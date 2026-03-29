@@ -1,7 +1,7 @@
 [project]
-name = "__PYTHON_PROJECT_NAME__"
+name = "nanodiffusion"
 version = "0.1.0"
-description = "__REPO_DESCRIPTION__"
+description = "Diffusion-based chat language model in JAX and Equinox"
 readme = "README.md"
 authors = [{ name = "Romain Graux", email = "author@romaingrx.com" }]
 requires-python = ">=3.13"

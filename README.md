@@ -1,6 +1,6 @@
-# __REPO_NAME__
+# nanodiffusion
 
-> __REPO_DESCRIPTION__
+> Diffusion-based chat language model in JAX and Equinox
 
 ## License
 
