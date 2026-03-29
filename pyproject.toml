@@ -1,0 +1,36 @@
+[project]
+name = "__PYTHON_PROJECT_NAME__"
+version = "0.1.0"
+description = "__REPO_DESCRIPTION__"
+readme = "README.md"
+authors = [{ name = "Romain Graux", email = "author@romaingrx.com" }]
+requires-python = ">=3.13"
+license = "MIT"
+license-files = ["LICENSE"]
+
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["basedpyright", "ruff", "pytest", "pre-commit"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.basedpyright]
+reportAny = false
+reportExplicitAny = false
+reportUnusedCallResult = false
+
+[tool.isort]
+profile = "black"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+norecursedirs = [] # If want to ignore some dirs
+addopts = [
+    # Use modern Python imports (i.e., don't require __init__.py files everywhere)
+    "--import-mode=importlib",
+    # Require markers to be explicitly defined
+    "--strict-markers",
+]

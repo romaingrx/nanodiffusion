@@ -1,0 +1,27 @@
+name: 'Setup dev environment'
+description: 'Setup Python development environment with uv'
+
+inputs:
+  uv-version:
+    description: 'Version of uv to install'
+    required: false
+    default: '0.11.2'
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Install uv
+      uses: astral-sh/setup-uv@cec208311dfd045dd5311c1add060b2062131d57 # v8.0.0
+      with:
+        version: ${{ inputs.uv-version }}
+        enable-cache: true
+        cache-dependency-glob: uv.lock
+
+    - name: Set up Python
+      uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+      with:
+        python-version-file: pyproject.toml
+
+    - name: Install dependencies
+      run: uv sync --all-extras --all-groups --locked
+      shell: bash
