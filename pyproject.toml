@@ -28,8 +28,6 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["basedpyright", "ruff", "pytest", "beartype>=0.18.0", "pre-commit"]
-serve = ["fastapi", "uvicorn[standard]", "websockets"]
-train = ["wandb", "datasets"]
 
 [project.scripts]
 nanodiffusion = "nanodiffusion.cli:main"
