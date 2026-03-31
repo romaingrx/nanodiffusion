@@ -206,3 +206,10 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# Training runs and experiment tracking
+runs/
+wandb/
+
+# Nix
+.nix-venv/

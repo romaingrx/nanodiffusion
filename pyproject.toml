@@ -8,29 +8,65 @@ requires-python = ">=3.13"
 license = "MIT"
 license-files = ["LICENSE"]
 
-dependencies = []
+dependencies = [
+    # ML core
+    "jax>=0.4.35",
+    "equinox>=0.11.10",
+    "optax>=0.2.4",
+    "jaxtyping>=0.2.34",
+    "einops>=0.8.0",
+    # Tokenizer
+    "tiktoken>=0.8.0",
+    # CLI
+    "click>=8.0.0",
+    # Config
+    "pydantic>=2.0.0",
+    "pyyaml>=6.0.0",
+    # Logging
+    "structlog>=24.0.0",
+]
 
 [project.optional-dependencies]
-dev = ["basedpyright", "ruff", "pytest", "pre-commit"]
+dev = ["basedpyright", "ruff", "pytest", "beartype>=0.18.0", "pre-commit"]
+serve = ["fastapi", "uvicorn[standard]", "websockets"]
+train = ["wandb", "datasets"]
+
+[project.scripts]
+nanodiffusion = "nanodiffusion.cli:main"
 
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
+[tool.ruff]
+line-length = 88
+target-version = "py313"
+
+[tool.ruff.lint]
+select = ["ALL"]
+ignore = [
+    "D",      # pydocstyle — we don't enforce docstrings
+    "COM812", # trailing comma (conflicts with ruff formatter)
+    "ISC001", # single-line implicit string concat (conflicts with ruff formatter)
+    "F722",   # jaxtyping dimension strings are not valid Python annotations (no fix available)
+]
+
+[tool.ruff.lint.per-file-ignores]
+"nanodiffusion/types.py" = ["UP040"]  # jaxtyping aliases need TypeAlias, not PEP 695 type keyword
+"tests/**" = [
+    "S101",    # assert is the standard pytest pattern
+    "PLR2004", # magic values are fine in test assertions
+    "INP001",  # tests don't need __init__.py (import-mode=importlib)
+]
+
 [tool.basedpyright]
+include = ["nanodiffusion"]
+typeCheckingMode = "strict"
 reportAny = false
 reportExplicitAny = false
 reportUnusedCallResult = false
 
-[tool.isort]
-profile = "black"
-
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-norecursedirs = [] # If want to ignore some dirs
-addopts = [
-    # Use modern Python imports (i.e., don't require __init__.py files everywhere)
-    "--import-mode=importlib",
-    # Require markers to be explicitly defined
-    "--strict-markers",
-]
+addopts = ["--import-mode=importlib", "--strict-markers"]
+markers = ["slow: marks tests that take a long time"]
