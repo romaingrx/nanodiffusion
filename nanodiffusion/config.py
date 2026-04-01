@@ -5,7 +5,7 @@ from pydantic import BaseModel
 
 
 class ModelConfig(BaseModel):
-    vocab_size: int = 50258  # GPT-2 (50257) + MASK token
+    vocab_size: int = 50264  # GPT-2 (50257) + 7 special tokens (see SpecialToken enum)
     num_layers: int = 12
     hidden_dim: int = 768
     num_heads: int = 12
