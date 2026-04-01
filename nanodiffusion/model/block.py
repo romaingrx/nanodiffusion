@@ -34,8 +34,8 @@ class AdaLNModulation(eqx.Module):
         Float[Array, " dim"],
     ]:
         out = self.linear(jax.nn.silu(cond))
-        shift_attn, scale_attn, gate_attn, shift_ffn, scale_ffn, gate_ffn = (
-            jnp.split(out, 6)
+        shift_attn, scale_attn, gate_attn, shift_ffn, scale_ffn, gate_ffn = jnp.split(
+            out, 6
         )
         return shift_attn, scale_attn, gate_attn, shift_ffn, scale_ffn, gate_ffn
 

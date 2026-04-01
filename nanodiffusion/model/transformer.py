@@ -22,8 +22,7 @@ class Transformer(eqx.Module):
         self.embed = TokenEmbedding(config.vocab_size, config.hidden_dim, key=keys[0])
         self.time_embed = TimeEmbedding(config.hidden_dim, key=keys[1])
         self.blocks = [
-            TransformerBlock(config, key=keys[2 + i])
-            for i in range(config.num_layers)
+            TransformerBlock(config, key=keys[2 + i]) for i in range(config.num_layers)
         ]
         self.final_norm = eqx.nn.RMSNorm(
             config.hidden_dim, use_weight=False, use_bias=False

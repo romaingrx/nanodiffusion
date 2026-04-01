@@ -88,9 +88,7 @@ def test_feed_forward_shape(key: jax.Array, small_config: ModelConfig) -> None:
     assert out.shape == (16, 64)
 
 
-def test_transformer_block_shape(
-    key: jax.Array, small_config: ModelConfig
-) -> None:
+def test_transformer_block_shape(key: jax.Array, small_config: ModelConfig) -> None:
     block = TransformerBlock(small_config, key=key)
     x = jax.random.normal(key, (16, 64))
     cond = jax.random.normal(key, (64,))
@@ -109,9 +107,7 @@ def test_transformer_block_residual_at_init(
     assert jnp.allclose(out, x, atol=1e-5)
 
 
-def test_transformer_forward_shape(
-    key: jax.Array, small_config: ModelConfig
-) -> None:
+def test_transformer_forward_shape(key: jax.Array, small_config: ModelConfig) -> None:
     model = Transformer(small_config, key=key)
     tokens = jnp.arange(16)
     t = jnp.array(0.5)
@@ -144,9 +140,7 @@ def test_transformer_time_sensitivity(
     assert not jnp.allclose(logits_early, logits_late)
 
 
-def test_transformer_gradient_flow(
-    key: jax.Array, small_config: ModelConfig
-) -> None:
+def test_transformer_gradient_flow(key: jax.Array, small_config: ModelConfig) -> None:
     model = Transformer(small_config, key=key)
     tokens = jnp.arange(16)
     t = jnp.array(0.5)
@@ -172,9 +166,7 @@ def test_transformer_batched_via_vmap(
     assert batched_logits.shape == (2, 16, 256)
 
 
-def test_transformer_jit_compatible(
-    key: jax.Array, small_config: ModelConfig
-) -> None:
+def test_transformer_jit_compatible(key: jax.Array, small_config: ModelConfig) -> None:
     model = Transformer(small_config, key=key)
     tokens = jnp.arange(16)
     t = jnp.array(0.5)
