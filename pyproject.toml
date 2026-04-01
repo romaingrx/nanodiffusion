@@ -63,6 +63,9 @@ typeCheckingMode = "strict"
 reportAny = false
 reportExplicitAny = false
 reportUnusedCallResult = false
+# JAX/Equinox stubs are incomplete — these fire on library functions, not our code
+reportUnknownMemberType = false
+reportUnknownLambdaType = false
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
