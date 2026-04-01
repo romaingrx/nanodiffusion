@@ -1,0 +1,49 @@
+import equinox as eqx
+import jax
+import jax.numpy as jnp
+from jaxtyping import Array, Float, Int
+
+from nanodiffusion.config import ModelConfig
+from nanodiffusion.model.block import TransformerBlock
+from nanodiffusion.model.embedding import TimeEmbedding, TokenEmbedding
+from nanodiffusion.types import Logits, PRNGKeyArray, Scalar
+
+
+class Transformer(eqx.Module):
+    embed: TokenEmbedding
+    time_embed: TimeEmbedding
+    blocks: list[TransformerBlock]
+    final_norm: eqx.nn.RMSNorm
+    lm_head: eqx.nn.Linear
+
+    def __init__(self, config: ModelConfig, *, key: PRNGKeyArray) -> None:
+        def split() -> PRNGKeyArray:
+            nonlocal key
+            key, subkey = jax.random.split(key)
+            return subkey
+
+        self.embed = TokenEmbedding(config.vocab_size, config.hidden_dim, key=split())
+        self.time_embed = TimeEmbedding(config.hidden_dim, key=split())
+        self.blocks = [
+            TransformerBlock(config, key=split()) for _ in range(config.num_layers)
+        ]
+        self.final_norm = eqx.nn.RMSNorm(
+            config.hidden_dim, use_weight=False, use_bias=False
+        )
+
+        lm_head = eqx.nn.Linear(
+            config.hidden_dim, config.vocab_size, use_bias=False, key=split()
+        )
+        self.lm_head = eqx.tree_at(
+            lambda m: m.weight, lm_head, jnp.zeros_like(lm_head.weight)
+        )
+
+    def __call__(self, tokens: Int[Array, " seq"], t: Scalar) -> Logits:
+        x: Float[Array, "seq dim"] = self.embed(tokens)
+        cond: Float[Array, " dim"] = self.time_embed(t)
+
+        for block in self.blocks:
+            x = block(x, cond)
+
+        x = jax.vmap(self.final_norm)(x)
+        return jax.vmap(self.lm_head)(x)

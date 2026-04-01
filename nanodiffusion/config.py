@@ -1,7 +1,12 @@
+import math
 from pathlib import Path
 
 import yaml
 from pydantic import BaseModel
+
+
+def _round_to_multiple(x: int, multiple: int) -> int:
+    return math.ceil(x / multiple) * multiple
 
 
 class ModelConfig(BaseModel):
@@ -16,6 +21,10 @@ class ModelConfig(BaseModel):
     @property
     def head_dim(self) -> int:
         return self.hidden_dim // self.num_heads
+
+    @property
+    def ffn_dim(self) -> int:
+        return _round_to_multiple(int(2 / 3 * self.ffn_mult * self.hidden_dim), 256)
 
 
 class TrainConfig(BaseModel):
