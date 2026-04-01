@@ -17,22 +17,20 @@ class Transformer(eqx.Module):
     lm_head: eqx.nn.Linear
 
     def __init__(self, config: ModelConfig, *, key: PRNGKeyArray) -> None:
-        def split() -> PRNGKeyArray:
-            nonlocal key
-            key, subkey = jax.random.split(key)
-            return subkey
+        keys = jax.random.split(key, config.num_layers + 3)
 
-        self.embed = TokenEmbedding(config.vocab_size, config.hidden_dim, key=split())
-        self.time_embed = TimeEmbedding(config.hidden_dim, key=split())
+        self.embed = TokenEmbedding(config.vocab_size, config.hidden_dim, key=keys[0])
+        self.time_embed = TimeEmbedding(config.hidden_dim, key=keys[1])
         self.blocks = [
-            TransformerBlock(config, key=split()) for _ in range(config.num_layers)
+            TransformerBlock(config, key=keys[2 + i])
+            for i in range(config.num_layers)
         ]
         self.final_norm = eqx.nn.RMSNorm(
             config.hidden_dim, use_weight=False, use_bias=False
         )
 
         lm_head = eqx.nn.Linear(
-            config.hidden_dim, config.vocab_size, use_bias=False, key=split()
+            config.hidden_dim, config.vocab_size, use_bias=False, key=keys[-1]
         )
         self.lm_head = eqx.tree_at(
             lambda m: m.weight, lm_head, jnp.zeros_like(lm_head.weight)

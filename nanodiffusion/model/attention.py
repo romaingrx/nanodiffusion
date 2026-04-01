@@ -20,19 +20,16 @@ class SelfAttention(eqx.Module):
     head_dim: int = eqx.field(static=True)
 
     def __init__(self, hidden_dim: int, num_heads: int, *, key: PRNGKeyArray) -> None:
-        def split() -> PRNGKeyArray:
-            nonlocal key
-            key, subkey = jax.random.split(key)
-            return subkey
+        qkey, kkey, vkey, okey = jax.random.split(key, 4)
 
         self.num_heads = num_heads
         self.head_dim = hidden_dim // num_heads
 
-        self.q_proj = eqx.nn.Linear(hidden_dim, hidden_dim, use_bias=False, key=split())
-        self.k_proj = eqx.nn.Linear(hidden_dim, hidden_dim, use_bias=False, key=split())
-        self.v_proj = eqx.nn.Linear(hidden_dim, hidden_dim, use_bias=False, key=split())
+        self.q_proj = eqx.nn.Linear(hidden_dim, hidden_dim, use_bias=False, key=qkey)
+        self.k_proj = eqx.nn.Linear(hidden_dim, hidden_dim, use_bias=False, key=kkey)
+        self.v_proj = eqx.nn.Linear(hidden_dim, hidden_dim, use_bias=False, key=vkey)
 
-        o_proj = eqx.nn.Linear(hidden_dim, hidden_dim, use_bias=False, key=split())
+        o_proj = eqx.nn.Linear(hidden_dim, hidden_dim, use_bias=False, key=okey)
         self.o_proj = eqx.tree_at(
             lambda m: m.weight, o_proj, jnp.zeros_like(o_proj.weight)
         )
@@ -51,16 +48,13 @@ class SelfAttention(eqx.Module):
         k = k.reshape(seq_len, self.num_heads, self.head_dim)
         v = v.reshape(seq_len, self.num_heads, self.head_dim)
 
-        # (seq, heads, head_dim) -> (heads, seq, head_dim)
         q = jnp.transpose(q, (1, 0, 2))
         k = jnp.transpose(k, (1, 0, 2))
         v = jnp.transpose(v, (1, 0, 2))
 
-        # QK-norm: normalize each head's query/key vectors
         q = jax.vmap(jax.vmap(self.q_norm))(q)
         k = jax.vmap(jax.vmap(self.k_norm))(k)
 
-        # RoPE: apply per head over (seq, head_dim)
         q = jax.vmap(self.rope)(q)
         k = jax.vmap(self.rope)(k)
 
@@ -70,7 +64,6 @@ class SelfAttention(eqx.Module):
 
         out = jnp.matmul(attn_weights, v)
 
-        # (heads, seq, head_dim) -> (seq, heads, head_dim) -> (seq, hidden_dim)
         out = jnp.transpose(out, (1, 0, 2))
         out = out.reshape(seq_len, self.num_heads * self.head_dim)
 

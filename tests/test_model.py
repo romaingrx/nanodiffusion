@@ -39,17 +39,11 @@ def key() -> jax.Array:
     return jax.random.PRNGKey(0)
 
 
-# --- Token embedding ---
-
-
 def test_token_embedding_shape(key: jax.Array) -> None:
     embed = TokenEmbedding(256, 64, key=key)
     tokens = jnp.arange(16)
     out = embed(tokens)
     assert out.shape == (16, 64)
-
-
-# --- Time embedding ---
 
 
 def test_time_embedding_shape(key: jax.Array) -> None:
@@ -63,9 +57,6 @@ def test_time_embedding_different_t_gives_different_output(key: jax.Array) -> No
     out_a = time_embed(jnp.array(0.1))
     out_b = time_embed(jnp.array(0.9))
     assert not jnp.allclose(out_a, out_b)
-
-
-# --- Self attention ---
 
 
 def test_self_attention_shape(key: jax.Array) -> None:
@@ -84,15 +75,10 @@ def test_self_attention_is_bidirectional(key: jax.Array) -> None:
     out_orig = attn(x)
     out_modified = attn(x_modified)
 
-    # Last position should see the change at position 0
     assert not jnp.allclose(out_orig[-1], out_modified[-1])
-    # Position 0 should see changes at last position too
     x_modified_last = x.at[-1].set(x[-1] + 10.0)
     out_modified_last = attn(x_modified_last)
     assert not jnp.allclose(out_orig[0], out_modified_last[0])
-
-
-# --- Feed forward ---
 
 
 def test_feed_forward_shape(key: jax.Array, small_config: ModelConfig) -> None:
@@ -100,9 +86,6 @@ def test_feed_forward_shape(key: jax.Array, small_config: ModelConfig) -> None:
     x = jax.random.normal(key, (16, 64))
     out = ffn(x)
     assert out.shape == (16, 64)
-
-
-# --- Transformer block ---
 
 
 def test_transformer_block_shape(
@@ -126,9 +109,6 @@ def test_transformer_block_residual_at_init(
     assert jnp.allclose(out, x, atol=1e-5)
 
 
-# --- Full transformer ---
-
-
 def test_transformer_forward_shape(
     key: jax.Array, small_config: ModelConfig
 ) -> None:
@@ -150,7 +130,6 @@ def test_transformer_is_bidirectional(
 
     logits_a = model(tokens_a, t)
     logits_b = model(tokens_b, t)
-    # Last position should see the change at position 0
     assert not jnp.allclose(logits_a[-1], logits_b[-1])
 
 

@@ -10,10 +10,8 @@ from nanodiffusion.types import PRNGKeyArray
 
 class AdaLNModulation(eqx.Module):
     linear: eqx.nn.Linear
-    hidden_dim: int = eqx.field(static=True)
 
     def __init__(self, hidden_dim: int, *, key: PRNGKeyArray) -> None:
-        self.hidden_dim = hidden_dim
         linear = eqx.nn.Linear(hidden_dim, 6 * hidden_dim, use_bias=True, key=key)
         bias = linear.bias
         if bias is None:
@@ -48,15 +46,12 @@ class FeedForward(eqx.Module):
     down_proj: eqx.nn.Linear
 
     def __init__(self, hidden_dim: int, ffn_dim: int, *, key: PRNGKeyArray) -> None:
-        def split() -> PRNGKeyArray:
-            nonlocal key
-            key, subkey = jax.random.split(key)
-            return subkey
+        gkey, ukey, dkey = jax.random.split(key, 3)
 
-        self.gate_proj = eqx.nn.Linear(hidden_dim, ffn_dim, use_bias=False, key=split())
-        self.up_proj = eqx.nn.Linear(hidden_dim, ffn_dim, use_bias=False, key=split())
+        self.gate_proj = eqx.nn.Linear(hidden_dim, ffn_dim, use_bias=False, key=gkey)
+        self.up_proj = eqx.nn.Linear(hidden_dim, ffn_dim, use_bias=False, key=ukey)
 
-        down_proj = eqx.nn.Linear(ffn_dim, hidden_dim, use_bias=False, key=split())
+        down_proj = eqx.nn.Linear(ffn_dim, hidden_dim, use_bias=False, key=dkey)
         self.down_proj = eqx.tree_at(
             lambda m: m.weight, down_proj, jnp.zeros_like(down_proj.weight)
         )
@@ -75,20 +70,17 @@ class TransformerBlock(eqx.Module):
     adaln: AdaLNModulation
 
     def __init__(self, config: ModelConfig, *, key: PRNGKeyArray) -> None:
-        def split() -> PRNGKeyArray:
-            nonlocal key
-            key, subkey = jax.random.split(key)
-            return subkey
+        akey, fkey, mkey = jax.random.split(key, 3)
 
-        self.attn = SelfAttention(config.hidden_dim, config.num_heads, key=split())
-        self.ffn = FeedForward(config.hidden_dim, config.ffn_dim, key=split())
+        self.attn = SelfAttention(config.hidden_dim, config.num_heads, key=akey)
+        self.ffn = FeedForward(config.hidden_dim, config.ffn_dim, key=fkey)
         self.attn_norm = eqx.nn.RMSNorm(
             config.hidden_dim, use_weight=False, use_bias=False
         )
         self.ffn_norm = eqx.nn.RMSNorm(
             config.hidden_dim, use_weight=False, use_bias=False
         )
-        self.adaln = AdaLNModulation(config.hidden_dim, key=split())
+        self.adaln = AdaLNModulation(config.hidden_dim, key=mkey)
 
     def __call__(
         self, x: Float[Array, "seq dim"], cond: Float[Array, " dim"]
