@@ -51,10 +51,7 @@ class FeedForward(eqx.Module):
         self.gate_proj = eqx.nn.Linear(hidden_dim, ffn_dim, use_bias=False, key=gkey)
         self.up_proj = eqx.nn.Linear(hidden_dim, ffn_dim, use_bias=False, key=ukey)
 
-        down_proj = eqx.nn.Linear(ffn_dim, hidden_dim, use_bias=False, key=dkey)
-        self.down_proj = eqx.tree_at(
-            lambda m: m.weight, down_proj, jnp.zeros_like(down_proj.weight)
-        )
+        self.down_proj = eqx.nn.Linear(ffn_dim, hidden_dim, use_bias=False, key=dkey)
 
     def __call__(self, x: Float[Array, "seq dim"]) -> Float[Array, "seq dim"]:
         gate = jax.vmap(self.gate_proj)(x)

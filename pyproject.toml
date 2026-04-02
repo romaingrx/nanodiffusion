@@ -57,6 +57,10 @@ ignore = [
     "PLR2004", # magic values are fine in test assertions
     "INP001",  # tests don't need __init__.py (import-mode=importlib)
 ]
+"examples/**" = [
+    "T201",    # print is the primary output mechanism for scripts
+    "INP001",  # examples don't need __init__.py
+]
 
 [tool.basedpyright]
 include = ["nanodiffusion"]

@@ -20,3 +20,4 @@ wandb/
 
 # Claude Code memory (user-specific)
 .claude/projects/*/memory/
+overfit_pattern.png

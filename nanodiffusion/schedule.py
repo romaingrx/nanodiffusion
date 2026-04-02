@@ -37,6 +37,7 @@ class LogLinearSchedule(eqx.Module):
 
     Default in MDLM (Sahoo et al., 2024) and LLaDA (Nie et al., 2025).
     """
+
     eps: float = eqx.field(static=True, default=1e-3)
 
     def sigma(self, t: Scalar) -> Scalar:
@@ -51,6 +52,7 @@ class CosineSchedule(eqx.Module):
 
     From Chang et al., "MaskGIT", CVPR 2022.
     """
+
     eps: float = eqx.field(static=True, default=1e-3)
 
     def sigma(self, t: Scalar) -> Scalar:

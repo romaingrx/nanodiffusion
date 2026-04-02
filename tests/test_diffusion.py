@@ -128,9 +128,7 @@ def test_gradient_flows_only_through_masked(
     mask_id = small_config.vocab_size - 1
     t = jnp.array(0.5)
 
-    xt, is_masked = forward_mask(
-        x0, t, schedule=sched, mask_token_id=mask_id, key=k2
-    )
+    xt, is_masked = forward_mask(x0, t, schedule=sched, mask_token_id=mask_id, key=k2)
     weight = loss_weight(sched, t)
     logits = model(xt, t)
 
@@ -199,9 +197,7 @@ def test_compute_loss_jit_compatible(
 
     @eqx.filter_jit
     def jit_loss(m: Transformer, batch: jax.Array, k: jax.Array) -> jax.Array:
-        return compute_loss(
-            m, batch, schedule=schedule, mask_token_id=mask_id, key=k
-        )
+        return compute_loss(m, batch, schedule=schedule, mask_token_id=mask_id, key=k)
 
     jitted = jit_loss(model, x0, key)
     assert jnp.allclose(eager, jitted, atol=1e-5)
@@ -218,9 +214,7 @@ def test_compute_loss_gradient_flow(
 
     @eqx.filter_grad
     def compute_grad(m: Transformer) -> jax.Array:
-        return compute_loss(
-            m, x0, schedule=schedule, mask_token_id=mask_id, key=key
-        )
+        return compute_loss(m, x0, schedule=schedule, mask_token_id=mask_id, key=key)
 
     grads = compute_grad(model)
     leaves = jax.tree.leaves(eqx.filter(grads, eqx.is_array))
@@ -235,9 +229,7 @@ def test_diffusion_loss_value_correctness(key: jax.Array) -> None:
     mask_id = vocab_size - 1
     x0 = jnp.array([0, 1, 2, 3])
 
-    _xt, is_masked = forward_mask(
-        x0, t, schedule=sched, mask_token_id=mask_id, key=key
-    )
+    _xt, is_masked = forward_mask(x0, t, schedule=sched, mask_token_id=mask_id, key=key)
 
     # Zero-initialized lm_head → uniform logits → NLL = log(vocab_size)
     expected_nll = jnp.log(jnp.array(vocab_size, dtype=jnp.float32))
@@ -249,8 +241,6 @@ def test_diffusion_loss_value_correctness(key: jax.Array) -> None:
         vocab_size=vocab_size, num_layers=1, hidden_dim=32, num_heads=2, max_seq_len=8
     )
     model = Transformer(config, key=key)
-    loss = diffusion_loss(
-        model, x0, t, schedule=sched, mask_token_id=mask_id, key=key
-    )
+    loss = diffusion_loss(model, x0, t, schedule=sched, mask_token_id=mask_id, key=key)
     if n_masked > 0:
         assert jnp.isclose(loss, expected_loss, rtol=0.1)
