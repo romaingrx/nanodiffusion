@@ -1,35 +1,43 @@
-import abc
+from typing import Protocol
 
 import equinox as eqx
-import jax
 import jax.numpy as jnp
 
-from nanodiffusion.types import Mask, PRNGKeyArray, Scalar, Tokens
+from nanodiffusion.types import Scalar
 
 
-class NoiseSchedule(eqx.Module):
-    """Maps continuous time t in [0, 1] to cumulative noise sigma(t)."""
+class NoiseSchedule(Protocol):
+    """Cumulative noise sigma(t) and its derivative for t in [0, 1].
 
-    eps: float = eqx.field(static=True, default=1e-3)
+    Ref: Sahoo et al., "Simple and Effective Masked Diffusion Language Models"
+    (MDLM), NeurIPS 2024, Sec. 3.1 — sigma parameterization.
+    """
 
-    @abc.abstractmethod
     def sigma(self, t: Scalar) -> Scalar: ...
-
-    @abc.abstractmethod
     def dsigma(self, t: Scalar) -> Scalar: ...
 
-    def alpha(self, t: Scalar) -> Scalar:
-        return jnp.exp(-self.sigma(t))
 
-    def mask_chance(self, t: Scalar) -> Scalar:
-        return -jnp.expm1(-self.sigma(t))
-
-    def loss_weight(self, t: Scalar) -> Scalar:
-        return self.dsigma(t) / jnp.expm1(self.sigma(t))
+def alpha(schedule: NoiseSchedule, t: Scalar) -> Scalar:
+    """Probability a token stays unmasked: exp(-sigma(t))."""
+    return jnp.exp(-schedule.sigma(t))
 
 
-class LogLinearSchedule(NoiseSchedule):
-    """sigma(t) = -log(1 - (1-eps)t), so mask_chance ~ t. Default in MDLM."""
+def mask_chance(schedule: NoiseSchedule, t: Scalar) -> Scalar:
+    """Probability a token is masked: 1 - alpha(t)."""
+    return -jnp.expm1(-schedule.sigma(t))
+
+
+def loss_weight(schedule: NoiseSchedule, t: Scalar) -> Scalar:
+    """NELBO weight: dsigma/dt / expm1(sigma(t)). See MDLM Eq. 14."""
+    return schedule.dsigma(t) / jnp.expm1(schedule.sigma(t))
+
+
+class LogLinearSchedule(eqx.Module):
+    """sigma(t) = -log(1 - (1-eps)t), so mask_chance ~ t.
+
+    Default in MDLM (Sahoo et al., 2024) and LLaDA (Nie et al., 2025).
+    """
+    eps: float = eqx.field(static=True, default=1e-3)
 
     def sigma(self, t: Scalar) -> Scalar:
         return -jnp.log1p(-(1 - self.eps) * t)
@@ -38,8 +46,12 @@ class LogLinearSchedule(NoiseSchedule):
         return (1 - self.eps) / (1 - (1 - self.eps) * t)
 
 
-class CosineSchedule(NoiseSchedule):
-    """alpha(t) = eps + (1-eps)cos(pi*t/2). Slower masking at start and end."""
+class CosineSchedule(eqx.Module):
+    """alpha(t) = eps + (1-eps)cos(pi*t/2). Slower masking at start and end.
+
+    From Chang et al., "MaskGIT", CVPR 2022.
+    """
+    eps: float = eqx.field(static=True, default=1e-3)
 
     def sigma(self, t: Scalar) -> Scalar:
         return -jnp.log(self.eps + (1 - self.eps) * jnp.cos(jnp.pi * t / 2))
@@ -48,19 +60,3 @@ class CosineSchedule(NoiseSchedule):
         num = jnp.pi / 2 * (1 - self.eps) * jnp.sin(jnp.pi * t / 2)
         den = self.eps + (1 - self.eps) * jnp.cos(jnp.pi * t / 2)
         return num / den
-
-
-def forward_mask(
-    x0: Tokens,
-    t: Scalar,
-    *,
-    schedule: NoiseSchedule,
-    mask_token_id: int,
-    key: PRNGKeyArray,
-) -> tuple[Tokens, Mask]:
-    """Apply forward diffusion: independently mask each token with prob 1 - alpha(t)."""
-    chance = schedule.mask_chance(t)
-    noise = jax.random.uniform(key, x0.shape)
-    is_masked = noise < chance
-    xt = jnp.where(is_masked, mask_token_id, x0)
-    return xt, is_masked
