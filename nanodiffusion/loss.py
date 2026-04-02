@@ -3,7 +3,7 @@ from typing import Protocol
 import jax
 import jax.numpy as jnp
 
-from nanodiffusion.model.transformer import Transformer
+from nanodiffusion.model import DiffusionModel
 from nanodiffusion.schedule import NoiseSchedule, loss_weight, mask_chance
 from nanodiffusion.types import Logits, Mask, PRNGKeyArray, Scalar, TokenBatch, Tokens
 
@@ -45,7 +45,6 @@ def masked_nll(
     is_masked: Mask,
     weight: Scalar,
 ) -> Scalar:
-    """Weighted cross-entropy on masked positions, normalized by mask count."""
     log_probs = jax.nn.log_softmax(logits, axis=-1)
     log_p_x0 = jnp.take_along_axis(log_probs, x0[..., None], axis=-1).squeeze(-1)
     nll = -log_p_x0 * is_masked
@@ -54,7 +53,7 @@ def masked_nll(
 
 
 def diffusion_loss(
-    model: Transformer,
+    model: DiffusionModel,
     x0: Tokens,
     t: Scalar,
     *,
@@ -74,7 +73,7 @@ def diffusion_loss(
 
 
 def compute_loss(
-    model: Transformer,
+    model: DiffusionModel,
     x0: TokenBatch,
     *,
     schedule: NoiseSchedule,
@@ -82,7 +81,6 @@ def compute_loss(
     key: PRNGKeyArray,
     sampler: TimeSampler = low_discrepancy_sampler,
 ) -> Scalar:
-    """Batched diffusion loss: sample t per element, vmap the single-sequence loss."""
     batch_size = x0.shape[0]
     key, t_key = jax.random.split(key)
     t_batch = sampler(batch_size, key=t_key)

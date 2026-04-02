@@ -1,7 +1,6 @@
 import equinox as eqx
 import jax
 import jax.numpy as jnp
-import pytest
 
 from nanodiffusion.config import ModelConfig
 from nanodiffusion.model.attention import SelfAttention
@@ -21,22 +20,6 @@ def _activate_zeros[M: eqx.Module](model: M, key: jax.Array) -> M:
         return leaf
 
     return jax.tree.map(f, model, is_leaf=eqx.is_array)
-
-
-@pytest.fixture
-def small_config() -> ModelConfig:
-    return ModelConfig(
-        vocab_size=256,
-        num_layers=2,
-        hidden_dim=64,
-        num_heads=4,
-        max_seq_len=32,
-    )
-
-
-@pytest.fixture
-def key() -> jax.Array:
-    return jax.random.PRNGKey(0)
 
 
 def test_token_embedding_shape(key: jax.Array) -> None:

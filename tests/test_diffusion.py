@@ -16,28 +16,6 @@ from nanodiffusion.schedule import (
 )
 
 
-@pytest.fixture
-def small_config() -> ModelConfig:
-    return ModelConfig(
-        vocab_size=256,
-        num_layers=2,
-        hidden_dim=64,
-        num_heads=4,
-        max_seq_len=32,
-    )
-
-
-@pytest.fixture
-def key() -> jax.Array:
-    return jax.random.PRNGKey(0)
-
-
-@pytest.fixture
-def model(small_config: ModelConfig, key: jax.Array) -> Transformer:
-    model_key, _ = jax.random.split(key)
-    return Transformer(small_config, key=model_key)
-
-
 @pytest.fixture(params=[LogLinearSchedule, CosineSchedule])
 def schedule(request: pytest.FixtureRequest) -> NoiseSchedule:
     return request.param()
@@ -231,7 +209,7 @@ def test_diffusion_loss_value_correctness(key: jax.Array) -> None:
 
     _xt, is_masked = forward_mask(x0, t, schedule=sched, mask_token_id=mask_id, key=key)
 
-    # Zero-initialized lm_head → uniform logits → NLL = log(vocab_size)
+    # Uniform logits → NLL = log(vocab_size)
     expected_nll = jnp.log(jnp.array(vocab_size, dtype=jnp.float32))
     n_masked = is_masked.sum()
     weight = loss_weight(sched, t)
@@ -241,6 +219,10 @@ def test_diffusion_loss_value_correctness(key: jax.Array) -> None:
         vocab_size=vocab_size, num_layers=1, hidden_dim=32, num_heads=2, max_seq_len=8
     )
     model = Transformer(config, key=key)
+    # Zero out lm_head to get uniform logits for a predictable expected loss
+    model = eqx.tree_at(
+        lambda m: m.lm_head.weight, model, jnp.zeros_like(model.lm_head.weight)
+    )
     loss = diffusion_loss(model, x0, t, schedule=sched, mask_token_id=mask_id, key=key)
     if n_masked > 0:
         assert jnp.isclose(loss, expected_loss, rtol=0.1)

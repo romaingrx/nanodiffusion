@@ -18,12 +18,10 @@ class NoiseSchedule(Protocol):
 
 
 def alpha(schedule: NoiseSchedule, t: Scalar) -> Scalar:
-    """Probability a token stays unmasked: exp(-sigma(t))."""
     return jnp.exp(-schedule.sigma(t))
 
 
 def mask_chance(schedule: NoiseSchedule, t: Scalar) -> Scalar:
-    """Probability a token is masked: 1 - alpha(t)."""
     return -jnp.expm1(-schedule.sigma(t))
 
 
