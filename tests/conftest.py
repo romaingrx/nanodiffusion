@@ -3,9 +3,12 @@ from pathlib import Path
 import jax
 import pytest
 import yaml
+from jaxtyping import install_import_hook
 
-from nanodiffusion.config import ModelConfig
-from nanodiffusion.model.transformer import Transformer
+install_import_hook("nanodiffusion", "beartype.beartype")
+
+from nanodiffusion.config import ModelConfig  # noqa: E402
+from nanodiffusion.model.transformer import Transformer  # noqa: E402
 
 
 @pytest.fixture

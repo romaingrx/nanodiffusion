@@ -8,6 +8,7 @@ __all__ = [
     "Mask",
     "MaskBatch",
     "PRNGKeyArray",
+    "Prompt",
     "Scalar",
     "TokenBatch",
     "Tokens",
@@ -18,6 +19,7 @@ Scalar: TypeAlias = Float[Array, ""]
 # Token sequences: integer token IDs
 Tokens: TypeAlias = Int[Array, " seq"]
 TokenBatch: TypeAlias = Int[Array, "batch seq"]
+Prompt: TypeAlias = Int[Array, " prompt"]
 
 # Model output logits
 Logits: TypeAlias = Float[Array, "seq vocab"]

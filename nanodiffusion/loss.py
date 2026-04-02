@@ -1,4 +1,4 @@
-from typing import Protocol
+from typing import Protocol, runtime_checkable
 
 import jax
 import jax.numpy as jnp
@@ -8,6 +8,7 @@ from nanodiffusion.schedule import NoiseSchedule, loss_weight, mask_chance
 from nanodiffusion.types import Logits, Mask, PRNGKeyArray, Scalar, TokenBatch, Tokens
 
 
+@runtime_checkable
 class TimeSampler(Protocol):
     def __call__(self, batch_size: int, *, key: PRNGKeyArray) -> jax.Array: ...
 

@@ -1,4 +1,4 @@
-from typing import Protocol
+from typing import Protocol, runtime_checkable
 
 import equinox as eqx
 import jax.numpy as jnp
@@ -6,6 +6,7 @@ import jax.numpy as jnp
 from nanodiffusion.types import Scalar
 
 
+@runtime_checkable
 class NoiseSchedule(Protocol):
     """Cumulative noise sigma(t) and its derivative for t in [0, 1].
 
