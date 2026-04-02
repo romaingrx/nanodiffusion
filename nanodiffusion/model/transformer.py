@@ -1,6 +1,5 @@
 import equinox as eqx
 import jax
-import jax.numpy as jnp
 from jaxtyping import Array, Float, Int
 
 from nanodiffusion.config import ModelConfig
@@ -28,11 +27,8 @@ class Transformer(eqx.Module):
             config.hidden_dim, use_weight=False, use_bias=False
         )
 
-        lm_head = eqx.nn.Linear(
+        self.lm_head = eqx.nn.Linear(
             config.hidden_dim, config.vocab_size, use_bias=False, key=keys[-1]
-        )
-        self.lm_head = eqx.tree_at(
-            lambda m: m.weight, lm_head, jnp.zeros_like(lm_head.weight)
         )
 
     def __call__(self, tokens: Int[Array, " seq"], t: Scalar) -> Logits:

@@ -47,6 +47,7 @@ ignore = [
     "COM812", # trailing comma (conflicts with ruff formatter)
     "ISC001", # single-line implicit string concat (conflicts with ruff formatter)
     "F722",   # jaxtyping dimension strings are not valid Python annotations (no fix available)
+    "PLR0913", # JAX functions often need model + data + config + key args
 ]
 
 [tool.ruff.lint.per-file-ignores]
@@ -55,6 +56,10 @@ ignore = [
     "S101",    # assert is the standard pytest pattern
     "PLR2004", # magic values are fine in test assertions
     "INP001",  # tests don't need __init__.py (import-mode=importlib)
+]
+"examples/**" = [
+    "T201",    # print is the primary output mechanism for scripts
+    "INP001",  # examples don't need __init__.py
 ]
 
 [tool.basedpyright]

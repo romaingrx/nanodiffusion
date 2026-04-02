@@ -29,10 +29,7 @@ class SelfAttention(eqx.Module):
         self.k_proj = eqx.nn.Linear(hidden_dim, hidden_dim, use_bias=False, key=kkey)
         self.v_proj = eqx.nn.Linear(hidden_dim, hidden_dim, use_bias=False, key=vkey)
 
-        o_proj = eqx.nn.Linear(hidden_dim, hidden_dim, use_bias=False, key=okey)
-        self.o_proj = eqx.tree_at(
-            lambda m: m.weight, o_proj, jnp.zeros_like(o_proj.weight)
-        )
+        self.o_proj = eqx.nn.Linear(hidden_dim, hidden_dim, use_bias=False, key=okey)
 
         self.q_norm = eqx.nn.RMSNorm(self.head_dim, use_weight=False, use_bias=False)
         self.k_norm = eqx.nn.RMSNorm(self.head_dim, use_weight=False, use_bias=False)
