@@ -24,11 +24,6 @@ def schedule(request: pytest.FixtureRequest) -> NoiseSchedule:
     return request.param
 
 
-# ---------------------------------------------------------------------------
-# Token filtering
-# ---------------------------------------------------------------------------
-
-
 class TestTopKFiltering:
     def test_keeps_exactly_k(self) -> None:
         logits = jnp.array([1.0, 5.0, 3.0, 2.0, 4.0])
@@ -72,10 +67,13 @@ class TestFilterLogits:
         result = filter_logits(logits, temperature=2.0, top_k=0, top_p=1.0)
         assert jnp.allclose(result, logits / 2.0)
 
-
-# ---------------------------------------------------------------------------
-# Sampler integration
-# ---------------------------------------------------------------------------
+    def test_top_k_then_top_p(self) -> None:
+        logits = jnp.array([1.0, 5.0, 3.0, 2.0, 4.0])
+        result = filter_logits(logits, temperature=1.0, top_k=3, top_p=0.9)
+        finite = jnp.isfinite(result)
+        # top-k=3 keeps indices {1,2,4}, then top-p further narrows
+        assert int(finite.sum()) <= 3
+        assert int(finite.sum()) >= 1
 
 
 class TestSampler:
@@ -221,6 +219,21 @@ class TestSampler:
         )
         assert tokens.shape == (SEQ_LEN,)
         assert tokens[0] == 0
+
+    def test_rejects_max_length_too_short(
+        self, model: Transformer, key: jax.Array, schedule: NoiseSchedule
+    ) -> None:
+        prompt = jnp.array([0, 1, 2])
+        with pytest.raises(ValueError, match=r"max_length.*must exceed prompt length"):
+            sample_tokens(
+                model,
+                prompt,
+                schedule=schedule,
+                mask_token_id=MASK_ID,
+                max_length=3,
+                steps=4,
+                key=key,
+            )
 
     def test_rejects_2d_prompt(
         self, model: Transformer, key: jax.Array, schedule: NoiseSchedule

@@ -23,8 +23,6 @@ class SampleStep(NamedTuple):
     total_steps: int
 
 
-
-
 def top_k_filtering(
     logits: Float[Array, " vocab"], k: int
 ) -> Float[Array, " vocab"]:
@@ -61,8 +59,6 @@ def filter_logits(
     return logits / temperature
 
 
-
-
 def _reverse_posterior(
     filtered_logits: Float[Array, "seq vocab"],
     move_chance_t: Scalar,
@@ -77,7 +73,7 @@ def _reverse_posterior(
     return log_q.at[:, mask_token_id].set(log_stay)
 
 
-_EPS = 1e-5
+_T_MIN = 1e-5
 
 
 def sample(
@@ -99,6 +95,9 @@ def sample(
     Models", NeurIPS 2024, Algorithm 1 (ddpm_cache variant).
     """
     prompt_len = prompt_tokens.shape[0]
+    if max_length <= prompt_len:
+        msg = f"max_length ({max_length}) must exceed prompt length ({prompt_len})"
+        raise ValueError(msg)
     gen_len = max_length - prompt_len
     x = jnp.concatenate([prompt_tokens, jnp.full(gen_len, mask_token_id)])
     is_prompt = jnp.concatenate([
@@ -106,7 +105,7 @@ def sample(
         jnp.zeros(gen_len, dtype=bool),
     ])
 
-    timesteps = jnp.linspace(1.0, _EPS, steps + 1)
+    timesteps = jnp.linspace(1.0, _T_MIN, steps + 1)
 
     _filter = functools.partial(
         filter_logits, temperature=temperature, top_k=top_k, top_p=top_p
@@ -134,7 +133,7 @@ def sample(
         yield SampleStep(x, i, steps)
 
     # Final denoising: argmax remaining masks
-    logits = model(x, jnp.array(_EPS))
+    logits = model(x, jnp.array(_T_MIN))
     logits = logits.at[:, mask_token_id].set(-1e9)
     x = jnp.where(x == mask_token_id, jnp.argmax(logits, axis=-1), x)
 
