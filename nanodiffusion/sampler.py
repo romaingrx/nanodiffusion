@@ -23,9 +23,7 @@ class SampleStep(NamedTuple):
     total_steps: int
 
 
-def top_k_filtering(
-    logits: Float[Array, " vocab"], k: int
-) -> Float[Array, " vocab"]:
+def top_k_filtering(logits: Float[Array, " vocab"], k: int) -> Float[Array, " vocab"]:
     if k <= 0:
         return logits
     top_values, _ = jax.lax.top_k(logits, k)
@@ -33,9 +31,7 @@ def top_k_filtering(
     return jnp.where(logits >= threshold, logits, -jnp.inf)
 
 
-def top_p_filtering(
-    logits: Float[Array, " vocab"], p: float
-) -> Float[Array, " vocab"]:
+def top_p_filtering(logits: Float[Array, " vocab"], p: float) -> Float[Array, " vocab"]:
     if p >= 1.0:
         return logits
     sorted_indices = jnp.argsort(-logits)
@@ -100,10 +96,12 @@ def sample(
         raise ValueError(msg)
     gen_len = max_length - prompt_len
     x = jnp.concatenate([prompt_tokens, jnp.full(gen_len, mask_token_id)])
-    is_prompt = jnp.concatenate([
-        jnp.ones(prompt_len, dtype=bool),
-        jnp.zeros(gen_len, dtype=bool),
-    ])
+    is_prompt = jnp.concatenate(
+        [
+            jnp.ones(prompt_len, dtype=bool),
+            jnp.zeros(gen_len, dtype=bool),
+        ]
+    )
 
     timesteps = jnp.linspace(1.0, _T_MIN, steps + 1)
 
