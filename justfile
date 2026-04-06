@@ -17,4 +17,4 @@ format:
 typecheck:
     uv run basedpyright
 
-check: lint typecheck test
+check: lint format typecheck test
