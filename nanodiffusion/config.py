@@ -2,7 +2,7 @@ import math
 from pathlib import Path
 
 import yaml
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 
 
 def _round_to_multiple(x: int, multiple: int) -> int:
@@ -49,10 +49,33 @@ class SampleConfig(BaseModel):
     max_length: int = 256
 
 
+class DataConfig(BaseModel):
+    dataset: str = "climbmix-400b"
+    data_dir: Path = Path("data")
+    num_train_shards: int | None = None
+    tokenizer_batch_size: int = 128
+    tokenizer_threads: int = 4
+    prefetch_size: int = 4
+
+    @field_validator("dataset")
+    @classmethod
+    def _validate_dataset(cls, v: str) -> str:
+        # Lazy import keeps `from nanodiffusion.config import Config` cheap
+        # for callers that never touch the data layer (e.g. sampling-only).
+        from nanodiffusion.data.datasets import DATASETS  # noqa: PLC0415
+
+        if v not in DATASETS:
+            available = ", ".join(sorted(DATASETS)) or "(none)"
+            msg = f"Unknown dataset {v!r}. Known: {available}"
+            raise ValueError(msg)
+        return v
+
+
 class Config(BaseModel):
     model: ModelConfig = ModelConfig()
     train: TrainConfig = TrainConfig()
     sample: SampleConfig = SampleConfig()
+    data: DataConfig = DataConfig()
 
     @classmethod
     def from_yaml(cls, path: str | Path) -> "Config":

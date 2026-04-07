@@ -17,6 +17,9 @@ dependencies = [
     "einops>=0.8.0",
     # Tokenizer
     "tiktoken>=0.8.0",
+    # Data pipeline
+    "pyarrow>=18.0.0",
+    "requests>=2.32.0",
     # CLI
     "click>=8.0.0",
     # Config
@@ -56,6 +59,9 @@ ignore = [
     "S101",    # assert is the standard pytest pattern
     "PLR2004", # magic values are fine in test assertions
     "INP001",  # tests don't need __init__.py (import-mode=importlib)
+    "ANN401",  # *args/**kwargs in test fakes are inherently dynamic
+    "TRY003",  # test exception messages don't need a dedicated exception class
+    "EM101",   # ditto: terse string literals are fine in test raises
 ]
 "examples/**" = [
     "T201",    # print is the primary output mechanism for scripts
@@ -76,3 +82,8 @@ reportUnknownLambdaType = false
 testpaths = ["tests"]
 addopts = ["--import-mode=importlib", "--strict-markers"]
 markers = ["slow: marks tests that take a long time"]
+
+[dependency-groups]
+dev = [
+    "pyarrow-stubs>=20.0.0.20251215",
+]

@@ -54,6 +54,20 @@ class Tokenizer:
     def encode(self, text: str) -> list[int]:
         return self._base.encode(text)
 
+    def encode_batch(
+        self,
+        texts: list[str],
+        *,
+        num_threads: int = 4,
+    ) -> list[list[int]]:
+        """Encode a batch of plain text strings, ignoring special tokens.
+
+        Wraps tiktoken's ``encode_ordinary_batch``, which releases the GIL
+        and parallelizes across ``num_threads`` C++ workers. Used by the
+        pretrain data loader for streaming tokenization of document batches.
+        """
+        return self._base.encode_ordinary_batch(texts, num_threads=num_threads)
+
     def decode(self, token_ids: list[int]) -> str:
         parts: list[str] = []
         buf: list[int] = []
