@@ -1,0 +1,91 @@
+"""``nanodiffusion data ...`` commands: list and download pretraining datasets."""
+
+import inspect
+from pathlib import Path
+
+import click
+
+
+@click.group(name="data")
+def data_group() -> None:
+    """Data pipeline commands."""
+
+
+@data_group.command(name="list")
+def list_datasets() -> None:
+    """List registered datasets with one-line descriptions."""
+    from nanodiffusion.data.datasets import DATASETS  # noqa: PLC0415
+
+    for name in sorted(DATASETS):
+        doc = inspect.getdoc(DATASETS[name]) or ""
+        first_line = doc.partition("\n")[0]
+        click.echo(f"{name}\t{first_line}" if first_line else name)
+
+
+@data_group.command()
+@click.option(
+    "--dataset",
+    default="climbmix-400b",
+    show_default=True,
+    help="Registered dataset name (see `nanodiffusion data list`)",
+)
+@click.option(
+    "--num-train",
+    type=click.IntRange(min=1),
+    default=10,
+    show_default=True,
+    help="Number of train shards to download",
+)
+@click.option(
+    "--data-dir",
+    type=click.Path(path_type=Path),
+    default=Path("data"),
+    show_default=True,
+)
+@click.option(
+    "--retries",
+    type=int,
+    default=5,
+    show_default=True,
+    help="Max retries per shard before failing",
+)
+@click.option(
+    "--timeout",
+    type=float,
+    default=60.0,
+    show_default=True,
+    help="HTTP request timeout in seconds",
+)
+@click.option(
+    "--num-workers",
+    type=int,
+    default=4,
+    show_default=True,
+    help="Parallel download workers",
+)
+def download(
+    dataset: str,
+    num_train: int,
+    data_dir: Path,
+    retries: int,
+    timeout: float,
+    num_workers: int,
+) -> None:
+    """Download parquet shards for a registered dataset."""
+    from nanodiffusion.data.datasets import (  # noqa: PLC0415
+        DownloadOptions,
+        get_dataset,
+    )
+
+    try:
+        factory = get_dataset(dataset)
+    except KeyError as exc:
+        raise click.BadParameter(exc.args[0], param_hint="--dataset") from exc
+    options = DownloadOptions(retries=retries, timeout=timeout, num_workers=num_workers)
+    factory(
+        data_dir,
+        num_train=num_train,
+        download=True,
+        download_options=options,
+    )
+    click.echo(f"Downloaded {num_train} train shards + val shard(s) to {data_dir}")

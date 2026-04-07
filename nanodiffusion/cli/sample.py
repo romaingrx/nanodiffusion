@@ -1,28 +1,12 @@
-import logging
+"""``nanodiffusion sample`` command: generate text via iterative unmasking."""
+
 from pathlib import Path
 
 import click
 import structlog
 
 
-@click.group()
-@click.option("-v", "--verbose", is_flag=True, help="Enable debug logging")
-def main(*, verbose: bool) -> None:
-    level = logging.DEBUG if verbose else logging.INFO
-
-    structlog.configure(
-        processors=[
-            structlog.contextvars.merge_contextvars,
-            structlog.stdlib.add_log_level,
-            structlog.processors.TimeStamper(fmt="iso"),
-            structlog.dev.ConsoleRenderer(),
-        ],
-        wrapper_class=structlog.make_filtering_bound_logger(level),
-        logger_factory=structlog.PrintLoggerFactory(),
-    )
-
-
-@main.command()
+@click.command(name="sample")
 @click.option(
     "--checkpoint",
     required=True,
@@ -35,7 +19,7 @@ def main(*, verbose: bool) -> None:
 @click.option("--top-p", default=1.0, show_default=True, type=float)
 @click.option("--max-length", default=256, show_default=True, type=int)
 @click.option("--seed", default=42, show_default=True, type=int)
-def sample(
+def sample_command(
     *,
     checkpoint: Path,
     prompt: str,

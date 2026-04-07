@@ -9,6 +9,7 @@ install_import_hook("nanodiffusion", "beartype.beartype")
 
 from nanodiffusion.config import ModelConfig  # noqa: E402
 from nanodiffusion.model.transformer import Transformer  # noqa: E402
+from nanodiffusion.tokenizer import Tokenizer  # noqa: E402
 
 
 @pytest.fixture
@@ -49,3 +50,9 @@ def config_path(tmp_path: Path) -> Path:
     p = tmp_path / "config.yaml"
     p.write_text(yaml.dump(data))
     return p
+
+
+@pytest.fixture
+def tok() -> Tokenizer:
+    """Shared tokenizer instance for tests that touch the data pipeline."""
+    return Tokenizer()

@@ -5,15 +5,27 @@ Follows the nanochat convention of paired start/end delimiters and
 """
 
 import enum
+from typing import Protocol, runtime_checkable
 
 import tiktoken
 
 
-class SpecialToken(enum.StrEnum):
-    """Every special token in the vocabulary.
+@runtime_checkable
+class TokenizerLike(Protocol):
+    """Minimal tokenizer surface the data loader depends on.
 
-    IDs are assigned in declaration order, starting at ``base_vocab_size``.
+    Implementations decide their own threading strategy at construction time;
+    the loader stays agnostic so non-parallel tokenizers don't need to
+    accept a no-op ``num_threads`` kwarg.
     """
+
+    eos_token_id: int
+
+    def encode_batch(self, texts: list[str]) -> list[list[int]]: ...
+
+
+class SpecialToken(enum.StrEnum):
+    """Special tokens; IDs assigned in declaration order from ``base_vocab_size``."""
 
     MASK = "<|mask|>"
     BOS = "<|bos|>"
@@ -25,14 +37,11 @@ class SpecialToken(enum.StrEnum):
 
 
 class Tokenizer:
-    """GPT-2 tiktoken encoding extended with diffusion and chat tokens.
+    """GPT-2 tiktoken encoding extended with diffusion and chat tokens."""
 
-    Special token IDs sit immediately above the base vocabulary in the order
-    defined by :class:`SpecialToken`.
-    """
-
-    def __init__(self) -> None:
+    def __init__(self, *, encode_threads: int = 4) -> None:
         self._base = tiktoken.get_encoding("gpt2")
+        self._encode_threads = encode_threads
         base = self._base.n_vocab
 
         self._special_to_id: dict[SpecialToken, int] = {
@@ -53,6 +62,10 @@ class Tokenizer:
 
     def encode(self, text: str) -> list[int]:
         return self._base.encode(text)
+
+    def encode_batch(self, texts: list[str]) -> list[list[int]]:
+        """Encode plain text (no special tokens). GIL-free via tiktoken C++."""
+        return self._base.encode_ordinary_batch(texts, num_threads=self._encode_threads)
 
     def decode(self, token_ids: list[int]) -> str:
         parts: list[str] = []

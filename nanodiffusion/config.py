@@ -49,10 +49,21 @@ class SampleConfig(BaseModel):
     max_length: int = 256
 
 
+class DataConfig(BaseModel):
+    dataset: str = "climbmix-400b"
+    data_dir: Path = Path("data")
+    num_train_shards: int | None = None
+    tokenizer_batch_size: int = 128
+    tokenizer_threads: int = 4
+    prefetch_size: int = 4
+    max_empty_passes: int = 100
+
+
 class Config(BaseModel):
     model: ModelConfig = ModelConfig()
     train: TrainConfig = TrainConfig()
     sample: SampleConfig = SampleConfig()
+    data: DataConfig = DataConfig()
 
     @classmethod
     def from_yaml(cls, path: str | Path) -> "Config":
