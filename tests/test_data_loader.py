@@ -14,7 +14,7 @@ from nanodiffusion.data.loader import (
     prefetch,
     pretrain_loader,
 )
-from nanodiffusion.data.source import InMemoryTextSource
+from nanodiffusion.data.source import InMemoryTextSource, SourcePosition, Split
 from nanodiffusion.tokenizer import Tokenizer
 
 _ShapeError = TypeCheckError
@@ -98,25 +98,14 @@ def test_full_utilization_no_special_tokens_in_text(tok: Tokenizer) -> None:
 
 
 def test_determinism(tok: Tokenizer) -> None:
-    """Two runs with identical sources and parameters yield identical batches.
-
-    Pin tokenizer_threads=1 so the test does not rely on tiktoken's
-    multi-threaded ordering being stable.
-    """
+    """Two runs with identical sources and parameters yield identical batches."""
     docs = _docs(60)
 
     def loader_run() -> list[BatchOutput]:
         src = InMemoryTextSource(docs, val_size=2)
         return list(
             islice(
-                pretrain_loader(
-                    src,
-                    tok,
-                    batch_size=2,
-                    seq_len=48,
-                    split="train",
-                    tokenizer_threads=1,
-                ),
+                pretrain_loader(src, tok, batch_size=2, seq_len=48, split="train"),
                 5,
             )
         )
@@ -145,44 +134,39 @@ def test_long_doc_spans_multiple_chunks(tok: Tokenizer) -> None:
     assert any((b.segments == 0).all() for b in batches)
 
 
-def test_resume_state_round_trip(tok: Tokenizer) -> None:
-    """Resume from a saved state and verify the loader produces consistent
-    follow-up batches."""
+def _state_tuple(state: SourcePosition) -> tuple[int, int, int]:
+    return state["epoch"], state["shard_idx"], state["row_group_idx"]
+
+
+def test_resume_state_advances_past_saved_position(tok: Tokenizer) -> None:
+    """Resuming must skip past the saved position rather than restart."""
     src = InMemoryTextSource(_docs(80), val_size=4)
     first = list(
         islice(
-            pretrain_loader(
-                src,
-                tok,
-                batch_size=2,
-                seq_len=32,
-                split="train",
-                tokenizer_threads=1,
-            ),
+            pretrain_loader(src, tok, batch_size=2, seq_len=32, split="train"),
             3,
         )
     )
     saved_state = first[-1].state
 
-    fresh_src = InMemoryTextSource(_docs(80), val_size=4)
+    resumed_src = InMemoryTextSource(_docs(80), val_size=4)
     resumed = list(
         islice(
             pretrain_loader(
-                fresh_src,
+                resumed_src,
                 tok,
                 batch_size=2,
                 seq_len=32,
                 split="train",
-                tokenizer_threads=1,
                 resume_state=saved_state,
             ),
             2,
         )
     )
-    # The resumed batches must have valid state with epoch >= the saved one.
-    for batch in resumed:
-        assert batch.state["epoch"] >= saved_state["epoch"]
-    # Resumed batches must satisfy the same shape and segment invariants.
+
+    # The first resumed batch must come from a strictly later source position;
+    # otherwise resume_state is silently ignored.
+    assert _state_tuple(resumed[0].state) > _state_tuple(saved_state)
     for b in resumed:
         assert b.tokens.shape == (2, 32)
         assert (b.segments[:, 0] == 0).all()
@@ -212,13 +196,7 @@ def test_pretrain_loader_infinite_loop_guard(tok: Tokenizer) -> None:
     class EmptyTokenizer:
         eos_token_id: int = 0
 
-        def encode_batch(
-            self,
-            texts: list[str],
-            *,
-            num_threads: int = 4,
-        ) -> list[list[int]]:
-            del num_threads
+        def encode_batch(self, texts: list[str]) -> list[list[int]]:
             return [[] for _ in texts]
 
     del tok
@@ -227,7 +205,7 @@ def test_pretrain_loader_infinite_loop_guard(tok: Tokenizer) -> None:
         next(
             pretrain_loader(
                 src,
-                EmptyTokenizer(),  # type: ignore[arg-type]
+                EmptyTokenizer(),
                 batch_size=2,
                 seq_len=32,
                 split="train",
@@ -238,7 +216,7 @@ def test_pretrain_loader_infinite_loop_guard(tok: Tokenizer) -> None:
 
 def test_pretrain_loader_handles_finite_source(tok: Tokenizer) -> None:
     """A finite source must surface as a clean StopIteration, not RuntimeError."""
-    from nanodiffusion.data.source import SourcePosition, Split  # noqa: PLC0415
+    from structlog.testing import capture_logs  # noqa: PLC0415
 
     class FiniteSource:
         def iter_documents(
@@ -248,8 +226,9 @@ def test_pretrain_loader_handles_finite_source(tok: Tokenizer) -> None:
             start: int = 0,
             step: int = 1,
             batch_size: int = 128,
+            resume: SourcePosition | None = None,
         ) -> Iterator[tuple[list[str], SourcePosition]]:
-            del split, start, step, batch_size
+            del split, start, step, batch_size, resume
             position: SourcePosition = {
                 "epoch": 1,
                 "shard_idx": 0,
@@ -265,8 +244,11 @@ def test_pretrain_loader_handles_finite_source(tok: Tokenizer) -> None:
         split="train",
     )
     # The single tiny doc cannot fill a 256-token chunk; the loader should
-    # exhaust the source and exit cleanly.
-    assert list(loader) == []
+    # exhaust the source, log a warning, and exit cleanly.
+    with capture_logs() as logs:
+        result = list(loader)
+    assert result == []
+    assert any("partial chunk dropped" in log["event"] for log in logs)
 
 
 def test_batch_output_to_jax_returns_jax_batch(tok: Tokenizer) -> None:
@@ -323,26 +305,12 @@ def test_prefetch_yields_same_sequence_as_loader(tok: Tokenizer) -> None:
 
     plain = list(
         islice(
-            pretrain_loader(
-                src_a,
-                tok,
-                batch_size=2,
-                seq_len=32,
-                split="train",
-                tokenizer_threads=1,
-            ),
+            pretrain_loader(src_a, tok, batch_size=2, seq_len=32, split="train"),
             4,
         )
     )
     with prefetch(
-        pretrain_loader(
-            src_b,
-            tok,
-            batch_size=2,
-            seq_len=32,
-            split="train",
-            tokenizer_threads=1,
-        ),
+        pretrain_loader(src_b, tok, batch_size=2, seq_len=32, split="train"),
         size=2,
     ) as p:
         prefetched = list(islice(p, 4))

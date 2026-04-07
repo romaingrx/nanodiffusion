@@ -31,7 +31,7 @@ def list_datasets() -> None:
 )
 @click.option(
     "--num-train",
-    type=int,
+    type=click.IntRange(min=1),
     default=10,
     show_default=True,
     help="Number of train shards to download",

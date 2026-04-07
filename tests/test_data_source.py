@@ -77,6 +77,50 @@ def test_in_memory_source_rejects_invalid_val_size() -> None:
         InMemoryTextSource(["a", "b"], val_size=0)
 
 
+def test_in_memory_source_rejects_unsatisfiable_stride() -> None:
+    """A start beyond every batch must raise instead of looping forever."""
+    src = InMemoryTextSource([f"d{i}" for i in range(4)], val_size=1)
+    with pytest.raises(ValueError, match="no batches"):
+        list(islice(src.iter_documents("train", batch_size=10, start=99), 1))
+
+
+def test_in_memory_source_rejects_negative_start() -> None:
+    src = InMemoryTextSource(["a", "b", "c"], val_size=1)
+    with pytest.raises(ValueError, match="start must be"):
+        next(src.iter_documents("train", batch_size=1, start=-1))
+
+
+def test_in_memory_source_rejects_zero_step() -> None:
+    src = InMemoryTextSource(["a", "b", "c"], val_size=1)
+    with pytest.raises(ValueError, match="step must be"):
+        next(src.iter_documents("train", batch_size=1, step=0))
+
+
+def test_in_memory_source_resume_advances_past_saved_position() -> None:
+    """``resume`` must yield strictly later positions than the saved one."""
+    src = InMemoryTextSource([f"d{i}" for i in range(20)], val_size=2)
+    first = list(islice(src.iter_documents("train", batch_size=2), 3))
+    saved = first[-1][1]
+
+    resumed_first = next(src.iter_documents("train", batch_size=2, resume=saved))
+    new_state = resumed_first[1]
+    saved_tup = (saved["epoch"], saved["shard_idx"], saved["row_group_idx"])
+    new_tup = (new_state["epoch"], new_state["shard_idx"], new_state["row_group_idx"])
+    assert new_tup > saved_tup
+    # The doc at the saved batch must not appear again immediately after resume.
+    assert resumed_first[0] != first[-1][0]
+
+
+def test_in_memory_source_resume_at_last_position_advances_epoch() -> None:
+    """Resuming at the very last batch of an epoch must roll into the next epoch."""
+    src = InMemoryTextSource([f"d{i}" for i in range(5)], val_size=1)
+    all_first_epoch = list(islice(src.iter_documents("train", batch_size=2), 2))
+    saved = all_first_epoch[-1][1]
+
+    resumed = next(src.iter_documents("train", batch_size=2, resume=saved))
+    assert resumed[1]["epoch"] == saved["epoch"] + 1
+
+
 def test_parquet_source_round_trip(tmp_path: Path) -> None:
     train_a = tmp_path / "train_a.parquet"
     train_b = tmp_path / "train_b.parquet"
@@ -176,3 +220,51 @@ def test_parquet_source_rejects_empty_split(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="val"):
         next(src.iter_documents("val"))
+
+
+def test_parquet_source_rejects_unsatisfiable_stride(tmp_path: Path) -> None:
+    """A start beyond every row group must raise instead of looping forever."""
+    train = tmp_path / "train.parquet"
+    val = tmp_path / "val.parquet"
+    write_parquet(train, ["a", "b"], row_group_size=1)
+    write_parquet(val, ["v"], row_group_size=1)
+    src = ParquetTextSource([train], [val])
+    with pytest.raises(ValueError, match="no batches"):
+        list(islice(src.iter_documents("train", batch_size=10, start=99), 1))
+
+
+def test_parquet_source_resume_advances_past_saved_row_group(tmp_path: Path) -> None:
+    """``resume`` must skip the saved row group so training doesn't re-ingest it."""
+    train = tmp_path / "train.parquet"
+    val = tmp_path / "val.parquet"
+    write_parquet(train, [f"d{i}" for i in range(6)], row_group_size=1)
+    write_parquet(val, ["v"], row_group_size=1)
+    src = ParquetTextSource([train], [val])
+
+    first = list(islice(src.iter_documents("train", batch_size=10), 3))
+    saved = first[-1][1]
+
+    resumed_first = next(src.iter_documents("train", batch_size=10, resume=saved))
+    new_state = resumed_first[1]
+    saved_tup = (saved["epoch"], saved["shard_idx"], saved["row_group_idx"])
+    new_tup = (new_state["epoch"], new_state["shard_idx"], new_state["row_group_idx"])
+    assert new_tup > saved_tup
+    assert resumed_first[0] != first[-1][0]
+
+
+def test_parquet_source_resume_across_shards(tmp_path: Path) -> None:
+    """Resuming at shard N must skip shards < N and continue from N + 1 row group."""
+    train_a = tmp_path / "a.parquet"
+    train_b = tmp_path / "b.parquet"
+    val = tmp_path / "v.parquet"
+    write_parquet(train_a, ["a0", "a1"], row_group_size=1)
+    write_parquet(train_b, ["b0", "b1"], row_group_size=1)
+    write_parquet(val, ["v"], row_group_size=1)
+    src = ParquetTextSource([train_a, train_b], [val])
+
+    saved: SourcePosition = {"epoch": 1, "shard_idx": 0, "row_group_idx": 1}
+    batches = list(islice(src.iter_documents("train", batch_size=10, resume=saved), 2))
+    # Shard 0 row group 1 is skipped; next is shard 1 row group 0.
+    assert batches[0][1]["shard_idx"] == 1
+    assert batches[0][1]["row_group_idx"] == 0
+    assert batches[0][0] == ["b0"]

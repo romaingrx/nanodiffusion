@@ -10,6 +10,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol, runtime_checkable
 
+import pyarrow as pa
+import pyarrow.parquet as pq
+
 from nanodiffusion.data.source import ParquetTextSource, TextSource
 
 
@@ -122,14 +125,38 @@ def _download_shards(
         url = _HF_RESOLVE_URL.format(repo_id=repo_id, filename=filename)
         target = dest_dir / filename
         target.parent.mkdir(parents=True, exist_ok=True)
-        _download_with_backoff(url, target, options=options)
+        _download_with_backoff(
+            url, target, options=options, validator=_validate_parquet
+        )
 
     with ThreadPoolExecutor(max_workers=options.num_workers) as pool:
         for _ in pool.map(task, todo):
             pass
 
 
-def _download_with_backoff(url: str, target: Path, *, options: DownloadOptions) -> None:
+def _validate_parquet(path: Path) -> None:
+    """Verify the file at ``path`` is a readable parquet file.
+
+    Raises :class:`ValueError` so the download retry loop treats a corrupt
+    payload (e.g. an HTML error page served with HTTP 200) the same as a
+    transient network failure.
+    """
+    try:
+        # Touch metadata so parquet reads the footer instead of just opening
+        # the file handle.
+        _ = pq.ParquetFile(path).metadata
+    except (pa.ArrowException, OSError) as exc:
+        msg = f"File at {path} is not a valid parquet"
+        raise ValueError(msg) from exc
+
+
+def _download_with_backoff(
+    url: str,
+    target: Path,
+    *,
+    options: DownloadOptions,
+    validator: Callable[[Path], None] | None = None,
+) -> None:
     # Local imports keep module import cheap for callers that only touch
     # the registry (e.g. ``data list``).
     import random  # noqa: PLC0415
@@ -150,8 +177,12 @@ def _download_with_backoff(url: str, target: Path, *, options: DownloadOptions) 
                     for chunk in response.iter_content(chunk_size=options.chunk_size):
                         if chunk:
                             fh.write(chunk)
+            # Validate before rename so a corrupt payload is retried instead
+            # of being committed and then failing at read time.
+            if validator is not None:
+                validator(tmp)
             tmp.replace(target)
-        except (requests.RequestException, OSError) as exc:
+        except (requests.RequestException, OSError, ValueError) as exc:
             last_exc = exc
             if tmp.exists():
                 tmp.unlink(missing_ok=True)

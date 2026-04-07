@@ -33,7 +33,9 @@ class TextSource(Protocol):
     After exhausting the assigned shards, implementations must loop back
     and increment ``position["epoch"]``. ``start`` / ``step`` partition
     the work at the implementation's natural granularity and are safe to
-    use as a data-parallel sharding hook.
+    use as a data-parallel sharding hook. ``resume`` fast-forwards past a
+    previously yielded position so checkpoint resumption skips already
+    processed data.
     """
 
     def iter_documents(
@@ -43,7 +45,16 @@ class TextSource(Protocol):
         start: int = 0,
         step: int = 1,
         batch_size: int = 128,
+        resume: SourcePosition | None = None,
     ) -> Iterator[tuple[list[str], SourcePosition]]: ...
+
+
+def _validate_stride(start: int, step: int) -> None:
+    if start < 0 or step < 1:
+        msg = (
+            f"start must be >= 0 and step must be >= 1, got start={start}, step={step}"
+        )
+        raise ValueError(msg)
 
 
 class ParquetTextSource:
@@ -67,17 +78,27 @@ class ParquetTextSource:
         start: int = 0,
         step: int = 1,
         batch_size: int = 128,
+        resume: SourcePosition | None = None,
     ) -> Iterator[tuple[list[str], SourcePosition]]:
         paths = self._train_paths if split == "train" else self._val_paths
         if not paths:
             msg = f"ParquetTextSource has no {split!r} shards"
             raise ValueError(msg)
+        _validate_stride(start, step)
 
-        epoch = 1
+        epoch = resume["epoch"] if resume else 1
+        skip = resume
         while True:
+            yielded = False
             for shard_idx, path in enumerate(paths):
+                if skip is not None and shard_idx < skip["shard_idx"]:
+                    continue
                 pf = pq.ParquetFile(path)
-                for row_group_idx in range(start, pf.num_row_groups, step):
+                if skip is not None and shard_idx == skip["shard_idx"]:
+                    rg_start = skip["row_group_idx"] + step
+                else:
+                    rg_start = start
+                for row_group_idx in range(rg_start, pf.num_row_groups, step):
                     row_group = pf.read_row_group(
                         row_group_idx, columns=[self._text_column]
                     )
@@ -91,7 +112,17 @@ class ParquetTextSource:
                             "shard_idx": shard_idx,
                             "row_group_idx": row_group_idx,
                         }
+                        yielded = True
                         yield batch, position
+            was_skipping = skip is not None
+            skip = None
+            if not yielded and not was_skipping:
+                # An unskipped epoch produced nothing, so the next will too.
+                msg = (
+                    f"ParquetTextSource yields no batches for split={split!r} "
+                    f"with start={start}, step={step}"
+                )
+                raise ValueError(msg)
             epoch += 1
 
 
@@ -119,16 +150,21 @@ class InMemoryTextSource:
         start: int = 0,
         step: int = 1,
         batch_size: int = 128,
+        resume: SourcePosition | None = None,
     ) -> Iterator[tuple[list[str], SourcePosition]]:
         docs = self._train if split == "train" else self._val
         if not docs:
             msg = f"InMemoryTextSource has no {split!r} docs"
             raise ValueError(msg)
+        _validate_stride(start, step)
 
         batch_count = (len(docs) + batch_size - 1) // batch_size
-        epoch = 1
+        epoch = resume["epoch"] if resume else 1
+        skip = resume
         while True:
-            for batch_idx in range(start, batch_count, step):
+            yielded = False
+            batch_start = skip["row_group_idx"] + step if skip is not None else start
+            for batch_idx in range(batch_start, batch_count, step):
                 offset = batch_idx * batch_size
                 batch = docs[offset : offset + batch_size]
                 position: SourcePosition = {
@@ -136,5 +172,14 @@ class InMemoryTextSource:
                     "shard_idx": 0,
                     "row_group_idx": batch_idx,
                 }
+                yielded = True
                 yield batch, position
+            was_skipping = skip is not None
+            skip = None
+            if not yielded and not was_skipping:
+                msg = (
+                    f"InMemoryTextSource yields no batches for split={split!r} "
+                    f"with start={start}, step={step}"
+                )
+                raise ValueError(msg)
             epoch += 1

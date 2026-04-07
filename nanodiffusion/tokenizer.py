@@ -12,16 +12,16 @@ import tiktoken
 
 @runtime_checkable
 class TokenizerLike(Protocol):
-    """Minimal tokenizer surface the data loader depends on."""
+    """Minimal tokenizer surface the data loader depends on.
+
+    Implementations decide their own threading strategy at construction time;
+    the loader stays agnostic so non-parallel tokenizers don't need to
+    accept a no-op ``num_threads`` kwarg.
+    """
 
     eos_token_id: int
 
-    def encode_batch(
-        self,
-        texts: list[str],
-        *,
-        num_threads: int = 4,
-    ) -> list[list[int]]: ...
+    def encode_batch(self, texts: list[str]) -> list[list[int]]: ...
 
 
 class SpecialToken(enum.StrEnum):
@@ -39,8 +39,9 @@ class SpecialToken(enum.StrEnum):
 class Tokenizer:
     """GPT-2 tiktoken encoding extended with diffusion and chat tokens."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, encode_threads: int = 4) -> None:
         self._base = tiktoken.get_encoding("gpt2")
+        self._encode_threads = encode_threads
         base = self._base.n_vocab
 
         self._special_to_id: dict[SpecialToken, int] = {
@@ -62,14 +63,9 @@ class Tokenizer:
     def encode(self, text: str) -> list[int]:
         return self._base.encode(text)
 
-    def encode_batch(
-        self,
-        texts: list[str],
-        *,
-        num_threads: int = 4,
-    ) -> list[list[int]]:
+    def encode_batch(self, texts: list[str]) -> list[list[int]]:
         """Encode plain text (no special tokens). GIL-free via tiktoken C++."""
-        return self._base.encode_ordinary_batch(texts, num_threads=num_threads)
+        return self._base.encode_ordinary_batch(texts, num_threads=self._encode_threads)
 
     def decode(self, token_ids: list[int]) -> str:
         parts: list[str] = []

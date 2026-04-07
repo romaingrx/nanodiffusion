@@ -17,12 +17,11 @@ from tests._helpers import write_parquet
 
 
 def _dummy_factory(
-    data_dir: Path,
+    _data_dir: Path,
     *,
-    num_train: int | None = None,
-    download: bool = True,
+    _num_train: int | None = None,
+    _download: bool = True,
 ) -> ParquetTextSource:
-    del data_dir, num_train, download
     raise NotImplementedError
 
 
@@ -255,3 +254,37 @@ def test_download_skips_existing_files(
     )
     train_first = next(src.iter_documents("train", batch_size=10))
     assert train_first[0] == ["existing"]
+
+
+def test_download_rejects_invalid_parquet_payload(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A 200 OK with a non-parquet body must be retried, not committed.
+
+    Simulates the failure mode where HuggingFace returns an HTML error page
+    or a CDN returns a partial download with the wrong content type.
+    """
+    calls = {"n": 0}
+
+    def fake_get(_url: str, **_kwargs: Any) -> _FakeResponse:
+        calls["n"] += 1
+        return _FakeResponse(b"<html>not a parquet file</html>")
+
+    import requests  # noqa: PLC0415
+
+    monkeypatch.setattr(requests, "get", fake_get)
+
+    dest = tmp_path / "out"
+    with pytest.raises(RuntimeError, match="Failed to download"):
+        parquet_from_huggingface(
+            repo_id="user/repo",
+            filename_pattern="shard_{index:05d}.parquet",
+            train_indices=[0],
+            val_indices=[],
+            data_dir=dest,
+            download=True,
+            options=_no_sleep_options(retries=2),
+        )
+    assert calls["n"] == 2  # Validation failure must trigger retries.
+    assert not (dest / "shard_00000.parquet").exists()
+    assert list(dest.glob("*.tmp")) == []
