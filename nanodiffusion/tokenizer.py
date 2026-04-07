@@ -5,8 +5,29 @@ Follows the nanochat convention of paired start/end delimiters and
 """
 
 import enum
+from typing import Protocol, runtime_checkable
 
 import tiktoken
+
+
+@runtime_checkable
+class TokenizerLike(Protocol):
+    """Minimal tokenizer surface the data loader depends on.
+
+    Mirrors the :class:`~nanodiffusion.model.DiffusionModel` Protocol pattern:
+    the loader stays decoupled from the concrete :class:`Tokenizer` so a
+    different backend (e.g. SentencePiece) can be plugged in without
+    touching ``data/``.
+    """
+
+    eos_token_id: int
+
+    def encode_batch(
+        self,
+        texts: list[str],
+        *,
+        num_threads: int = 4,
+    ) -> list[list[int]]: ...
 
 
 class SpecialToken(enum.StrEnum):

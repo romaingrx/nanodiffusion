@@ -1,9 +1,10 @@
 """Named pretraining datasets.
 
-A ``Dataset`` is a callable that materializes a :class:`TextSource` on
-demand. Datasets are registered in the module-level :data:`DATASETS` dict
-via the :func:`register` decorator. The config and CLI reference datasets
-by name; adding a new corpus is one decorated function below.
+A :class:`DatasetFactory` is a callable that materializes a
+:class:`TextSource` on demand. Factories are registered in the module-level
+:data:`DATASETS` dict via the :func:`register` decorator. The config and CLI
+reference datasets by name; adding a new corpus is one decorated function
+below.
 
 This is the only module that knows about Hugging Face. ``source.py`` stays
 offline-pure so its tests never touch the network.
@@ -11,6 +12,7 @@ offline-pure so its tests never touch the network.
 
 from collections.abc import Callable, Iterable
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol, runtime_checkable
 
@@ -18,13 +20,18 @@ from nanodiffusion.data.source import ParquetTextSource, TextSource
 
 
 @runtime_checkable
-class Dataset(Protocol):
+class DatasetFactory(Protocol):
     """Callable that builds a :class:`TextSource` from a local cache dir.
 
     Implementations may download files, scan a local directory, or build a
     synthetic source. ``num_train`` lets the caller request a smaller slice
     than the dataset's full train set; ``None`` means use whatever the
-    dataset considers full.
+    dataset considers full. ``download_options`` is honored by HTTP-backed
+    factories and silently ignored by local-only ones (the keyword is in
+    the contract so the CLI can stay generic).
+
+    Named ``DatasetFactory`` (not ``Dataset``) to avoid the collision with
+    ``torch.utils.data.Dataset`` and ``datasets.Dataset`` (HuggingFace).
     """
 
     def __call__(
@@ -33,20 +40,21 @@ class Dataset(Protocol):
         *,
         num_train: int | None = None,
         download: bool = True,
+        download_options: "DownloadOptions | None" = None,
     ) -> TextSource: ...
 
 
-DATASETS: dict[str, Dataset] = {}
+DATASETS: dict[str, DatasetFactory] = {}
 
 
-def register(name: str) -> Callable[[Dataset], Dataset]:
+def register(name: str) -> Callable[[DatasetFactory], DatasetFactory]:
     """Decorator: register a dataset factory under ``name``.
 
     Raises :class:`ValueError` on duplicate names so silent shadowing
     cannot happen if two modules define the same key.
     """
 
-    def decorator(fn: Dataset) -> Dataset:
+    def decorator(fn: DatasetFactory) -> DatasetFactory:
         if name in DATASETS:
             msg = f"Dataset {name!r} already registered"
             raise ValueError(msg)
@@ -56,13 +64,33 @@ def register(name: str) -> Callable[[Dataset], Dataset]:
     return decorator
 
 
-def get(name: str) -> Dataset:
-    """Look up a registered dataset by name."""
+def get_dataset(name: str) -> DatasetFactory:
+    """Look up a registered dataset by name with a helpful error on miss."""
     if name not in DATASETS:
         available = ", ".join(sorted(DATASETS)) or "(none)"
         msg = f"Unknown dataset {name!r}. Available: {available}"
         raise KeyError(msg)
     return DATASETS[name]
+
+
+@dataclass(frozen=True, slots=True)
+class DownloadOptions:
+    """Knobs for the HF parquet downloader.
+
+    All fields have sensible defaults for production use; tests can override
+    them to make retry/backoff paths fast and deterministic.
+    """
+
+    retries: int = 5
+    timeout: float = 60.0
+    backoff_base: float = 2.0
+    backoff_cap: float = 16.0
+    backoff_jitter: float = 0.5
+    chunk_size: int = 1 << 20
+    num_workers: int = 4
+
+
+_DEFAULT_DOWNLOAD = DownloadOptions()
 
 
 def parquet_from_huggingface(
@@ -74,7 +102,7 @@ def parquet_from_huggingface(
     data_dir: Path,
     download: bool = True,
     text_column: str = "text",
-    num_workers: int = 4,
+    options: DownloadOptions = _DEFAULT_DOWNLOAD,
 ) -> ParquetTextSource:
     """Helper most HF parquet datasets reuse.
 
@@ -91,7 +119,7 @@ def parquet_from_huggingface(
             filename_pattern=filename_pattern,
             indices=train_idx + val_idx,
             dest_dir=data_dir,
-            num_workers=num_workers,
+            options=options,
         )
     train_paths = [data_dir / filename_pattern.format(index=i) for i in train_idx]
     val_paths = [data_dir / filename_pattern.format(index=i) for i in val_idx]
@@ -99,7 +127,6 @@ def parquet_from_huggingface(
 
 
 _HF_RESOLVE_URL = "https://huggingface.co/datasets/{repo_id}/resolve/main/{filename}"
-_DOWNLOAD_RETRIES = 5
 
 
 def _download_shards(
@@ -108,14 +135,15 @@ def _download_shards(
     filename_pattern: str,
     indices: list[int],
     dest_dir: Path,
-    num_workers: int,
+    options: DownloadOptions,
 ) -> None:
     """Download missing parquet shards from a HF dataset repo.
 
-    Atomic via temp-file rename. Skips files already on disk. Parallelized
-    with a ``ThreadPoolExecutor``. The ``requests`` import is local so
-    importing this module stays cheap for callers that only touch the
-    registry (e.g. ``data list``).
+    Atomic via temp-file rename with a per-call uuid suffix so concurrent
+    callers in the same process never clobber each other. Skips files
+    already on disk. Parallelized with a :class:`ThreadPoolExecutor`. The
+    ``requests`` import is local so importing this module stays cheap for
+    callers that only touch the registry (e.g. ``data list``).
     """
     dest_dir.mkdir(parents=True, exist_ok=True)
     todo = [
@@ -129,26 +157,31 @@ def _download_shards(
         url = _HF_RESOLVE_URL.format(repo_id=repo_id, filename=filename)
         target = dest_dir / filename
         target.parent.mkdir(parents=True, exist_ok=True)
-        _download_with_backoff(url, target)
+        _download_with_backoff(url, target, options=options)
 
-    with ThreadPoolExecutor(max_workers=num_workers) as pool:
+    with ThreadPoolExecutor(max_workers=options.num_workers) as pool:
         for _ in pool.map(task, todo):
             pass
 
 
-def _download_with_backoff(url: str, target: Path) -> None:
+def _download_with_backoff(url: str, target: Path, *, options: DownloadOptions) -> None:
+    import random  # noqa: PLC0415
     import time  # noqa: PLC0415
+    import uuid  # noqa: PLC0415
 
     import requests  # noqa: PLC0415
 
-    tmp = target.with_suffix(target.suffix + ".tmp")
+    # Per-call uuid so two threads downloading the same shard concurrently
+    # write to different temp files. Last successful rename wins, but no
+    # half-written file ever ends up at the final path.
+    tmp = target.with_suffix(f"{target.suffix}.{uuid.uuid4().hex}.tmp")
     last_exc: Exception | None = None
-    for attempt in range(1, _DOWNLOAD_RETRIES + 1):
+    for attempt in range(1, options.retries + 1):
         try:
-            with requests.get(url, stream=True, timeout=60) as response:
+            with requests.get(url, stream=True, timeout=options.timeout) as response:
                 response.raise_for_status()
                 with tmp.open("wb") as fh:
-                    for chunk in response.iter_content(chunk_size=1 << 20):
+                    for chunk in response.iter_content(chunk_size=options.chunk_size):
                         if chunk:
                             fh.write(chunk)
             tmp.replace(target)
@@ -156,12 +189,16 @@ def _download_with_backoff(url: str, target: Path) -> None:
             last_exc = exc
             if tmp.exists():
                 tmp.unlink(missing_ok=True)
-            if attempt < _DOWNLOAD_RETRIES:
-                time.sleep(2**attempt)
+            if attempt < options.retries:
+                # Capped exponential backoff with jitter so a thundering
+                # herd of failed shards spreads out instead of stampeding.
+                base = min(options.backoff_base**attempt, options.backoff_cap)
+                jitter = random.uniform(0.0, options.backoff_jitter * base)  # noqa: S311
+                time.sleep(base + jitter)
             continue
         else:
             return
-    msg = f"Failed to download {url} after {_DOWNLOAD_RETRIES} attempts"
+    msg = f"Failed to download {url} after {options.retries} attempts"
     raise RuntimeError(msg) from last_exc
 
 
@@ -171,6 +208,7 @@ def climbmix_400b(
     *,
     num_train: int | None = None,
     download: bool = True,
+    download_options: DownloadOptions | None = None,
 ) -> ParquetTextSource:
     """ClimbMix-400B (Karpathy). nanochat default. 6543 shards, last is val."""
     return parquet_from_huggingface(
@@ -180,6 +218,7 @@ def climbmix_400b(
         val_indices=(6542,),
         data_dir=data_dir,
         download=download,
+        options=download_options or _DEFAULT_DOWNLOAD,
     )
 
 
@@ -189,18 +228,15 @@ def fineweb_edu_10bt(
     *,
     num_train: int | None = None,
     download: bool = True,
+    download_options: DownloadOptions | None = None,
 ) -> ParquetTextSource:
-    """FineWeb-Edu sample-10BT subset (HuggingFaceFW).
-
-    The exact filename pattern needs to be confirmed against the live repo
-    layout the first time this dataset is used; the placeholder below
-    follows the conventional ``sample/10BT/000_<NN>.parquet`` shape.
-    """
+    """FineWeb-Edu sample-10BT subset (HuggingFaceFW). 14 shards, last is val."""
     return parquet_from_huggingface(
         repo_id="HuggingFaceFW/fineweb-edu",
-        filename_pattern="sample/10BT/000_{index:05d}.parquet",
-        train_indices=range(num_train if num_train is not None else 14),
-        val_indices=(14,),
+        filename_pattern="sample/10BT/{index:03d}_00000.parquet",
+        train_indices=range(num_train if num_train is not None else 13),
+        val_indices=(13,),
         data_dir=data_dir,
         download=download,
+        options=download_options or _DEFAULT_DOWNLOAD,
     )

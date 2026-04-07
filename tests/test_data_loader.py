@@ -5,6 +5,7 @@ from collections.abc import Iterator
 
 import numpy as np
 import pytest
+from jaxtyping import TypeCheckError
 
 from nanodiffusion.data.loader import (
     BatchOutput,
@@ -14,19 +15,17 @@ from nanodiffusion.data.loader import (
 )
 from nanodiffusion.data.source import InMemoryTextSource
 from nanodiffusion.tokenizer import Tokenizer
+from tests._helpers import take
 
-
-@pytest.fixture
-def tok() -> Tokenizer:
-    return Tokenizer()
+# When tests run under the jaxtyping import hook, BatchOutput.__init__ is
+# decorated and shape errors surface as TypeCheckError. In production
+# (without the hook) the dataclass __post_init__ raises ValueError. Tests
+# accept either path.
+_ShapeError = (TypeCheckError, ValueError)
 
 
 def _docs(n: int, words_per_doc: int = 20) -> list[str]:
     return [f"doc {i} " + ("hello world " * words_per_doc) for i in range(n)]
-
-
-def _take(it: Iterator[BatchOutput], n: int) -> list[BatchOutput]:
-    return [next(it) for _ in range(n)]
 
 
 def test_batch_shape_and_dtype(tok: Tokenizer) -> None:
@@ -43,55 +42,84 @@ def test_batch_shape_and_dtype(tok: Tokenizer) -> None:
 def test_segments_start_at_zero(tok: Tokenizer) -> None:
     src = InMemoryTextSource(_docs(50), val_size=2)
     loader = pretrain_loader(src, tok, batch_size=4, seq_len=32, split="train")
-    batches = _take(loader, 3)
+    batches = take(loader, 3)
     for b in batches:
         assert (b.segments[:, 0] == 0).all()
+
+
+def test_segments_non_negative_per_row(tok: Tokenizer) -> None:
+    """The per-row min-subtraction must never produce negative segment ids."""
+    src = InMemoryTextSource(_docs(80, words_per_doc=5), val_size=4)
+    loader = pretrain_loader(src, tok, batch_size=4, seq_len=64, split="train")
+    for batch in take(loader, 4):
+        assert (batch.segments >= 0).all()
 
 
 def test_segments_monotonic_within_row(tok: Tokenizer) -> None:
     """Segment ids never decrease within a row and only increment by 1 at most."""
     src = InMemoryTextSource(_docs(80, words_per_doc=5), val_size=4)
     loader = pretrain_loader(src, tok, batch_size=4, seq_len=64, split="train")
-    batches = _take(loader, 4)
+    batches = take(loader, 4)
+    saw_increment = False
     for b in batches:
         diffs = np.diff(b.segments, axis=1)
         assert (diffs >= 0).all()
         assert (diffs <= 1).all()
+        if (diffs == 1).any():
+            saw_increment = True
+    # Sanity: the loader actually produced at least one segment boundary
+    # across the sample, otherwise the monotonicity check is vacuous.
+    assert saw_increment
 
 
 def test_segment_increments_after_eos(tok: Tokenizer) -> None:
-    """Where the row contains an EOS, the segment id increments at the next position."""
+    """Where the row contains an EOS, segment id increments at the next position."""
     src = InMemoryTextSource(_docs(80, words_per_doc=5), val_size=4)
     loader = pretrain_loader(src, tok, batch_size=2, seq_len=64, split="train")
     batch = next(loader)
     eos = tok.eos_token_id
+
+    seen_eos = 0
     for row in range(2):
         eos_positions = np.flatnonzero(batch.tokens[row] == eos)
-        if eos_positions.size == 0:
-            continue
+        seen_eos += int(eos_positions.size)
         for pos in eos_positions:
             if pos + 1 < batch.segments.shape[1]:
                 assert batch.segments[row, pos + 1] == batch.segments[row, pos] + 1
+    # The test only proves anything if at least one EOS appeared.
+    assert seen_eos > 0
 
 
-def test_full_utilization_no_padding_token(tok: Tokenizer) -> None:
-    """We use greedy concat, so there's no pad token in the output."""
+def test_full_utilization_no_special_tokens_in_text(tok: Tokenizer) -> None:
+    """Greedy concat should not introduce padding or mask tokens into x0."""
     src = InMemoryTextSource(_docs(50), val_size=2)
     loader = pretrain_loader(src, tok, batch_size=4, seq_len=32, split="train")
     batch = next(loader)
-    # The mask token id should never appear in pretrain data; only model
-    # forward-mask injects it. EOS is allowed.
+    # mask token only appears via the diffusion forward pass
     assert (batch.tokens != tok.mask_token_id).all()
+    # bos token is reserved for chat conversations, never in pretrain rows
+    assert (batch.tokens != tok.bos_token_id).all()
 
 
 def test_determinism(tok: Tokenizer) -> None:
-    """Two runs with identical sources and parameters yield identical batches."""
+    """Two runs with identical sources and parameters yield identical batches.
+
+    Pin tokenizer_threads=1 so the test does not rely on tiktoken's
+    multi-threaded ordering being stable.
+    """
     docs = _docs(60)
 
     def loader_run() -> list[BatchOutput]:
         src = InMemoryTextSource(docs, val_size=2)
-        return _take(
-            pretrain_loader(src, tok, batch_size=2, seq_len=48, split="train"),
+        return take(
+            pretrain_loader(
+                src,
+                tok,
+                batch_size=2,
+                seq_len=48,
+                split="train",
+                tokenizer_threads=1,
+            ),
             5,
         )
 
@@ -103,25 +131,67 @@ def test_determinism(tok: Tokenizer) -> None:
         assert ba.state == bb.state
 
 
-def test_long_doc_spans_multiple_rows(tok: Tokenizer) -> None:
-    """A doc longer than seq_len carries over the residue across batches."""
-    long_doc = "lorem ipsum dolor sit amet " * 200
-    src = InMemoryTextSource([long_doc] * 5, val_size=1)
+def test_long_doc_spans_multiple_chunks(tok: Tokenizer) -> None:
+    """A doc whose token count exceeds chunk_size must span several batches."""
+    # Build a doc large enough to fill several chunks (chunk_size = 2*32 = 64).
+    huge_doc = "lorem ipsum dolor sit amet consectetur adipiscing elit " * 200
+    src = InMemoryTextSource([huge_doc, "tiny"], val_size=1)
     loader = pretrain_loader(src, tok, batch_size=2, seq_len=32, split="train")
-    batches = _take(loader, 4)
-    # Long-doc residue means each new batch's first row's first segment is 0
-    # but the per-row reset should still apply.
+    batches = take(loader, 6)
+
+    # Per-row reset still applies for every row even mid-doc.
     for b in batches:
+        assert (b.segments[:, 0] == 0).all()
+    # Most rows are still inside the long doc, so they have very few unique
+    # segment ids. At least some rows should have only segment 0 (no EOS yet).
+    assert any((b.segments == 0).all() for b in batches)
+
+
+def test_resume_state_round_trip(tok: Tokenizer) -> None:
+    """Resume from a saved state and verify the loader produces consistent
+    follow-up batches."""
+    src = InMemoryTextSource(_docs(80), val_size=4)
+    first = take(
+        pretrain_loader(
+            src,
+            tok,
+            batch_size=2,
+            seq_len=32,
+            split="train",
+            tokenizer_threads=1,
+        ),
+        3,
+    )
+    saved_state = first[-1].state
+
+    fresh_src = InMemoryTextSource(_docs(80), val_size=4)
+    resumed = take(
+        pretrain_loader(
+            fresh_src,
+            tok,
+            batch_size=2,
+            seq_len=32,
+            split="train",
+            tokenizer_threads=1,
+            resume_state=saved_state,
+        ),
+        2,
+    )
+    # The resumed batches must have valid state with epoch >= the saved one.
+    for batch in resumed:
+        assert batch.state["epoch"] >= saved_state["epoch"]
+    # Resumed batches must satisfy the same shape and segment invariants.
+    for b in resumed:
+        assert b.tokens.shape == (2, 32)
         assert (b.segments[:, 0] == 0).all()
 
 
-def test_resume_state_advances(tok: Tokenizer) -> None:
+def test_state_epoch_monotonic(tok: Tokenizer) -> None:
     src = InMemoryTextSource(_docs(80), val_size=4)
     loader = pretrain_loader(src, tok, batch_size=2, seq_len=32, split="train")
-    batches = _take(loader, 5)
+    batches = take(loader, 5)
     epochs = [b.state["epoch"] for b in batches]
     assert epochs[0] >= 1
-    # Epochs are monotonically non-decreasing across batches.
     for a, b in itertools.pairwise(epochs):
         assert b >= a
 
@@ -134,19 +204,158 @@ def test_pretrain_loader_rejects_invalid_dims(tok: Tokenizer) -> None:
         next(pretrain_loader(src, tok, batch_size=2, seq_len=0, split="train"))
 
 
+def test_pretrain_loader_infinite_loop_guard(tok: Tokenizer) -> None:
+    """A tokenizer that always returns empty must not loop forever."""
+
+    class EmptyTokenizer:
+        eos_token_id: int = 0
+
+        def encode_batch(
+            self,
+            texts: list[str],
+            *,
+            num_threads: int = 4,
+        ) -> list[list[int]]:
+            del num_threads
+            return [[] for _ in texts]
+
+    del tok
+    src = InMemoryTextSource(_docs(50), val_size=2)
+    with pytest.raises(RuntimeError, match="no tokens"):
+        next(
+            pretrain_loader(
+                src,
+                EmptyTokenizer(),  # type: ignore[arg-type]
+                batch_size=2,
+                seq_len=32,
+                split="train",
+                max_empty_passes=5,
+            )
+        )
+
+
+def test_pretrain_loader_handles_finite_source(tok: Tokenizer) -> None:
+    """A finite source must surface as a clean StopIteration, not RuntimeError."""
+    from nanodiffusion.data.source import SourcePosition, Split  # noqa: PLC0415
+
+    class FiniteSource:
+        def iter_documents(
+            self,
+            split: Split,
+            *,
+            start: int = 0,
+            step: int = 1,
+            batch_size: int = 128,
+        ) -> Iterator[tuple[list[str], SourcePosition]]:
+            del split, start, step, batch_size
+            position: SourcePosition = {
+                "epoch": 1,
+                "shard_idx": 0,
+                "row_group_idx": 0,
+            }
+            yield ["just one doc"], position
+
+    loader = pretrain_loader(
+        FiniteSource(),
+        tok,
+        batch_size=4,
+        seq_len=64,
+        split="train",
+    )
+    # The single tiny doc cannot fill a 256-token chunk; the loader should
+    # exhaust the source and exit cleanly.
+    assert list(loader) == []
+
+
+def test_batch_output_to_jax_returns_jax_batch(tok: Tokenizer) -> None:
+    import jax  # noqa: PLC0415
+
+    from nanodiffusion.data.loader import JaxBatch  # noqa: PLC0415
+
+    src = InMemoryTextSource(_docs(40), val_size=2)
+    batch = next(pretrain_loader(src, tok, batch_size=2, seq_len=16, split="train"))
+    jax_batch = batch.to_jax()
+    assert isinstance(jax_batch, JaxBatch)
+    assert isinstance(jax_batch.tokens, jax.Array)
+    assert isinstance(jax_batch.segments, jax.Array)
+    assert jax_batch.tokens.shape == (2, 16)
+    assert jax_batch.segments.shape == (2, 16)
+    # state must round-trip unchanged so resume code can keep using it.
+    assert jax_batch.state == batch.state
+
+
+def test_batch_output_validates_shape_mismatch() -> None:
+    state = {"epoch": 1, "shard_idx": 0, "row_group_idx": 0}
+    with pytest.raises(_ShapeError):
+        BatchOutput(
+            tokens=np.zeros((4, 8), dtype=np.int32),
+            segments=np.zeros((4, 7), dtype=np.int32),
+            state=state,  # type: ignore[arg-type]
+        )
+
+
+def test_batch_output_validates_ndim() -> None:
+    state = {"epoch": 1, "shard_idx": 0, "row_group_idx": 0}
+    with pytest.raises(_ShapeError):
+        BatchOutput(
+            tokens=np.zeros((8,), dtype=np.int32),
+            segments=np.zeros((8,), dtype=np.int32),
+            state=state,  # type: ignore[arg-type]
+        )
+
+
+def test_batch_output_validates_dtype() -> None:
+    """jaxtyping.Int matches any integer dtype, so the int32 requirement
+    is enforced solely by ``__post_init__``. Construction must still raise
+    when float arrays are passed."""
+    state = {"epoch": 1, "shard_idx": 0, "row_group_idx": 0}
+    with pytest.raises(_ShapeError):
+        BatchOutput(
+            tokens=np.zeros((4, 8), dtype=np.float32),
+            segments=np.zeros((4, 8), dtype=np.int32),
+            state=state,  # type: ignore[arg-type]
+        )
+
+
+def test_batch_output_validates_int32_specifically() -> None:
+    """``__post_init__`` enforces int32 even for other integer dtypes that
+    jaxtyping's ``Int`` accepts."""
+    state = {"epoch": 1, "shard_idx": 0, "row_group_idx": 0}
+    with pytest.raises(ValueError, match="int32"):
+        BatchOutput(
+            tokens=np.zeros((4, 8), dtype=np.int64),
+            segments=np.zeros((4, 8), dtype=np.int64),
+            state=state,  # type: ignore[arg-type]
+        )
+
+
 def test_prefetch_yields_same_sequence_as_loader(tok: Tokenizer) -> None:
     src_a = InMemoryTextSource(_docs(60), val_size=2)
     src_b = InMemoryTextSource(_docs(60), val_size=2)
 
-    plain = _take(
-        pretrain_loader(src_a, tok, batch_size=2, seq_len=32, split="train"),
+    plain = take(
+        pretrain_loader(
+            src_a,
+            tok,
+            batch_size=2,
+            seq_len=32,
+            split="train",
+            tokenizer_threads=1,
+        ),
         4,
     )
     with prefetch(
-        pretrain_loader(src_b, tok, batch_size=2, seq_len=32, split="train"),
+        pretrain_loader(
+            src_b,
+            tok,
+            batch_size=2,
+            seq_len=32,
+            split="train",
+            tokenizer_threads=1,
+        ),
         size=2,
     ) as p:
-        prefetched = _take(p, 4)
+        prefetched = take(p, 4)
 
     for x, y in zip(plain, prefetched, strict=True):
         np.testing.assert_array_equal(x.tokens, y.tokens)
@@ -161,6 +370,46 @@ def test_prefetch_close_is_idempotent() -> None:
     next(p)
     p.close()
     p.close()  # second call must not raise
+
+
+def test_prefetch_next_after_close_raises_stop_iteration() -> None:
+    """Regression: previously close() ate the sentinel and next() hung."""
+
+    def gen() -> Iterator[int]:
+        yield from range(100)
+
+    p = PrefetchIterator(gen(), size=2)
+    next(p)
+    p.close()
+    with pytest.raises(StopIteration):
+        next(p)
+
+
+def test_prefetch_close_returns_promptly() -> None:
+    """close() must return without blocking the consumer indefinitely.
+
+    With the executor-based implementation there is no "stuck on a full
+    queue" failure mode (the executor handles backpressure for us), but we
+    still want to verify that an unconsumed iterator can be torn down
+    without leaving the executor running.
+    """
+    started = threading.Event()
+
+    def fast_gen() -> Iterator[int]:
+        started.set()
+        yield from range(1000)
+
+    p = PrefetchIterator(fast_gen(), size=4)
+    assert started.wait(timeout=1.0)
+    # Let the executor fill its look-ahead window.
+    time.sleep(0.05)
+    t0 = time.monotonic()
+    p.close()
+    elapsed = time.monotonic() - t0
+    assert elapsed < 1.5, f"close() took {elapsed:.2f}s"
+    # After close(), next() must raise StopIteration cleanly.
+    with pytest.raises(StopIteration):
+        next(p)
 
 
 def test_prefetch_propagates_worker_exceptions() -> None:
@@ -184,23 +433,27 @@ def test_prefetch_rejects_invalid_size() -> None:
 
 
 def test_prefetch_runs_in_background_thread() -> None:
-    """The worker thread should make progress without main-thread blocking."""
+    """The worker thread should fill the queue without main-thread blocking.
 
+    Uses an Event for synchronization (no sleeps) to avoid CI flakiness.
+    """
+    item_produced = threading.Event()
+    second_item_produced = threading.Event()
     produced: list[int] = []
-    started = threading.Event()
 
-    def slow_gen() -> Iterator[int]:
-        started.set()
+    def gen() -> Iterator[int]:
         for i in range(5):
-            time.sleep(0.005)
             produced.append(i)
+            if i == 0:
+                item_produced.set()
+            elif i == 1:
+                second_item_produced.set()
             yield i
 
-    with prefetch(slow_gen(), size=4) as p:
-        assert started.wait(timeout=1.0)
-        # Give the worker a moment to fill the queue.
-        time.sleep(0.1)
-        # By now the worker should have produced multiple items eagerly.
-        assert len(produced) >= 2
+    with prefetch(gen(), size=4) as p:
+        # The worker should produce at least the first two items eagerly,
+        # without the main thread reading from the queue at all.
+        assert item_produced.wait(timeout=1.0)
+        assert second_item_produced.wait(timeout=1.0)
         items = list(p)
     assert items == [0, 1, 2, 3, 4]

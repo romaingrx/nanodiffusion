@@ -56,12 +56,20 @@ class DataConfig(BaseModel):
     tokenizer_batch_size: int = 128
     tokenizer_threads: int = 4
     prefetch_size: int = 4
+    # Abort the loader if this many consecutive source batches produce no
+    # tokens. Guards against the silent infinite loop that would occur if a
+    # mis-configured tokenizer returns empty for every input doc.
+    max_empty_passes: int = 100
 
     @field_validator("dataset")
     @classmethod
     def _validate_dataset(cls, v: str) -> str:
-        # Lazy import keeps `from nanodiffusion.config import Config` cheap
-        # for callers that never touch the data layer (e.g. sampling-only).
+        # The data layer pulls in pyarrow at import time, which is heavy
+        # (~200ms). Lazy-import here so `from nanodiffusion.config import
+        # Config` stays cheap for callers that never touch the data layer
+        # (e.g. the `sample` CLI command). The decorator side effects in
+        # datasets.py populate DATASETS during this import, so the lookup
+        # below sees a fully-populated registry.
         from nanodiffusion.data.datasets import DATASETS  # noqa: PLC0415
 
         if v not in DATASETS:

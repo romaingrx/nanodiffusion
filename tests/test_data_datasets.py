@@ -2,20 +2,20 @@ from collections.abc import Iterator
 from pathlib import Path
 from typing import Any, Self
 
-import pyarrow as pa
-import pyarrow.parquet as pq
 import pytest
 
 from nanodiffusion.data.datasets import (
     DATASETS,
-    Dataset,
+    DatasetFactory,
+    DownloadOptions,
     climbmix_400b,
     fineweb_edu_10bt,
-    get,
+    get_dataset,
     parquet_from_huggingface,
     register,
 )
 from nanodiffusion.data.source import ParquetTextSource
+from tests._helpers import write_parquet
 
 
 def test_default_registry_entries() -> None:
@@ -24,8 +24,8 @@ def test_default_registry_entries() -> None:
 
 
 def test_registered_factories_satisfy_protocol() -> None:
-    assert isinstance(climbmix_400b, Dataset)
-    assert isinstance(fineweb_edu_10bt, Dataset)
+    assert isinstance(climbmix_400b, DatasetFactory)
+    assert isinstance(fineweb_edu_10bt, DatasetFactory)
 
 
 def test_register_decorator_adds_entry() -> None:
@@ -43,7 +43,26 @@ def test_register_decorator_adds_entry() -> None:
             raise NotImplementedError
 
         assert name in DATASETS
-        assert get(name) is my_dataset
+        assert get_dataset(name) is my_dataset
+    finally:
+        DATASETS.pop(name, None)
+
+
+def test_register_returns_original_function() -> None:
+    name = "test-register-returns"
+    try:
+
+        def fn(
+            data_dir: Path,
+            *,
+            num_train: int | None = None,
+            download: bool = True,
+        ) -> ParquetTextSource:
+            del data_dir, num_train, download
+            raise NotImplementedError
+
+        wrapped = register(name)(fn)
+        assert wrapped is fn
     finally:
         DATASETS.pop(name, None)
 
@@ -78,20 +97,51 @@ def test_register_rejects_duplicate() -> None:
         DATASETS.pop(name, None)
 
 
-def test_get_unknown_lists_available() -> None:
-    with pytest.raises(KeyError, match="climbmix-400b"):
-        get("definitely-does-not-exist")
+def test_direct_dict_assignment_works() -> None:
+    """Bypassing the decorator with a direct dict assignment is supported."""
+    name = "test-direct-assign"
+    try:
+
+        def fn(
+            data_dir: Path,
+            *,
+            num_train: int | None = None,
+            download: bool = True,
+        ) -> ParquetTextSource:
+            del data_dir, num_train, download
+            raise NotImplementedError
+
+        DATASETS[name] = fn
+        assert get_dataset(name) is fn
+    finally:
+        DATASETS.pop(name, None)
 
 
-def _write_parquet(path: Path, texts: list[str]) -> None:
-    table = pa.table({"text": texts})
-    pq.write_table(table, path, row_group_size=2)
+def test_get_dataset_unknown_lists_available() -> None:
+    """Error message must contain at least one currently-registered name."""
+    with pytest.raises(KeyError) as exc_info:
+        get_dataset("definitely-does-not-exist")
+    msg = str(exc_info.value)
+    assert "definitely-does-not-exist" in msg
+    # Whatever default datasets are registered, at least one should be listed.
+    assert any(name in msg for name in DATASETS)
+
+
+def test_get_dataset_empty_registry_message() -> None:
+    """When DATASETS is empty the error must say so cleanly."""
+    saved = dict(DATASETS)
+    try:
+        DATASETS.clear()
+        with pytest.raises(KeyError, match=r"\(none\)"):
+            get_dataset("anything")
+    finally:
+        DATASETS.update(saved)
 
 
 def test_parquet_from_huggingface_no_download(tmp_path: Path) -> None:
-    _write_parquet(tmp_path / "shard_00000.parquet", ["doc0", "doc1"])
-    _write_parquet(tmp_path / "shard_00001.parquet", ["doc2", "doc3"])
-    _write_parquet(tmp_path / "shard_00099.parquet", ["v0"])
+    write_parquet(tmp_path / "shard_00000.parquet", ["doc0", "doc1"])
+    write_parquet(tmp_path / "shard_00001.parquet", ["doc2", "doc3"])
+    write_parquet(tmp_path / "shard_00099.parquet", ["v0"])
 
     src = parquet_from_huggingface(
         repo_id="ignored",
@@ -106,72 +156,137 @@ def test_parquet_from_huggingface_no_download(tmp_path: Path) -> None:
     assert "doc0" in train_first[0]
 
 
-def test_parquet_from_huggingface_downloads_with_retry(
+def _no_sleep_options(retries: int = 5) -> DownloadOptions:
+    """DownloadOptions tuned to skip wall-clock waits in tests."""
+    return DownloadOptions(
+        retries=retries,
+        timeout=5.0,
+        backoff_base=0.0,
+        backoff_cap=0.0,
+        backoff_jitter=0.0,
+    )
+
+
+class _FakeResponse:
+    def __init__(self, payload: bytes) -> None:
+        self._payload = payload
+
+    def __enter__(self) -> Self:
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        pass
+
+    def raise_for_status(self) -> None:
+        pass
+
+    def iter_content(self, chunk_size: int) -> Iterator[bytes]:
+        del chunk_size
+        yield self._payload
+
+
+def test_download_succeeds_on_first_try(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """First two HTTP attempts fail, third succeeds."""
     fixture = tmp_path / "fixture.parquet"
-    _write_parquet(fixture, ["alpha", "beta"])
+    write_parquet(fixture, ["alpha", "beta"])
 
-    call_count = {"n": 0}
+    calls = {"n": 0}
 
-    class FakeResponse:
-        def __init__(self, payload: bytes) -> None:
-            self._payload = payload
-
-        def __enter__(self) -> Self:
-            return self
-
-        def __exit__(self, *exc: object) -> None:
-            pass
-
-        def raise_for_status(self) -> None:
-            pass
-
-        def iter_content(self, chunk_size: int) -> Iterator[bytes]:
-            del chunk_size
-            yield self._payload
-
-    def fake_get(_url: str, **_kwargs: Any) -> FakeResponse:
-        call_count["n"] += 1
-        if call_count["n"] < 3:
-            import requests as _requests  # noqa: PLC0415
-
-            raise _requests.RequestException("simulated transient failure")
-        return FakeResponse(fixture.read_bytes())
+    def fake_get(_url: str, **_kwargs: Any) -> _FakeResponse:
+        calls["n"] += 1
+        return _FakeResponse(fixture.read_bytes())
 
     import requests  # noqa: PLC0415
 
     monkeypatch.setattr(requests, "get", fake_get)
-    # The lazy `import time` inside _download_with_backoff resolves to the
-    # global time module, so patching time.sleep here suppresses the backoff.
-    import time  # noqa: PLC0415
-
-    monkeypatch.setattr(time, "sleep", lambda *_a, **_k: None)
 
     dest = tmp_path / "out"
-    src = parquet_from_huggingface(
+    parquet_from_huggingface(
         repo_id="user/repo",
         filename_pattern="shard_{index:05d}.parquet",
         train_indices=[0],
         val_indices=[1],
         data_dir=dest,
         download=True,
-        num_workers=1,
+        options=_no_sleep_options(),
     )
-
-    assert call_count["n"] >= 3
+    assert calls["n"] == 2
     assert (dest / "shard_00000.parquet").exists()
-    assert (dest / "shard_00001.parquet").exists()
+
+
+def test_download_retries_then_succeeds(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """First two HTTP attempts fail, third succeeds."""
+    fixture = tmp_path / "fixture.parquet"
+    write_parquet(fixture, ["alpha", "beta"])
+
+    calls = {"n": 0}
+
+    def fake_get(_url: str, **_kwargs: Any) -> _FakeResponse:
+        calls["n"] += 1
+        if calls["n"] < 3:
+            import requests as _requests  # noqa: PLC0415
+
+            raise _requests.RequestException("simulated transient failure")
+        return _FakeResponse(fixture.read_bytes())
+
+    import requests  # noqa: PLC0415
+
+    monkeypatch.setattr(requests, "get", fake_get)
+
+    dest = tmp_path / "out"
+    src = parquet_from_huggingface(
+        repo_id="user/repo",
+        filename_pattern="shard_{index:05d}.parquet",
+        train_indices=[0],
+        val_indices=[],
+        data_dir=dest,
+        download=True,
+        options=_no_sleep_options(),
+    )
+    assert calls["n"] == 3
+    assert (dest / "shard_00000.parquet").exists()
     train_first = next(src.iter_documents("train", batch_size=10))
     assert train_first[0] == ["alpha", "beta"]
 
 
-def test_parquet_from_huggingface_skips_existing(
+def test_download_total_failure_raises(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    _write_parquet(tmp_path / "shard_00000.parquet", ["existing"])
-    _write_parquet(tmp_path / "shard_00099.parquet", ["existing-val"])
+    def always_fail(_url: str, **_kwargs: Any) -> None:
+        import requests as _requests  # noqa: PLC0415
+
+        raise _requests.RequestException("permanent failure")
+
+    import requests  # noqa: PLC0415
+
+    monkeypatch.setattr(requests, "get", always_fail)
+
+    with pytest.raises(RuntimeError, match="Failed to download"):
+        parquet_from_huggingface(
+            repo_id="user/repo",
+            filename_pattern="shard_{index:05d}.parquet",
+            train_indices=[0],
+            val_indices=[],
+            data_dir=tmp_path / "out",
+            download=True,
+            options=_no_sleep_options(retries=2),
+        )
+
+    # No final shard file should be left on disk after total failure.
+    assert not (tmp_path / "out" / "shard_00000.parquet").exists()
+    # And no temp files should be left behind.
+    leftover = list((tmp_path / "out").glob("*.tmp"))
+    assert leftover == []
+
+
+def test_download_skips_existing_files(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    write_parquet(tmp_path / "shard_00000.parquet", ["existing"])
+    write_parquet(tmp_path / "shard_00099.parquet", ["existing-val"])
 
     def explode(*_a: object, **_k: object) -> None:
         msg = "should not be called"
@@ -188,6 +303,7 @@ def test_parquet_from_huggingface_skips_existing(
         val_indices=[99],
         data_dir=tmp_path,
         download=True,
+        options=_no_sleep_options(),
     )
     train_first = next(src.iter_documents("train", batch_size=10))
     assert train_first[0] == ["existing"]
