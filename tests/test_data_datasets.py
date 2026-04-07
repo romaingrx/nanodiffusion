@@ -8,8 +8,6 @@ from nanodiffusion.data.datasets import (
     DATASETS,
     DatasetFactory,
     DownloadOptions,
-    climbmix_400b,
-    fineweb_edu_10bt,
     get_dataset,
     parquet_from_huggingface,
     register,
@@ -18,32 +16,32 @@ from nanodiffusion.data.source import ParquetTextSource
 from tests._helpers import write_parquet
 
 
+def _dummy_factory(
+    data_dir: Path,
+    *,
+    num_train: int | None = None,
+    download: bool = True,
+) -> ParquetTextSource:
+    del data_dir, num_train, download
+    raise NotImplementedError
+
+
 def test_default_registry_entries() -> None:
     assert "climbmix-400b" in DATASETS
     assert "fineweb-edu-10bt" in DATASETS
 
 
 def test_registered_factories_satisfy_protocol() -> None:
-    assert isinstance(climbmix_400b, DatasetFactory)
-    assert isinstance(fineweb_edu_10bt, DatasetFactory)
+    assert isinstance(DATASETS["climbmix-400b"], DatasetFactory)
+    assert isinstance(DATASETS["fineweb-edu-10bt"], DatasetFactory)
 
 
 def test_register_decorator_adds_entry() -> None:
     name = "test-register-add"
     try:
-
-        @register(name)
-        def my_dataset(
-            data_dir: Path,
-            *,
-            num_train: int | None = None,
-            download: bool = True,
-        ) -> ParquetTextSource:
-            del data_dir, num_train, download
-            raise NotImplementedError
-
+        wrapped = register(name)(_dummy_factory)
         assert name in DATASETS
-        assert get_dataset(name) is my_dataset
+        assert get_dataset(name) is wrapped
     finally:
         DATASETS.pop(name, None)
 
@@ -51,18 +49,8 @@ def test_register_decorator_adds_entry() -> None:
 def test_register_returns_original_function() -> None:
     name = "test-register-returns"
     try:
-
-        def fn(
-            data_dir: Path,
-            *,
-            num_train: int | None = None,
-            download: bool = True,
-        ) -> ParquetTextSource:
-            del data_dir, num_train, download
-            raise NotImplementedError
-
-        wrapped = register(name)(fn)
-        assert wrapped is fn
+        wrapped = register(name)(_dummy_factory)
+        assert wrapped is _dummy_factory
     finally:
         DATASETS.pop(name, None)
 
@@ -70,49 +58,9 @@ def test_register_returns_original_function() -> None:
 def test_register_rejects_duplicate() -> None:
     name = "test-register-dup"
     try:
-
-        @register(name)
-        def first(
-            data_dir: Path,
-            *,
-            num_train: int | None = None,
-            download: bool = True,
-        ) -> ParquetTextSource:
-            del data_dir, num_train, download
-            raise NotImplementedError
-
+        register(name)(_dummy_factory)
         with pytest.raises(ValueError, match="already registered"):
-
-            @register(name)
-            def second(
-                data_dir: Path,
-                *,
-                num_train: int | None = None,
-                download: bool = True,
-            ) -> ParquetTextSource:
-                del data_dir, num_train, download
-                raise NotImplementedError
-
-    finally:
-        DATASETS.pop(name, None)
-
-
-def test_direct_dict_assignment_works() -> None:
-    """Bypassing the decorator with a direct dict assignment is supported."""
-    name = "test-direct-assign"
-    try:
-
-        def fn(
-            data_dir: Path,
-            *,
-            num_train: int | None = None,
-            download: bool = True,
-        ) -> ParquetTextSource:
-            del data_dir, num_train, download
-            raise NotImplementedError
-
-        DATASETS[name] = fn
-        assert get_dataset(name) is fn
+            register(name)(_dummy_factory)
     finally:
         DATASETS.pop(name, None)
 

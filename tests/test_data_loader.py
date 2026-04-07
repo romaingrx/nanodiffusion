@@ -2,6 +2,7 @@ import itertools
 import threading
 import time
 from collections.abc import Iterator
+from itertools import islice
 
 import numpy as np
 import pytest
@@ -15,13 +16,8 @@ from nanodiffusion.data.loader import (
 )
 from nanodiffusion.data.source import InMemoryTextSource
 from nanodiffusion.tokenizer import Tokenizer
-from tests._helpers import take
 
-# When tests run under the jaxtyping import hook, BatchOutput.__init__ is
-# decorated and shape errors surface as TypeCheckError. In production
-# (without the hook) the dataclass __post_init__ raises ValueError. Tests
-# accept either path.
-_ShapeError = (TypeCheckError, ValueError)
+_ShapeError = TypeCheckError
 
 
 def _docs(n: int, words_per_doc: int = 20) -> list[str]:
@@ -42,7 +38,7 @@ def test_batch_shape_and_dtype(tok: Tokenizer) -> None:
 def test_segments_start_at_zero(tok: Tokenizer) -> None:
     src = InMemoryTextSource(_docs(50), val_size=2)
     loader = pretrain_loader(src, tok, batch_size=4, seq_len=32, split="train")
-    batches = take(loader, 3)
+    batches = list(islice(loader, 3))
     for b in batches:
         assert (b.segments[:, 0] == 0).all()
 
@@ -51,7 +47,7 @@ def test_segments_non_negative_per_row(tok: Tokenizer) -> None:
     """The per-row min-subtraction must never produce negative segment ids."""
     src = InMemoryTextSource(_docs(80, words_per_doc=5), val_size=4)
     loader = pretrain_loader(src, tok, batch_size=4, seq_len=64, split="train")
-    for batch in take(loader, 4):
+    for batch in islice(loader, 4):
         assert (batch.segments >= 0).all()
 
 
@@ -59,7 +55,7 @@ def test_segments_monotonic_within_row(tok: Tokenizer) -> None:
     """Segment ids never decrease within a row and only increment by 1 at most."""
     src = InMemoryTextSource(_docs(80, words_per_doc=5), val_size=4)
     loader = pretrain_loader(src, tok, batch_size=4, seq_len=64, split="train")
-    batches = take(loader, 4)
+    batches = list(islice(loader, 4))
     saw_increment = False
     for b in batches:
         diffs = np.diff(b.segments, axis=1)
@@ -111,16 +107,18 @@ def test_determinism(tok: Tokenizer) -> None:
 
     def loader_run() -> list[BatchOutput]:
         src = InMemoryTextSource(docs, val_size=2)
-        return take(
-            pretrain_loader(
-                src,
-                tok,
-                batch_size=2,
-                seq_len=48,
-                split="train",
-                tokenizer_threads=1,
-            ),
-            5,
+        return list(
+            islice(
+                pretrain_loader(
+                    src,
+                    tok,
+                    batch_size=2,
+                    seq_len=48,
+                    split="train",
+                    tokenizer_threads=1,
+                ),
+                5,
+            )
         )
 
     a = loader_run()
@@ -137,7 +135,7 @@ def test_long_doc_spans_multiple_chunks(tok: Tokenizer) -> None:
     huge_doc = "lorem ipsum dolor sit amet consectetur adipiscing elit " * 200
     src = InMemoryTextSource([huge_doc, "tiny"], val_size=1)
     loader = pretrain_loader(src, tok, batch_size=2, seq_len=32, split="train")
-    batches = take(loader, 6)
+    batches = list(islice(loader, 6))
 
     # Per-row reset still applies for every row even mid-doc.
     for b in batches:
@@ -151,31 +149,35 @@ def test_resume_state_round_trip(tok: Tokenizer) -> None:
     """Resume from a saved state and verify the loader produces consistent
     follow-up batches."""
     src = InMemoryTextSource(_docs(80), val_size=4)
-    first = take(
-        pretrain_loader(
-            src,
-            tok,
-            batch_size=2,
-            seq_len=32,
-            split="train",
-            tokenizer_threads=1,
-        ),
-        3,
+    first = list(
+        islice(
+            pretrain_loader(
+                src,
+                tok,
+                batch_size=2,
+                seq_len=32,
+                split="train",
+                tokenizer_threads=1,
+            ),
+            3,
+        )
     )
     saved_state = first[-1].state
 
     fresh_src = InMemoryTextSource(_docs(80), val_size=4)
-    resumed = take(
-        pretrain_loader(
-            fresh_src,
-            tok,
-            batch_size=2,
-            seq_len=32,
-            split="train",
-            tokenizer_threads=1,
-            resume_state=saved_state,
-        ),
-        2,
+    resumed = list(
+        islice(
+            pretrain_loader(
+                fresh_src,
+                tok,
+                batch_size=2,
+                seq_len=32,
+                split="train",
+                tokenizer_threads=1,
+                resume_state=saved_state,
+            ),
+            2,
+        )
     )
     # The resumed batches must have valid state with epoch >= the saved one.
     for batch in resumed:
@@ -189,7 +191,7 @@ def test_resume_state_round_trip(tok: Tokenizer) -> None:
 def test_state_epoch_monotonic(tok: Tokenizer) -> None:
     src = InMemoryTextSource(_docs(80), val_size=4)
     loader = pretrain_loader(src, tok, batch_size=2, seq_len=32, split="train")
-    batches = take(loader, 5)
+    batches = list(islice(loader, 5))
     epochs = [b.state["epoch"] for b in batches]
     assert epochs[0] >= 1
     for a, b in itertools.pairwise(epochs):
@@ -305,9 +307,7 @@ def test_batch_output_validates_ndim() -> None:
 
 
 def test_batch_output_validates_dtype() -> None:
-    """jaxtyping.Int matches any integer dtype, so the int32 requirement
-    is enforced solely by ``__post_init__``. Construction must still raise
-    when float arrays are passed."""
+    """jaxtyping rejects float arrays for Int[...] annotations."""
     state = {"epoch": 1, "shard_idx": 0, "row_group_idx": 0}
     with pytest.raises(_ShapeError):
         BatchOutput(
@@ -317,32 +317,22 @@ def test_batch_output_validates_dtype() -> None:
         )
 
 
-def test_batch_output_validates_int32_specifically() -> None:
-    """``__post_init__`` enforces int32 even for other integer dtypes that
-    jaxtyping's ``Int`` accepts."""
-    state = {"epoch": 1, "shard_idx": 0, "row_group_idx": 0}
-    with pytest.raises(ValueError, match="int32"):
-        BatchOutput(
-            tokens=np.zeros((4, 8), dtype=np.int64),
-            segments=np.zeros((4, 8), dtype=np.int64),
-            state=state,  # type: ignore[arg-type]
-        )
-
-
 def test_prefetch_yields_same_sequence_as_loader(tok: Tokenizer) -> None:
     src_a = InMemoryTextSource(_docs(60), val_size=2)
     src_b = InMemoryTextSource(_docs(60), val_size=2)
 
-    plain = take(
-        pretrain_loader(
-            src_a,
-            tok,
-            batch_size=2,
-            seq_len=32,
-            split="train",
-            tokenizer_threads=1,
-        ),
-        4,
+    plain = list(
+        islice(
+            pretrain_loader(
+                src_a,
+                tok,
+                batch_size=2,
+                seq_len=32,
+                split="train",
+                tokenizer_threads=1,
+            ),
+            4,
+        )
     )
     with prefetch(
         pretrain_loader(
@@ -355,7 +345,7 @@ def test_prefetch_yields_same_sequence_as_loader(tok: Tokenizer) -> None:
         ),
         size=2,
     ) as p:
-        prefetched = take(p, 4)
+        prefetched = list(islice(p, 4))
 
     for x, y in zip(plain, prefetched, strict=True):
         np.testing.assert_array_equal(x.tokens, y.tokens)

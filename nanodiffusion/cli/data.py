@@ -1,5 +1,6 @@
 """``nanodiffusion data ...`` commands: list and download pretraining datasets."""
 
+import inspect
 from pathlib import Path
 
 import click
@@ -16,12 +17,9 @@ def list_datasets() -> None:
     from nanodiffusion.data.datasets import DATASETS  # noqa: PLC0415
 
     for name in sorted(DATASETS):
-        factory = DATASETS[name]
-        first_line = (factory.__doc__ or "").strip().split("\n", maxsplit=1)[0]
-        if first_line:
-            click.echo(f"{name}\t{first_line}")
-        else:
-            click.echo(name)
+        doc = inspect.getdoc(DATASETS[name]) or ""
+        first_line = doc.partition("\n")[0]
+        click.echo(f"{name}\t{first_line}" if first_line else name)
 
 
 @data_group.command()
@@ -75,16 +73,14 @@ def download(
 ) -> None:
     """Download parquet shards for a registered dataset."""
     from nanodiffusion.data.datasets import (  # noqa: PLC0415
-        DATASETS,
         DownloadOptions,
         get_dataset,
     )
 
-    if dataset not in DATASETS:
-        available = ", ".join(sorted(DATASETS)) or "(none)"
-        msg = f"Unknown dataset {dataset!r}. Available: {available}"
-        raise click.BadParameter(msg, param_hint="--dataset")
-    factory = get_dataset(dataset)
+    try:
+        factory = get_dataset(dataset)
+    except KeyError as exc:
+        raise click.BadParameter(exc.args[0], param_hint="--dataset") from exc
     options = DownloadOptions(retries=retries, timeout=timeout, num_workers=num_workers)
     factory(
         data_dir,

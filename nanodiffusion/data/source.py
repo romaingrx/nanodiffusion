@@ -1,9 +1,7 @@
-"""Text sources for the pretraining data pipeline.
+"""Text sources for the pretraining pipeline.
 
-A :class:`TextSource` is a thin abstraction over an iterable of document
-batches. This module is offline-pure: it only reads files that already exist
-on disk. All network and dataset-specific knowledge lives in
-:mod:`nanodiffusion.data.datasets`.
+Offline-pure: only reads files already on disk. All network and
+dataset-specific knowledge lives in :mod:`nanodiffusion.data.datasets`.
 """
 
 from collections.abc import Iterator
@@ -16,19 +14,11 @@ type Split = Literal["train", "val"]
 
 
 class SourcePosition(TypedDict):
-    """Where the source is in its iteration; used for fast-forward resume.
+    """Cursor for fast-forward resume.
 
-    ``epoch`` is 1-indexed and increments on each full pass through the
-    assigned shards.
-
-    ``shard_idx`` is the index into the per-split shard list (not a global
-    file index).
-
-    ``row_group_idx`` is the index of the current group of records within
-    that shard. Both implementations use it as an opaque cursor: for
-    :class:`ParquetTextSource` it is the parquet row-group index; for
-    :class:`InMemoryTextSource` it is the batch index within the (single)
-    in-memory shard. Polymorphic resume code should treat it as opaque.
+    ``row_group_idx`` is an opaque per-implementation cursor (parquet
+    row-group index for :class:`ParquetTextSource`, batch index for
+    :class:`InMemoryTextSource`).
     """
 
     epoch: int
@@ -38,20 +28,12 @@ class SourcePosition(TypedDict):
 
 @runtime_checkable
 class TextSource(Protocol):
-    """Iterable of document batches with resume positions.
+    """Iterable of ``(batch, position)`` tuples with infinite iteration.
 
-    Implementations must yield ``(batch, position)`` tuples indefinitely:
-    after exhausting the assigned shards they must loop back to the start
-    and increment ``position["epoch"]``. The pretrain loader assumes
-    iteration never terminates; finite sources will surface as a
-    ``RuntimeError`` deep inside the generator.
-
-    The ``start`` / ``step`` parameters partition the work at the
-    implementation's natural granularity (parquet row-group for parquet,
-    batch for in-memory). For any fixed source and parameters, the same
-    ``(start, step)`` values produce a deterministic, non-overlapping
-    subset of records, which makes them safe to use as a data-parallel
-    sharding hook.
+    After exhausting the assigned shards, implementations must loop back
+    and increment ``position["epoch"]``. ``start`` / ``step`` partition
+    the work at the implementation's natural granularity and are safe to
+    use as a data-parallel sharding hook.
     """
 
     def iter_documents(
@@ -65,14 +47,7 @@ class TextSource(Protocol):
 
 
 class ParquetTextSource:
-    """Streams text documents from a list of parquet shards on disk.
-
-    Pure offline reader. Knows nothing about Hugging Face or specific
-    datasets. The caller decides which files belong to which split via
-    ``train_paths`` / ``val_paths``. Iteration is infinite.
-
-    ``start`` / ``step`` stride at the *row-group* level within each shard.
-    """
+    """Streams documents from parquet shards. Strides at the row-group level."""
 
     def __init__(
         self,
@@ -107,8 +82,7 @@ class ParquetTextSource:
                         row_group_idx, columns=[self._text_column]
                     )
                     column = row_group.column(self._text_column).to_pylist()
-                    # Drop null rows. Parquet may contain them and they are
-                    # useless for pretraining; the cast is safe after filter.
+                    # Parquet may contain null rows; drop them and cast.
                     docs: list[str] = [v for v in column if isinstance(v, str)]
                     for offset in range(0, len(docs), batch_size):
                         batch = docs[offset : offset + batch_size]
@@ -122,14 +96,10 @@ class ParquetTextSource:
 
 
 class InMemoryTextSource:
-    """Test double: serves a fixed list of documents.
+    """Test double: serves a fixed list of documents; last ``val_size`` are val.
 
-    Reserves the last ``val_size`` documents as the val split; the rest are
-    train. Iteration is infinite. ``start`` / ``step`` stride at the *batch*
-    level (one row-group equals one batch in the in-memory layout), so
-    ``SourcePosition.row_group_idx`` is the batch index within the single
-    in-memory shard. This keeps the partition contract from
-    :class:`TextSource` consistent across implementations.
+    Strides at the batch level so ``row_group_idx`` matches
+    :class:`ParquetTextSource`'s cursor semantics.
     """
 
     def __init__(self, docs: list[str], *, val_size: int = 1) -> None:
@@ -155,8 +125,6 @@ class InMemoryTextSource:
             msg = f"InMemoryTextSource has no {split!r} docs"
             raise ValueError(msg)
 
-        # Group docs into batches and stride over the batch indices so the
-        # (start, step) partition contract holds with parquet semantics.
         batch_count = (len(docs) + batch_size - 1) // batch_size
         epoch = 1
         while True:

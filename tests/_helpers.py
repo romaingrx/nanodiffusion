@@ -1,26 +1,9 @@
-"""Shared utilities for tests.
+"""Shared test helpers. Fixtures live in ``conftest.py``."""
 
-This module is intentionally separate from ``conftest.py``: pytest treats
-``conftest.py`` specially during collection, and importing helpers FROM it
-is non-idiomatic. Plain helper functions live here; ``conftest.py`` is
-reserved for fixtures.
-"""
-
-from collections.abc import Iterator
 from pathlib import Path
 
 import pyarrow as pa
 import pyarrow.parquet as pq
-
-
-def take[T](it: Iterator[T], n: int) -> list[T]:
-    """Take the first ``n`` items from an iterator."""
-    out: list[T] = []
-    for i, item in enumerate(it):
-        if i >= n:
-            break
-        out.append(item)
-    return out
 
 
 def write_parquet(

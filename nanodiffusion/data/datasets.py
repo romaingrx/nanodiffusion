@@ -1,12 +1,6 @@
 """Named pretraining datasets.
 
-A :class:`DatasetFactory` is a callable that materializes a
-:class:`TextSource` on demand. Factories are registered in the module-level
-:data:`DATASETS` dict via the :func:`register` decorator. The config and CLI
-reference datasets by name; adding a new corpus is one decorated function
-below.
-
-This is the only module that knows about Hugging Face. ``source.py`` stays
+This is the only module that knows about Hugging Face; ``source.py`` stays
 offline-pure so its tests never touch the network.
 """
 
@@ -23,15 +17,11 @@ from nanodiffusion.data.source import ParquetTextSource, TextSource
 class DatasetFactory(Protocol):
     """Callable that builds a :class:`TextSource` from a local cache dir.
 
-    Implementations may download files, scan a local directory, or build a
-    synthetic source. ``num_train`` lets the caller request a smaller slice
-    than the dataset's full train set; ``None`` means use whatever the
-    dataset considers full. ``download_options`` is honored by HTTP-backed
-    factories and silently ignored by local-only ones (the keyword is in
-    the contract so the CLI can stay generic).
+    ``download_options`` is honored by HTTP-backed factories and silently
+    ignored by local-only ones so the CLI can stay generic.
 
-    Named ``DatasetFactory`` (not ``Dataset``) to avoid the collision with
-    ``torch.utils.data.Dataset`` and ``datasets.Dataset`` (HuggingFace).
+    Named ``DatasetFactory`` rather than ``Dataset`` to avoid collision with
+    ``torch.utils.data.Dataset`` and HuggingFace ``datasets.Dataset``.
     """
 
     def __call__(
@@ -48,12 +38,6 @@ DATASETS: dict[str, DatasetFactory] = {}
 
 
 def register(name: str) -> Callable[[DatasetFactory], DatasetFactory]:
-    """Decorator: register a dataset factory under ``name``.
-
-    Raises :class:`ValueError` on duplicate names so silent shadowing
-    cannot happen if two modules define the same key.
-    """
-
     def decorator(fn: DatasetFactory) -> DatasetFactory:
         if name in DATASETS:
             msg = f"Dataset {name!r} already registered"
@@ -65,7 +49,6 @@ def register(name: str) -> Callable[[DatasetFactory], DatasetFactory]:
 
 
 def get_dataset(name: str) -> DatasetFactory:
-    """Look up a registered dataset by name with a helpful error on miss."""
     if name not in DATASETS:
         available = ", ".join(sorted(DATASETS)) or "(none)"
         msg = f"Unknown dataset {name!r}. Available: {available}"
@@ -75,12 +58,6 @@ def get_dataset(name: str) -> DatasetFactory:
 
 @dataclass(frozen=True, slots=True)
 class DownloadOptions:
-    """Knobs for the HF parquet downloader.
-
-    All fields have sensible defaults for production use; tests can override
-    them to make retry/backoff paths fast and deterministic.
-    """
-
     retries: int = 5
     timeout: float = 60.0
     backoff_base: float = 2.0
@@ -88,9 +65,6 @@ class DownloadOptions:
     backoff_jitter: float = 0.5
     chunk_size: int = 1 << 20
     num_workers: int = 4
-
-
-_DEFAULT_DOWNLOAD = DownloadOptions()
 
 
 def parquet_from_huggingface(
@@ -102,15 +76,14 @@ def parquet_from_huggingface(
     data_dir: Path,
     download: bool = True,
     text_column: str = "text",
-    options: DownloadOptions = _DEFAULT_DOWNLOAD,
+    options: DownloadOptions | None = None,
 ) -> ParquetTextSource:
-    """Helper most HF parquet datasets reuse.
+    """Download any missing shards, then return a :class:`ParquetTextSource`.
 
-    Downloads any missing shards (if ``download``) into ``data_dir``, then
-    returns a :class:`ParquetTextSource` pointing at the resulting paths.
     ``filename_pattern`` is a Python format string with one ``{index}``
     placeholder, e.g. ``"shard_{index:05d}.parquet"``.
     """
+    opts = options or DownloadOptions()
     train_idx = list(train_indices)
     val_idx = list(val_indices)
     if download:
@@ -119,7 +92,7 @@ def parquet_from_huggingface(
             filename_pattern=filename_pattern,
             indices=train_idx + val_idx,
             dest_dir=data_dir,
-            options=options,
+            options=opts,
         )
     train_paths = [data_dir / filename_pattern.format(index=i) for i in train_idx]
     val_paths = [data_dir / filename_pattern.format(index=i) for i in val_idx]
@@ -137,14 +110,6 @@ def _download_shards(
     dest_dir: Path,
     options: DownloadOptions,
 ) -> None:
-    """Download missing parquet shards from a HF dataset repo.
-
-    Atomic via temp-file rename with a per-call uuid suffix so concurrent
-    callers in the same process never clobber each other. Skips files
-    already on disk. Parallelized with a :class:`ThreadPoolExecutor`. The
-    ``requests`` import is local so importing this module stays cheap for
-    callers that only touch the registry (e.g. ``data list``).
-    """
     dest_dir.mkdir(parents=True, exist_ok=True)
     todo = [
         i for i in indices if not (dest_dir / filename_pattern.format(index=i)).exists()
@@ -165,15 +130,16 @@ def _download_shards(
 
 
 def _download_with_backoff(url: str, target: Path, *, options: DownloadOptions) -> None:
+    # Local imports keep module import cheap for callers that only touch
+    # the registry (e.g. ``data list``).
     import random  # noqa: PLC0415
     import time  # noqa: PLC0415
     import uuid  # noqa: PLC0415
 
     import requests  # noqa: PLC0415
 
-    # Per-call uuid so two threads downloading the same shard concurrently
-    # write to different temp files. Last successful rename wins, but no
-    # half-written file ever ends up at the final path.
+    # Per-call uuid lets concurrent downloads of the same shard write to
+    # different temp files; the final rename is atomic.
     tmp = target.with_suffix(f"{target.suffix}.{uuid.uuid4().hex}.tmp")
     last_exc: Exception | None = None
     for attempt in range(1, options.retries + 1):
@@ -190,8 +156,8 @@ def _download_with_backoff(url: str, target: Path, *, options: DownloadOptions) 
             if tmp.exists():
                 tmp.unlink(missing_ok=True)
             if attempt < options.retries:
-                # Capped exponential backoff with jitter so a thundering
-                # herd of failed shards spreads out instead of stampeding.
+                # Capped exponential backoff with jitter to scatter a
+                # thundering herd of failed shards.
                 base = min(options.backoff_base**attempt, options.backoff_cap)
                 jitter = random.uniform(0.0, options.backoff_jitter * base)  # noqa: S311
                 time.sleep(base + jitter)
@@ -202,41 +168,53 @@ def _download_with_backoff(url: str, target: Path, *, options: DownloadOptions) 
     raise RuntimeError(msg) from last_exc
 
 
-@register("climbmix-400b")
-def climbmix_400b(
-    data_dir: Path,
-    *,
-    num_train: int | None = None,
-    download: bool = True,
-    download_options: DownloadOptions | None = None,
-) -> ParquetTextSource:
-    """ClimbMix-400B (Karpathy). nanochat default. 6543 shards, last is val."""
-    return parquet_from_huggingface(
+@dataclass(frozen=True, slots=True)
+class _HFDataset:
+    repo_id: str
+    filename_pattern: str
+    num_shards: int  # train shards; val shard(s) follow
+    doc: str
+
+
+_HF_REGISTRY: dict[str, _HFDataset] = {
+    "climbmix-400b": _HFDataset(
         repo_id="karpathy/climbmix-400b-shuffle",
         filename_pattern="shard_{index:05d}.parquet",
-        train_indices=range(num_train if num_train is not None else 6542),
-        val_indices=(6542,),
-        data_dir=data_dir,
-        download=download,
-        options=download_options or _DEFAULT_DOWNLOAD,
-    )
-
-
-@register("fineweb-edu-10bt")
-def fineweb_edu_10bt(
-    data_dir: Path,
-    *,
-    num_train: int | None = None,
-    download: bool = True,
-    download_options: DownloadOptions | None = None,
-) -> ParquetTextSource:
-    """FineWeb-Edu sample-10BT subset (HuggingFaceFW). 14 shards, last is val."""
-    return parquet_from_huggingface(
+        num_shards=6542,
+        doc="ClimbMix-400B (Karpathy). nanochat default. 6543 shards, last is val.",
+    ),
+    "fineweb-edu-10bt": _HFDataset(
         repo_id="HuggingFaceFW/fineweb-edu",
         filename_pattern="sample/10BT/{index:03d}_00000.parquet",
-        train_indices=range(num_train if num_train is not None else 13),
-        val_indices=(13,),
-        data_dir=data_dir,
-        download=download,
-        options=download_options or _DEFAULT_DOWNLOAD,
-    )
+        num_shards=13,
+        doc="FineWeb-Edu sample-10BT subset (HuggingFaceFW). 14 shards, last is val.",
+    ),
+}
+
+
+def _make_hf_factory(spec: _HFDataset) -> DatasetFactory:
+    def factory(
+        data_dir: Path,
+        *,
+        num_train: int | None = None,
+        download: bool = True,
+        download_options: DownloadOptions | None = None,
+    ) -> ParquetTextSource:
+        return parquet_from_huggingface(
+            repo_id=spec.repo_id,
+            filename_pattern=spec.filename_pattern,
+            train_indices=range(
+                num_train if num_train is not None else spec.num_shards
+            ),
+            val_indices=(spec.num_shards,),
+            data_dir=data_dir,
+            download=download,
+            options=download_options,
+        )
+
+    factory.__doc__ = spec.doc
+    return factory
+
+
+for _name, _spec in _HF_REGISTRY.items():
+    register(_name)(_make_hf_factory(_spec))

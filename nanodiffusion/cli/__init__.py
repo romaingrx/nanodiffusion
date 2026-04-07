@@ -1,10 +1,4 @@
-"""Nanodiffusion CLI entry point and command registration.
-
-The pyproject entry point ``nanodiffusion = "nanodiffusion.cli:main"`` resolves
-to :func:`main` below. New top-level commands are added by importing them here
-and calling :meth:`Group.add_command`. Each subcommand file exposes a single
-click object so registration is explicit and circular imports are impossible.
-"""
+"""Nanodiffusion CLI entry point."""
 
 import logging
 

@@ -12,13 +12,7 @@ import tiktoken
 
 @runtime_checkable
 class TokenizerLike(Protocol):
-    """Minimal tokenizer surface the data loader depends on.
-
-    Mirrors the :class:`~nanodiffusion.model.DiffusionModel` Protocol pattern:
-    the loader stays decoupled from the concrete :class:`Tokenizer` so a
-    different backend (e.g. SentencePiece) can be plugged in without
-    touching ``data/``.
-    """
+    """Minimal tokenizer surface the data loader depends on."""
 
     eos_token_id: int
 
@@ -31,10 +25,7 @@ class TokenizerLike(Protocol):
 
 
 class SpecialToken(enum.StrEnum):
-    """Every special token in the vocabulary.
-
-    IDs are assigned in declaration order, starting at ``base_vocab_size``.
-    """
+    """Special tokens; IDs assigned in declaration order from ``base_vocab_size``."""
 
     MASK = "<|mask|>"
     BOS = "<|bos|>"
@@ -46,11 +37,7 @@ class SpecialToken(enum.StrEnum):
 
 
 class Tokenizer:
-    """GPT-2 tiktoken encoding extended with diffusion and chat tokens.
-
-    Special token IDs sit immediately above the base vocabulary in the order
-    defined by :class:`SpecialToken`.
-    """
+    """GPT-2 tiktoken encoding extended with diffusion and chat tokens."""
 
     def __init__(self) -> None:
         self._base = tiktoken.get_encoding("gpt2")
@@ -81,12 +68,7 @@ class Tokenizer:
         *,
         num_threads: int = 4,
     ) -> list[list[int]]:
-        """Encode a batch of plain text strings, ignoring special tokens.
-
-        Wraps tiktoken's ``encode_ordinary_batch``, which releases the GIL
-        and parallelizes across ``num_threads`` C++ workers. Used by the
-        pretrain data loader for streaming tokenization of document batches.
-        """
+        """Encode plain text (no special tokens). GIL-free via tiktoken C++."""
         return self._base.encode_ordinary_batch(texts, num_threads=num_threads)
 
     def decode(self, token_ids: list[int]) -> str:
