@@ -15,16 +15,13 @@ from nanodiffusion.checkpoint import (
     save_checkpoint,
 )
 from nanodiffusion.model import Transformer
+from tests._helpers import inexact_leaves
 
 if TYPE_CHECKING:
     from pathlib import Path
 
     from nanodiffusion.config import ModelConfig
     from nanodiffusion.data.source import SourcePosition
-
-
-def _leaves(m: Transformer) -> list[jax.Array]:
-    return jax.tree.leaves(eqx.filter(m, eqx.is_inexact_array))
 
 
 def test_roundtrip_preserves_model_weights(
@@ -70,9 +67,9 @@ def test_roundtrip_preserves_model_weights(
 
     assert meta == CheckpointMeta(step=42, cursor=cursor)
 
-    for a, b in zip(_leaves(model), _leaves(loaded_model), strict=True):
+    for a, b in zip(inexact_leaves(model), inexact_leaves(loaded_model), strict=True):
         np.testing.assert_array_equal(a, b)
-    for a, b in zip(_leaves(ema_model), _leaves(loaded_ema), strict=True):
+    for a, b in zip(inexact_leaves(ema_model), inexact_leaves(loaded_ema), strict=True):
         np.testing.assert_array_equal(a, b)
 
 
@@ -131,7 +128,6 @@ def test_load_model_narrows_and_picks_snapshot(
     """``load_model`` returns the skeleton's concrete type and honors ``which``."""
     key, model_key, ema_key = jax.random.split(key, 3)
     model = Transformer(small_config, key=model_key)
-    # Construct a distinguishable EMA so we can tell which file was read.
     ema_model = Transformer(small_config, key=ema_key)
     optimizer = optax.adamw(1e-3)
     opt_state = optimizer.init(eqx.filter(model, eqx.is_inexact_array))
@@ -157,7 +153,7 @@ def test_load_model_narrows_and_picks_snapshot(
     assert_type(loaded_ema, Transformer)
     assert_type(loaded_raw, Transformer)
 
-    for a, b in zip(_leaves(ema_model), _leaves(loaded_ema), strict=True):
+    for a, b in zip(inexact_leaves(ema_model), inexact_leaves(loaded_ema), strict=True):
         np.testing.assert_array_equal(a, b)
-    for a, b in zip(_leaves(model), _leaves(loaded_raw), strict=True):
+    for a, b in zip(inexact_leaves(model), inexact_leaves(loaded_raw), strict=True):
         np.testing.assert_array_equal(a, b)

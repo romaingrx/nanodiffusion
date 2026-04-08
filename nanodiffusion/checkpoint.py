@@ -90,9 +90,7 @@ def load_checkpoint[M: DiffusionModel](
         eqx.tree_deserialise_leaves(path / "opt_state.eqx", opt_state_skeleton),
     )
     meta_data = json.loads((path / "meta.json").read_text())
-    cursor_raw = meta_data.get("cursor")
-    cursor: SourcePosition | None = cursor_raw if cursor_raw is not None else None
-    meta = CheckpointMeta(step=int(meta_data["step"]), cursor=cursor)
+    meta = CheckpointMeta(step=int(meta_data["step"]), cursor=meta_data.get("cursor"))
     return model, ema_model, opt_state, meta
 
 

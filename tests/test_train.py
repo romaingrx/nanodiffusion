@@ -16,6 +16,7 @@ from nanodiffusion.train import (
     make_optimizer,
     make_train_step,
 )
+from tests._helpers import inexact_leaves
 
 
 def test_make_optimizer_warmup_peak_and_decay() -> None:
@@ -24,18 +25,15 @@ def test_make_optimizer_warmup_peak_and_decay() -> None:
 
     assert float(sched(0)) == pytest.approx(0.0, abs=1e-8)
     assert float(sched(100)) == pytest.approx(1e-3, rel=1e-3)
-    # Cosine decay drives lr back to (near) 0 at max_steps
     assert float(sched(1000)) < 1e-5
 
 
 def _count_inexact_leaves_that_changed(
     before: Transformer, after: Transformer, *, atol: float = 0.0
 ) -> int:
-    before_leaves = jax.tree.leaves(eqx.filter(before, eqx.is_inexact_array))
-    after_leaves = jax.tree.leaves(eqx.filter(after, eqx.is_inexact_array))
     return sum(
         1
-        for a, b in zip(before_leaves, after_leaves, strict=True)
+        for a, b in zip(inexact_leaves(before), inexact_leaves(after), strict=True)
         if not np.allclose(a, b, atol=atol)
     )
 
@@ -46,9 +44,7 @@ def test_ema_update_at_decay_zero_copies_model(model: Transformer) -> None:
 
     updated = ema_update(model, perturbed, decay=0.0)
 
-    a = jax.tree.leaves(eqx.filter(updated, eqx.is_inexact_array))
-    b = jax.tree.leaves(eqx.filter(perturbed, eqx.is_inexact_array))
-    for x, y in zip(a, b, strict=True):
+    for x, y in zip(inexact_leaves(updated), inexact_leaves(perturbed), strict=True):
         np.testing.assert_allclose(x, y, atol=1e-6)
 
 
@@ -58,9 +54,7 @@ def test_ema_update_at_decay_one_keeps_ema(model: Transformer) -> None:
 
     updated = ema_update(model, perturbed, decay=1.0)
 
-    before = jax.tree.leaves(eqx.filter(model, eqx.is_inexact_array))
-    after = jax.tree.leaves(eqx.filter(updated, eqx.is_inexact_array))
-    for x, y in zip(before, after, strict=True):
+    for x, y in zip(inexact_leaves(model), inexact_leaves(updated), strict=True):
         np.testing.assert_allclose(x, y, atol=1e-6)
 
 
@@ -70,9 +64,9 @@ def test_ema_update_linear_interpolation(model: Transformer) -> None:
 
     updated = ema_update(model, perturbed, decay=0.75)
     # ema_new = 0.75 * ema_old + 0.25 * model_new = 0.75 * x + 0.25 * (x + 4) = x + 1
-    original = jax.tree.leaves(eqx.filter(model, eqx.is_inexact_array))
-    result = jax.tree.leaves(eqx.filter(updated, eqx.is_inexact_array))
-    for before, after in zip(original, result, strict=True):
+    for before, after in zip(
+        inexact_leaves(model), inexact_leaves(updated), strict=True
+    ):
         np.testing.assert_allclose(after, before + 1.0, atol=1e-5)
 
 
@@ -159,7 +153,7 @@ def test_train_step_updates_model_and_ema(
 
     assert _count_inexact_leaves_that_changed(model, new_model) > 0
     # With decay=0.5 and the EMA starting equal to the model, the new EMA
-    # must be halfway between old and new params — so it differs from both.
+    # must be halfway between old and new params, so it differs from both.
     assert _count_inexact_leaves_that_changed(new_model, new_ema) > 0
     assert _count_inexact_leaves_that_changed(model, new_ema) > 0
 
@@ -188,17 +182,9 @@ def test_train_step_jits_and_is_deterministic(
     m2, e2, _o2, l2 = train_step(model, model, opt_state, batch, step_key)
 
     assert float(l1) == pytest.approx(float(l2), abs=0.0)
-    for a, b in zip(
-        jax.tree.leaves(eqx.filter(m1, eqx.is_inexact_array)),
-        jax.tree.leaves(eqx.filter(m2, eqx.is_inexact_array)),
-        strict=True,
-    ):
+    for a, b in zip(inexact_leaves(m1), inexact_leaves(m2), strict=True):
         np.testing.assert_array_equal(a, b)
-    for a, b in zip(
-        jax.tree.leaves(eqx.filter(e1, eqx.is_inexact_array)),
-        jax.tree.leaves(eqx.filter(e2, eqx.is_inexact_array)),
-        strict=True,
-    ):
+    for a, b in zip(inexact_leaves(e1), inexact_leaves(e2), strict=True):
         np.testing.assert_array_equal(a, b)
 
 
@@ -229,7 +215,7 @@ def test_train_step_produces_finite_updates(
 
     assert jnp.isfinite(loss)
     for tree in (new_model, new_ema):
-        for leaf in jax.tree.leaves(eqx.filter(tree, eqx.is_inexact_array)):
+        for leaf in inexact_leaves(tree):
             assert jnp.all(jnp.isfinite(leaf))
 
 
@@ -290,7 +276,6 @@ def test_make_train_step_narrows_via_trainstepfn_annotation(
 
     assert_type(new_model, Transformer)
     assert_type(new_ema, Transformer)
-    # Runtime sanity: the narrowing agrees with the actual type.
     assert type(new_model) is Transformer
     assert type(new_ema) is Transformer
     assert jnp.isfinite(loss)

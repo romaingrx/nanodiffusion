@@ -143,7 +143,6 @@ def sample(
 
         yield SampleStep(x, i, steps)
 
-    # Final denoising: argmax remaining masks
     logits = _forward(model, x, jnp.array(_T_MIN))
     logits = logits.at[:, mask_token_id].set(-1e9)
     x = jnp.where(x == mask_token_id, jnp.argmax(logits, axis=-1), x)

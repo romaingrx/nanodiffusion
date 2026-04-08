@@ -47,13 +47,6 @@ def make_optimizer(
     separately so callers can log the current learning rate without
     reaching into opt_state internals.
     """
-    if train_cfg.max_steps <= train_cfg.warmup_steps:
-        msg = (
-            f"max_steps ({train_cfg.max_steps}) must exceed warmup_steps "
-            f"({train_cfg.warmup_steps}); otherwise the cosine schedule has "
-            "no decay phase."
-        )
-        raise ValueError(msg)
     lr_schedule = optax.warmup_cosine_decay_schedule(
         init_value=0.0,
         peak_value=train_cfg.learning_rate,
@@ -230,10 +223,10 @@ def pretrain(
             if step >= config.train.max_steps:
                 break
             last_cursor = batch.state
-            jax_batch = batch.to_jax()
+            tokens = jnp.asarray(batch.tokens)
             key, step_key = jax.random.split(key)
             model, ema_model, opt_state, loss = train_step(
-                model, ema_model, opt_state, jax_batch.tokens, step_key
+                model, ema_model, opt_state, tokens, step_key
             )
             step += 1
 

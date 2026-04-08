@@ -2,7 +2,7 @@ import math
 from pathlib import Path
 
 import yaml
-from pydantic import BaseModel
+from pydantic import BaseModel, model_validator
 
 
 def _round_to_multiple(x: int, multiple: int) -> int:
@@ -40,6 +40,17 @@ class TrainConfig(BaseModel):
     save_every: int = 5000
     eval_every: int = 1000
     run_dir: Path = Path("runs/pretrain")
+
+    @model_validator(mode="after")
+    def _check_steps(self) -> "TrainConfig":
+        if self.max_steps <= self.warmup_steps:
+            msg = (
+                f"max_steps ({self.max_steps}) must exceed warmup_steps "
+                f"({self.warmup_steps}); otherwise the cosine schedule has "
+                "no decay phase."
+            )
+            raise ValueError(msg)
+        return self
 
 
 class SampleConfig(BaseModel):
