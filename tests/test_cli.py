@@ -22,6 +22,38 @@ def test_main_help_lists_subcommands() -> None:
     assert "sample" in result.output
     assert "data" in result.output
     assert "pretrain" in result.output
+    assert "sft" in result.output
+
+
+def test_sft_command_help_mentions_checkpoint_option() -> None:
+    from nanodiffusion.cli.sft import sft_command  # noqa: PLC0415
+
+    runner = CliRunner()
+    result = runner.invoke(sft_command, ["--help"])
+    assert result.exit_code == 0
+    assert "--config" in result.output
+    assert "--checkpoint" in result.output
+    assert "--seed" in result.output
+
+
+def test_data_list_chat_prints_registered_chat_datasets() -> None:
+    from nanodiffusion.data.chat_datasets import CHAT_DATASETS  # noqa: PLC0415
+
+    runner = CliRunner()
+    result = runner.invoke(data_group, ["list-chat"])
+    assert result.exit_code == 0
+    for name in CHAT_DATASETS:
+        assert name in result.output
+
+
+def test_data_download_chat_unknown_dataset_uses_bad_parameter() -> None:
+    runner = CliRunner()
+    result = runner.invoke(
+        data_group, ["download-chat", "--dataset", "definitely-missing"]
+    )
+    assert result.exit_code != 0
+    assert "definitely-missing" in result.output
+    assert "Available" in result.output
 
 
 def test_sample_command_help() -> None:

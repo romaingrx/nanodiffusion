@@ -1,0 +1,263 @@
+from pathlib import Path
+from typing import assert_type
+
+import equinox as eqx
+import jax
+import jax.numpy as jnp
+import numpy as np
+import pytest
+
+from nanodiffusion.checkpoint import save_checkpoint
+from nanodiffusion.config import Config, ModelConfig, SFTConfig, SFTDatasetConfig
+from nanodiffusion.data.chat_datasets import CHAT_DATASETS, register_chat
+from nanodiffusion.data.chat_source import ChatSource, InMemoryChatSource
+from nanodiffusion.data.datasets import DownloadOptions
+from nanodiffusion.data.sft_loader import SFTJaxBatch
+from nanodiffusion.model import Transformer
+from nanodiffusion.pretrain.train import make_optimizer
+from nanodiffusion.schedule import LogLinearSchedule
+from nanodiffusion.sft import SFTTrainStepFn, make_sft_train_step, sft_finetune
+from tests._helpers import inexact_leaves
+
+
+def _make_supervised_batch(seq_len: int, batch: int = 4) -> SFTJaxBatch:
+    """Build a synthetic SFT batch with a prompt half and a response half."""
+    tokens = jnp.tile(
+        jnp.arange(seq_len, dtype=jnp.int32) % 16,
+        (batch, 1),
+    )
+    loss_mask = jnp.tile(
+        jnp.arange(seq_len) >= (seq_len // 2),
+        (batch, 1),
+    )
+    return SFTJaxBatch(tokens=tokens, loss_mask=loss_mask)
+
+
+def test_sft_train_step_decreases_loss_on_fixed_batch(
+    small_config: ModelConfig, key: jax.Array
+) -> None:
+    """A few aggressive-LR SFT steps on the same batch must lower the loss."""
+    key, model_key = jax.random.split(key)
+    model = Transformer(small_config, key=model_key)
+    ema_model = model
+
+    sft_cfg = SFTConfig(
+        learning_rate=3e-3,
+        warmup_steps=5,
+        max_steps=100,
+        weight_decay=0.0,
+        grad_clip=1.0,
+        ema_decay=0.99,
+    )
+    optimizer, _ = make_optimizer(sft_cfg)
+    opt_state = optimizer.init(eqx.filter(model, eqx.is_inexact_array))
+
+    train_step = make_sft_train_step(
+        optimizer,
+        schedule=LogLinearSchedule(),
+        mask_token_id=small_config.vocab_size - 1,
+        ema_decay=sft_cfg.ema_decay,
+    )
+
+    batch = _make_supervised_batch(small_config.max_seq_len, batch=4)
+
+    losses: list[float] = []
+    for _ in range(50):
+        key, step_key = jax.random.split(key)
+        model, ema_model, opt_state, loss = train_step(
+            model, ema_model, opt_state, batch, step_key
+        )
+        losses.append(float(loss))
+
+    early = float(np.mean(losses[:5]))
+    late = float(np.mean(losses[-5:]))
+    assert late < early, f"loss did not decrease: {early:.3f} -> {late:.3f}"
+
+
+def test_sft_train_step_is_deterministic(
+    small_config: ModelConfig, key: jax.Array
+) -> None:
+    """Same key + same batch + same init → bitwise identical updates."""
+    key, model_key = jax.random.split(key)
+    model = Transformer(small_config, key=model_key)
+
+    optimizer, _ = make_optimizer(SFTConfig(warmup_steps=2, max_steps=10))
+    opt_state = optimizer.init(eqx.filter(model, eqx.is_inexact_array))
+    train_step = make_sft_train_step(
+        optimizer,
+        schedule=LogLinearSchedule(),
+        mask_token_id=small_config.vocab_size - 1,
+        ema_decay=0.9,
+    )
+
+    batch = _make_supervised_batch(small_config.max_seq_len, batch=2)
+    step_key = jax.random.PRNGKey(123)
+
+    m1, e1, _o1, l1 = train_step(model, model, opt_state, batch, step_key)
+    m2, e2, _o2, l2 = train_step(model, model, opt_state, batch, step_key)
+
+    assert float(l1) == float(l2)
+    for a, b in zip(inexact_leaves(m1), inexact_leaves(m2), strict=True):
+        np.testing.assert_array_equal(a, b)
+    for a, b in zip(inexact_leaves(e1), inexact_leaves(e2), strict=True):
+        np.testing.assert_array_equal(a, b)
+
+
+def test_sft_train_step_prompt_positions_have_zero_embedding_grad(
+    small_config: ModelConfig, key: jax.Array
+) -> None:
+    """Full-stack regression: with loss_mask=all-False, gradients w.r.t. the
+    entire model (post-JIT) are zero. Mirrors Slice 1's load-bearing assertion
+    but through the full ``train_step`` path so any JIT reordering that would
+    accidentally leak gradient from prompt positions is caught.
+    """
+    key, model_key = jax.random.split(key)
+    model = Transformer(small_config, key=model_key)
+
+    optimizer, _ = make_optimizer(SFTConfig(warmup_steps=1, max_steps=10))
+    opt_state = optimizer.init(eqx.filter(model, eqx.is_inexact_array))
+    train_step = make_sft_train_step(
+        optimizer,
+        schedule=LogLinearSchedule(),
+        mask_token_id=small_config.vocab_size - 1,
+        ema_decay=0.9,
+    )
+
+    tokens = jnp.tile(
+        jnp.arange(small_config.max_seq_len, dtype=jnp.int32)
+        % (small_config.vocab_size - 1),
+        (2, 1),
+    )
+    loss_mask = jnp.zeros((2, small_config.max_seq_len), dtype=jnp.bool_)
+    batch = SFTJaxBatch(tokens=tokens, loss_mask=loss_mask)
+    step_key = jax.random.PRNGKey(5)
+
+    new_model, _new_ema, _opt, loss = train_step(
+        model, model, opt_state, batch, step_key
+    )
+    assert float(loss) == 0.0
+    # With zero loss, the optimizer should have made no change to the model.
+    for before, after in zip(
+        inexact_leaves(model), inexact_leaves(new_model), strict=True
+    ):
+        np.testing.assert_array_equal(before, after)
+
+
+def test_make_sft_train_step_narrows_via_sfttrainstepfn_annotation(
+    small_config: ModelConfig, key: jax.Array
+) -> None:
+    """Generic narrowing: a ``SFTTrainStepFn[Transformer]`` target annotation
+    pins ``M = Transformer`` so each return position narrows at call sites.
+    """
+    key, model_key = jax.random.split(key)
+    model = Transformer(small_config, key=model_key)
+
+    optimizer, _ = make_optimizer(
+        SFTConfig(warmup_steps=2, max_steps=10, ema_decay=0.9)
+    )
+    opt_state = optimizer.init(eqx.filter(model, eqx.is_inexact_array))
+
+    train_step: SFTTrainStepFn[Transformer] = make_sft_train_step(
+        optimizer,
+        schedule=LogLinearSchedule(),
+        mask_token_id=small_config.vocab_size - 1,
+        ema_decay=0.9,
+    )
+
+    batch = _make_supervised_batch(small_config.max_seq_len, batch=2)
+    key, step_key = jax.random.split(key)
+    new_model, new_ema, _new_opt_state, loss = train_step(
+        model, model, opt_state, batch, step_key
+    )
+
+    assert_type(new_model, Transformer)
+    assert_type(new_ema, Transformer)
+    assert type(new_model) is Transformer
+    assert type(new_ema) is Transformer
+    assert jnp.isfinite(loss)
+
+
+def _make_sft_conv(i: int) -> dict[str, list[dict[str, str]]]:
+    return {
+        "messages": [
+            {"role": "user", "content": f"q{i}"},
+            {"role": "assistant", "content": f"a{i}"},
+        ],
+    }
+
+
+def _tiny_inmem_factory(
+    data_dir: Path,
+    *,
+    download: bool = True,
+    download_options: DownloadOptions | None = None,
+) -> ChatSource:
+    del data_dir, download, download_options
+    return InMemoryChatSource([_make_sft_conv(i) for i in range(8)])  # pyright: ignore[reportArgumentType]
+
+
+@pytest.fixture
+def tiny_chat_factory() -> str:
+    """Register a tiny in-memory chat dataset and return its name.
+
+    Adds a one-off entry to ``CHAT_DATASETS`` so ``sft_finetune`` can
+    resolve a dataset via the registry without touching the network.
+    Not automatically unregistered — the registry is a module-level
+    dict, and the name is unique so re-registration is a no-op.
+    """
+    name = "tiny_inmem"
+    if name not in CHAT_DATASETS:
+        register_chat(name)(_tiny_inmem_factory)
+    return name
+
+
+def test_sft_finetune_end_to_end_smoke(
+    small_config: ModelConfig,
+    tmp_path: Path,
+    tiny_chat_factory: str,
+) -> None:
+    """A fresh pretrain-shaped checkpoint → sft_finetune → run dir artifacts."""
+    key = jax.random.PRNGKey(0)
+    model_key, _ = jax.random.split(key)
+    model = Transformer(small_config, key=model_key)
+    optimizer, _ = make_optimizer(SFTConfig(warmup_steps=1, max_steps=5))
+    opt_state = optimizer.init(eqx.filter(model, eqx.is_inexact_array))
+
+    ckpt_dir = tmp_path / "pretrain_latest"
+    save_checkpoint(
+        ckpt_dir,
+        model=model,
+        ema_model=model,
+        opt_state=opt_state,
+        step=0,
+        cursor=None,
+    )
+    # Drop a config.yaml alongside so _resolve_model_skeleton reads it.
+    import yaml  # noqa: PLC0415
+
+    ckpt_config = Config(model=small_config)
+    (ckpt_dir / "config.yaml").write_text(
+        yaml.dump(ckpt_config.model_dump(mode="json"))
+    )
+
+    sft_config = Config(
+        model=small_config,
+        sft=SFTConfig(
+            warmup_steps=1,
+            max_steps=3,
+            batch_size=2,
+            log_every=1,
+            save_every=2,
+            run_dir=tmp_path / "sft_runs",
+            datasets=[SFTDatasetConfig(name=tiny_chat_factory)],
+            prefetch_size=1,
+        ),
+    )
+
+    run_dir = sft_finetune(sft_config, checkpoint=ckpt_dir)
+    assert run_dir.exists()
+    assert (run_dir / "config.yaml").exists()
+    assert (run_dir / "latest").exists()
+    # max_steps=3 with save_every=2 → step_2/ exists, step_3/ final save
+    step_dirs = sorted(d.name for d in run_dir.iterdir() if d.name.startswith("step_"))
+    assert step_dirs, f"no step_ dirs in {run_dir}"

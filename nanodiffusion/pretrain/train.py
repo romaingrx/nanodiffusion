@@ -7,7 +7,6 @@ tested without spinning up the data pipeline: :func:`make_optimizer`,
 """
 
 import dataclasses
-import datetime
 import time
 from collections.abc import Callable
 from pathlib import Path
@@ -17,15 +16,15 @@ import jax
 import jax.numpy as jnp
 import optax
 import structlog
-import yaml
 
+from nanodiffusion._loop_utils import make_run_id, write_config
 from nanodiffusion.checkpoint import load_checkpoint, save_checkpoint
-from nanodiffusion.config import Config, TrainConfig
+from nanodiffusion.config import Config, OptimizerHyperparams
 from nanodiffusion.data.datasets import get_dataset
 from nanodiffusion.data.loader import prefetch, pretrain_loader
 from nanodiffusion.data.source import SourcePosition, TextSource
-from nanodiffusion.loss import compute_loss
 from nanodiffusion.model import DiffusionModel, Transformer
+from nanodiffusion.pretrain.loss import compute_loss
 from nanodiffusion.schedule import LogLinearSchedule, NoiseSchedule
 from nanodiffusion.tokenizer import Tokenizer
 from nanodiffusion.types import PRNGKeyArray, Scalar, TokenBatch
@@ -40,23 +39,26 @@ type TrainStepFn[M: DiffusionModel] = Callable[
 
 
 def make_optimizer(
-    train_cfg: TrainConfig,
+    hp: OptimizerHyperparams,
 ) -> tuple[optax.GradientTransformation, optax.Schedule]:
     """Warmup + cosine-decay AdamW with global-norm grad clipping.
 
-    Returns the optimizer and the lr schedule; the schedule is exposed
-    separately so callers can log the current learning rate without
-    reaching into opt_state internals.
+    Typed against :class:`OptimizerHyperparams` so both ``TrainConfig``
+    (pretrain) and ``SFTConfig`` (fine-tuning) satisfy it structurally
+    — this keeps SFT from dragging in a pretrain config reference just
+    to reuse the optimizer factory. Returns the optimizer and the lr
+    schedule; the schedule is exposed separately so callers can log
+    the current learning rate without reaching into opt_state internals.
     """
     lr_schedule = optax.warmup_cosine_decay_schedule(
         init_value=0.0,
-        peak_value=train_cfg.learning_rate,
-        warmup_steps=train_cfg.warmup_steps,
-        decay_steps=train_cfg.max_steps,
+        peak_value=hp.learning_rate,
+        warmup_steps=hp.warmup_steps,
+        decay_steps=hp.max_steps,
     )
     optimizer = optax.chain(
-        optax.clip_by_global_norm(train_cfg.grad_clip),
-        optax.adamw(lr_schedule, weight_decay=train_cfg.weight_decay),
+        optax.clip_by_global_norm(hp.grad_clip),
+        optax.adamw(lr_schedule, weight_decay=hp.weight_decay),
     )
     return optimizer, lr_schedule
 
@@ -120,14 +122,6 @@ def make_train_step[M: DiffusionModel](
     return train_step
 
 
-def _make_run_id() -> str:
-    return datetime.datetime.now(tz=datetime.UTC).strftime("%Y%m%d-%H%M%S")
-
-
-def _write_config(run_dir: Path, config: Config) -> None:
-    (run_dir / "config.yaml").write_text(yaml.dump(config.model_dump(mode="json")))
-
-
 def _init_run_dir(
     config: Config, *, starting_step: int, resume_from: Path | None
 ) -> Path:
@@ -141,9 +135,9 @@ def _init_run_dir(
     if resume_from is not None:
         run_dir = resume_from.parent.resolve()
     else:
-        run_dir = config.train.run_dir / _make_run_id()
+        run_dir = config.train.run_dir / make_run_id()
     run_dir.mkdir(parents=True, exist_ok=True)
-    _write_config(run_dir, config)
+    write_config(run_dir, config)
     logger.info(
         "pretrain_start",
         run_dir=str(run_dir),
@@ -216,7 +210,7 @@ def _run_loop[M: DiffusionModel](
             cursor=state.cursor,
             update_latest=True,
         )
-        _write_config(ckpt_dir, config)
+        write_config(ckpt_dir, config)
         state.last_saved_step = state.step
         logger.info("checkpoint_saved", path=str(ckpt_dir), step=state.step)
 

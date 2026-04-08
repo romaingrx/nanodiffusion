@@ -90,7 +90,7 @@ def parquet_from_huggingface(
     train_idx = list(train_indices)
     val_idx = list(val_indices)
     if download:
-        _download_shards(
+        download_shards(
             repo_id=repo_id,
             filename_pattern=filename_pattern,
             indices=train_idx + val_idx,
@@ -105,7 +105,7 @@ def parquet_from_huggingface(
 _HF_RESOLVE_URL = "https://huggingface.co/datasets/{repo_id}/resolve/main/{filename}"
 
 
-def _download_shards(
+def download_shards(
     *,
     repo_id: str,
     filename_pattern: str,
@@ -125,16 +125,14 @@ def _download_shards(
         url = _HF_RESOLVE_URL.format(repo_id=repo_id, filename=filename)
         target = dest_dir / filename
         target.parent.mkdir(parents=True, exist_ok=True)
-        _download_with_backoff(
-            url, target, options=options, validator=_validate_parquet
-        )
+        download_with_backoff(url, target, options=options, validator=validate_parquet)
 
     with ThreadPoolExecutor(max_workers=options.num_workers) as pool:
         for _ in pool.map(task, todo):
             pass
 
 
-def _validate_parquet(path: Path) -> None:
+def validate_parquet(path: Path) -> None:
     """Verify the file at ``path`` is a readable parquet file.
 
     Raises :class:`ValueError` so the download retry loop treats a corrupt
@@ -150,7 +148,7 @@ def _validate_parquet(path: Path) -> None:
         raise ValueError(msg) from exc
 
 
-def _download_with_backoff(
+def download_with_backoff(
     url: str,
     target: Path,
     *,

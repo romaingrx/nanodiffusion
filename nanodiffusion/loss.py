@@ -1,11 +1,18 @@
+"""Loss primitives shared by pretraining and SFT paths.
+
+Paradigm-specific loss functions and training loops live under
+``nanodiffusion.pretrain`` and ``nanodiffusion.sft``; this module keeps
+the small per-token helpers and the time-sampling Protocol that both
+paradigms depend on so neither has to import the other.
+"""
+
 from typing import Protocol, runtime_checkable
 
 import jax
 import jax.numpy as jnp
+from jaxtyping import Float
 
-from nanodiffusion.model import DiffusionModel
-from nanodiffusion.schedule import NoiseSchedule, loss_weight, mask_chance
-from nanodiffusion.types import Logits, Mask, PRNGKeyArray, Scalar, TokenBatch, Tokens
+from nanodiffusion.types import Logits, PRNGKeyArray, Tokens
 
 
 @runtime_checkable
@@ -21,77 +28,14 @@ def low_discrepancy_sampler(batch_size: int, *, key: PRNGKeyArray) -> jax.Array:
     return (1 - sampling_eps) * t_batch + sampling_eps
 
 
-def forward_mask(
-    x0: Tokens,
-    t: Scalar,
-    *,
-    schedule: NoiseSchedule,
-    mask_token_id: int,
-    key: PRNGKeyArray,
-) -> tuple[Tokens, Mask]:
-    """Apply forward diffusion: independently mask each token with prob 1 - alpha(t).
+def token_nll(logits: Logits, x0: Tokens) -> Float[jax.Array, " seq"]:
+    """Per-position negative log-likelihood of the true tokens.
 
-    Ref: MDLM Eq. 2 — per-token marginal q(x_t | x_0).
+    Pure log-softmax → gather, with no masking or reduction. Both the
+    pretrain and SFT loss paths layer masks and aggregations on top of
+    this single per-token score, so the underlying arithmetic is shared
+    without threading a ``reduction=`` flag through the public API.
     """
-    chance = mask_chance(schedule, t)
-    noise = jax.random.uniform(key, x0.shape)
-    is_masked = noise < chance
-    xt = jnp.where(is_masked, mask_token_id, x0)
-    return xt, is_masked
-
-
-def masked_nll(
-    logits: Logits,
-    x0: Tokens,
-    is_masked: Mask,
-    weight: Scalar,
-) -> Scalar:
     log_probs = jax.nn.log_softmax(logits, axis=-1)
     log_p_x0 = jnp.take_along_axis(log_probs, x0[..., None], axis=-1).squeeze(-1)
-    nll = -log_p_x0 * is_masked
-    n_masked = jnp.maximum(is_masked.sum(), 1)
-    return weight * nll.sum() / n_masked
-
-
-def diffusion_loss(
-    model: DiffusionModel,
-    x0: Tokens,
-    t: Scalar,
-    *,
-    schedule: NoiseSchedule,
-    mask_token_id: int,
-    key: PRNGKeyArray,
-) -> Scalar:
-    """Continuous-time NELBO for a single sequence. Assumes t > 0.
-
-    w(t) * mean_masked(-log p(x0 | xt)), see MDLM Eq. 13-14.
-    """
-    xt, is_masked = forward_mask(
-        x0, t, schedule=schedule, mask_token_id=mask_token_id, key=key
-    )
-    logits = model(xt, t)
-    return masked_nll(logits, x0, is_masked, loss_weight(schedule, t))
-
-
-def compute_loss(
-    model: DiffusionModel,
-    x0: TokenBatch,
-    *,
-    schedule: NoiseSchedule,
-    mask_token_id: int,
-    key: PRNGKeyArray,
-    sampler: TimeSampler = low_discrepancy_sampler,
-) -> Scalar:
-    batch_size = x0.shape[0]
-    key, t_key = jax.random.split(key)
-    t_batch = sampler(batch_size, key=t_key)
-
-    keys = jax.random.split(key, batch_size)
-
-    def _per_sample(xi: Tokens, ti: Scalar, ki: PRNGKeyArray) -> Scalar:
-        return diffusion_loss(
-            model, xi, ti, schedule=schedule, mask_token_id=mask_token_id, key=ki
-        )
-
-    losses = jax.vmap(_per_sample)(x0, t_batch, keys)
-    return losses.mean()
+    return -log_p_x0
