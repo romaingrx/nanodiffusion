@@ -24,7 +24,11 @@ import click
     "resume_from",
     type=click.Path(exists=True, file_okay=False, path_type=Path),
     default=None,
-    help="Checkpoint directory (e.g. runs/pretrain/<id>/step_1000) to resume from.",
+    help=(
+        "Checkpoint directory to resume from. Can be an explicit step "
+        "dir (runs/pretrain/<id>/step_1000) or the 'latest' symlink "
+        "(runs/pretrain/<id>/latest)."
+    ),
 )
 def pretrain_command(
     *,

@@ -6,6 +6,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
+from pydantic import ValidationError
 
 from nanodiffusion.config import ModelConfig, TrainConfig
 from nanodiffusion.model import Transformer
@@ -279,3 +280,30 @@ def test_make_train_step_narrows_via_trainstepfn_annotation(
     assert type(new_model) is Transformer
     assert type(new_ema) is Transformer
     assert jnp.isfinite(loss)
+
+
+def test_train_config_rejects_non_positive_save_every() -> None:
+    """``save_every == 0`` would ZeroDivisionError in the loop; reject up front."""
+    with pytest.raises(ValidationError, match="save_every"):
+        TrainConfig(save_every=0)
+    with pytest.raises(ValidationError, match="save_every"):
+        TrainConfig(save_every=-1)
+
+
+def test_train_config_rejects_non_positive_log_every() -> None:
+    with pytest.raises(ValidationError, match="log_every"):
+        TrainConfig(log_every=0)
+
+
+def test_train_config_rejects_ema_decay_out_of_range() -> None:
+    """EMA math only makes sense for ``decay in [0, 1]``."""
+    with pytest.raises(ValidationError, match="ema_decay"):
+        TrainConfig(ema_decay=-0.1)
+    with pytest.raises(ValidationError, match="ema_decay"):
+        TrainConfig(ema_decay=1.5)
+
+
+def test_train_config_accepts_ema_decay_endpoints() -> None:
+    """0 and 1 are valid degenerate cases (pure model / pure EMA)."""
+    TrainConfig(ema_decay=0.0)
+    TrainConfig(ema_decay=1.0)

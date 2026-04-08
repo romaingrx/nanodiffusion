@@ -17,7 +17,6 @@ train:
   grad_clip: 1.0
   log_every: 20
   save_every: 500
-  eval_every: 250
   run_dir: runs/pretrain
 
 data:
