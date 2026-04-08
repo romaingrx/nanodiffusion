@@ -44,6 +44,7 @@ def config_path(tmp_path: Path) -> Path:
         },
         "train": {
             "batch_size": 8,
+            "warmup_steps": 10,
             "max_steps": 100,
         },
     }

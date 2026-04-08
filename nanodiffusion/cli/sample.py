@@ -31,14 +31,14 @@ def sample_command(
     seed: int,
 ) -> None:
     """Generate text via iterative unmasking."""
-    import equinox as eqx  # noqa: PLC0415
     import jax  # noqa: PLC0415
     import jax.numpy as jnp  # noqa: PLC0415
 
     from nanodiffusion import sampler  # noqa: PLC0415
     from nanodiffusion.chat import render_for_completion  # noqa: PLC0415
+    from nanodiffusion.checkpoint import load_model  # noqa: PLC0415
     from nanodiffusion.config import Config  # noqa: PLC0415
-    from nanodiffusion.model.transformer import Transformer  # noqa: PLC0415
+    from nanodiffusion.model import Transformer  # noqa: PLC0415
     from nanodiffusion.schedule import LogLinearSchedule  # noqa: PLC0415
     from nanodiffusion.tokenizer import Tokenizer  # noqa: PLC0415
 
@@ -50,11 +50,8 @@ def sample_command(
 
     key = jax.random.PRNGKey(seed)
     key, model_key = jax.random.split(key)
-    skeleton = Transformer(config.model, key=model_key)
-    loaded: Transformer = eqx.tree_deserialise_leaves(  # pyright: ignore[reportUnknownVariableType,reportUnknownMemberType]
-        checkpoint / "model.eqx", skeleton
-    )
-    jit_model = eqx.filter_jit(loaded)  # pyright: ignore[reportUnknownArgumentType]
+    model_skeleton = Transformer(config.model, key=model_key)
+    model = load_model(checkpoint, model_skeleton=model_skeleton, which="ema")
 
     prompt_ids = render_for_completion(
         tok, {"messages": [{"role": "user", "content": prompt}]}
@@ -69,7 +66,7 @@ def sample_command(
     )
 
     tokens = sampler.sample_tokens(
-        jit_model,
+        model,
         prompt_tokens,
         schedule=schedule,
         mask_token_id=tok.mask_token_id,

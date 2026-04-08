@@ -24,7 +24,9 @@ def main(*, verbose: bool) -> None:
 
 
 from nanodiffusion.cli.data import data_group  # noqa: E402
+from nanodiffusion.cli.pretrain import pretrain_command  # noqa: E402
 from nanodiffusion.cli.sample import sample_command  # noqa: E402
 
 main.add_command(sample_command)
 main.add_command(data_group)
+main.add_command(pretrain_command)

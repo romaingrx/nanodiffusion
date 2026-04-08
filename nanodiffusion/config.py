@@ -2,7 +2,7 @@ import math
 from pathlib import Path
 
 import yaml
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, model_validator
 
 
 def _round_to_multiple(x: int, multiple: int) -> int:
@@ -29,16 +29,27 @@ class ModelConfig(BaseModel):
 
 class TrainConfig(BaseModel):
     seed: int = 42
-    batch_size: int = 32
-    learning_rate: float = 3e-4
-    weight_decay: float = 0.0
-    warmup_steps: int = 2500
-    max_steps: int = 100_000
-    ema_decay: float = 0.9999
-    grad_clip: float = 1.0
-    log_every: int = 100
-    save_every: int = 5000
-    eval_every: int = 1000
+    batch_size: int = Field(default=32, gt=0)
+    learning_rate: float = Field(default=3e-4, gt=0.0)
+    weight_decay: float = Field(default=0.0, ge=0.0)
+    warmup_steps: int = Field(default=2500, ge=0)
+    max_steps: int = Field(default=100_000, gt=0)
+    ema_decay: float = Field(default=0.9999, ge=0.0, le=1.0)
+    grad_clip: float = Field(default=1.0, gt=0.0)
+    log_every: int = Field(default=100, gt=0)
+    save_every: int = Field(default=5000, gt=0)
+    run_dir: Path = Path("runs/pretrain")
+
+    @model_validator(mode="after")
+    def _check_steps(self) -> "TrainConfig":
+        if self.max_steps <= self.warmup_steps:
+            msg = (
+                f"max_steps ({self.max_steps}) must exceed warmup_steps "
+                f"({self.warmup_steps}); otherwise the cosine schedule has "
+                "no decay phase."
+            )
+            raise ValueError(msg)
+        return self
 
 
 class SampleConfig(BaseModel):
