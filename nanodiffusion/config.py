@@ -39,6 +39,7 @@ class TrainConfig(BaseModel):
     log_every: int = 100
     save_every: int = 5000
     eval_every: int = 1000
+    run_dir: Path = Path("runs/pretrain")
 
 
 class SampleConfig(BaseModel):

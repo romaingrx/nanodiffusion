@@ -1,14 +1,14 @@
 import equinox as eqx
 import jax
-from jaxtyping import Array, Float, Int
 
 from nanodiffusion.config import ModelConfig
+from nanodiffusion.model._base import DiffusionModel
 from nanodiffusion.model.block import TransformerBlock
 from nanodiffusion.model.embedding import TimeEmbedding, TokenEmbedding
-from nanodiffusion.types import Logits, PRNGKeyArray, Scalar
+from nanodiffusion.types import Logits, PRNGKeyArray, Scalar, Tokens
 
 
-class Transformer(eqx.Module):
+class Transformer(DiffusionModel):
     embed: TokenEmbedding
     time_embed: TimeEmbedding
     blocks: list[TransformerBlock]
@@ -31,9 +31,9 @@ class Transformer(eqx.Module):
             config.hidden_dim, config.vocab_size, use_bias=False, key=keys[-1]
         )
 
-    def __call__(self, tokens: Int[Array, " seq"], t: Scalar) -> Logits:
-        x: Float[Array, "seq dim"] = self.embed(tokens)
-        cond: Float[Array, " dim"] = self.time_embed(t)
+    def __call__(self, tokens: Tokens, t: Scalar) -> Logits:
+        x = self.embed(tokens)
+        cond = self.time_embed(t)
 
         for block in self.blocks:
             x = block(x, cond)

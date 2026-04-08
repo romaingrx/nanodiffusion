@@ -1,0 +1,37 @@
+model:
+  num_layers: 3
+  hidden_dim: 192
+  num_heads: 3
+  max_seq_len: 128
+  dropout_rate: 0.0
+  ffn_mult: 4
+
+train:
+  seed: 42
+  batch_size: 8
+  learning_rate: 3e-4
+  weight_decay: 0.1
+  warmup_steps: 100
+  max_steps: 2000
+  ema_decay: 0.999
+  grad_clip: 1.0
+  log_every: 20
+  save_every: 500
+  eval_every: 250
+  run_dir: runs/pretrain
+
+data:
+  dataset: fineweb-edu-10bt
+  data_dir: data
+  num_train_shards: 1
+  tokenizer_batch_size: 128
+  tokenizer_threads: 4
+  prefetch_size: 2
+  max_empty_passes: 100
+
+sample:
+  steps: 32
+  temperature: 1.0
+  top_k: 0
+  top_p: 1.0
+  max_length: 128

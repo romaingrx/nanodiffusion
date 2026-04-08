@@ -8,13 +8,26 @@ import functools
 from collections.abc import Iterator
 from typing import NamedTuple
 
+import equinox as eqx
 import jax
 import jax.numpy as jnp
 from jaxtyping import Array, Float
 
 from nanodiffusion.model import DiffusionModel
 from nanodiffusion.schedule import NoiseSchedule, mask_chance
-from nanodiffusion.types import PRNGKeyArray, Prompt, Scalar, Tokens
+from nanodiffusion.types import Logits, PRNGKeyArray, Prompt, Scalar, Tokens
+
+
+@eqx.filter_jit
+def _forward(model: DiffusionModel, tokens: Tokens, t: Scalar) -> Logits:
+    """JIT-cached model forward pass used by the sampling loop.
+
+    Defined at module scope so ``filter_jit`` hashes the same closure
+    across every ``sample`` invocation; the model is passed as a pytree
+    argument, so the JIT cache keys on structural shape and any
+    ``DiffusionModel`` subclass flows through without downcasting.
+    """
+    return model(tokens, t)
 
 
 class SampleStep(NamedTuple):
@@ -116,7 +129,7 @@ def sample(
         move_t = mask_chance(schedule, t)
         move_s = mask_chance(schedule, s)
 
-        logits = model(x, t)
+        logits = _forward(model, x, t)
         logits = logits.at[:, mask_token_id].set(-1e9)
         filtered = jax.vmap(_filter)(logits)
 
@@ -131,7 +144,7 @@ def sample(
         yield SampleStep(x, i, steps)
 
     # Final denoising: argmax remaining masks
-    logits = model(x, jnp.array(_T_MIN))
+    logits = _forward(model, x, jnp.array(_T_MIN))
     logits = logits.at[:, mask_token_id].set(-1e9)
     x = jnp.where(x == mask_token_id, jnp.argmax(logits, axis=-1), x)
 

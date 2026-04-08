@@ -74,9 +74,21 @@ typeCheckingMode = "strict"
 reportAny = false
 reportExplicitAny = false
 reportUnusedCallResult = false
-# JAX/Equinox stubs are incomplete — these fire on library functions, not our code
+# JAX/Equinox/Optax stub gap — these rules fire on library call sites, not
+# our code. ``eqx.filter_value_and_grad`` and friends return
+# ``jaxtyping.PyTree`` (= Unknown to basedpyright), and optax has no
+# ``py.typed`` marker, so the Unknown cascades into every local that holds
+# a gradient, update, or optimizer state. Neither equinox nor flax runs
+# basedpyright strict for this exact reason: equinox tests against stock
+# pyright defaults and uses ``typing.cast`` at its own PyTree boundaries
+# (see equinox/_ad.py:185); flax uses only mypy with ``ignore_missing_imports``
+# for jax/optax. Strong types at function boundaries are still enforced —
+# inputs, outputs, and eqx.Module fields all stay typed.
 reportUnknownMemberType = false
 reportUnknownLambdaType = false
+reportUnknownVariableType = false
+reportUnknownArgumentType = false
+reportMissingTypeStubs = false
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

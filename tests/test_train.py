@@ -1,0 +1,296 @@
+from typing import assert_type
+
+import equinox as eqx
+import jax
+import jax.numpy as jnp
+import numpy as np
+import optax
+import pytest
+
+from nanodiffusion.config import ModelConfig, TrainConfig
+from nanodiffusion.model import Transformer
+from nanodiffusion.schedule import LogLinearSchedule
+from nanodiffusion.train import (
+    TrainStepFn,
+    ema_update,
+    make_optimizer,
+    make_train_step,
+)
+
+
+def test_make_optimizer_warmup_peak_and_decay() -> None:
+    cfg = TrainConfig(learning_rate=1e-3, warmup_steps=100, max_steps=1000)
+    _opt, sched = make_optimizer(cfg)
+
+    assert float(sched(0)) == pytest.approx(0.0, abs=1e-8)
+    assert float(sched(100)) == pytest.approx(1e-3, rel=1e-3)
+    # Cosine decay drives lr back to (near) 0 at max_steps
+    assert float(sched(1000)) < 1e-5
+
+
+def _count_inexact_leaves_that_changed(
+    before: Transformer, after: Transformer, *, atol: float = 0.0
+) -> int:
+    before_leaves = jax.tree.leaves(eqx.filter(before, eqx.is_inexact_array))
+    after_leaves = jax.tree.leaves(eqx.filter(after, eqx.is_inexact_array))
+    return sum(
+        1
+        for a, b in zip(before_leaves, after_leaves, strict=True)
+        if not np.allclose(a, b, atol=atol)
+    )
+
+
+def test_ema_update_at_decay_zero_copies_model(model: Transformer) -> None:
+    """With decay=0, ema becomes an exact copy of ``model``."""
+    perturbed = jax.tree.map(lambda x: x + 1.0 if eqx.is_inexact_array(x) else x, model)
+
+    updated = ema_update(model, perturbed, decay=0.0)
+
+    a = jax.tree.leaves(eqx.filter(updated, eqx.is_inexact_array))
+    b = jax.tree.leaves(eqx.filter(perturbed, eqx.is_inexact_array))
+    for x, y in zip(a, b, strict=True):
+        np.testing.assert_allclose(x, y, atol=1e-6)
+
+
+def test_ema_update_at_decay_one_keeps_ema(model: Transformer) -> None:
+    """With decay=1, ema ignores ``model`` entirely."""
+    perturbed = jax.tree.map(lambda x: x + 1.0 if eqx.is_inexact_array(x) else x, model)
+
+    updated = ema_update(model, perturbed, decay=1.0)
+
+    before = jax.tree.leaves(eqx.filter(model, eqx.is_inexact_array))
+    after = jax.tree.leaves(eqx.filter(updated, eqx.is_inexact_array))
+    for x, y in zip(before, after, strict=True):
+        np.testing.assert_allclose(x, y, atol=1e-6)
+
+
+def test_ema_update_linear_interpolation(model: Transformer) -> None:
+    """Spot-check the Polyak formula on a concrete leaf."""
+    perturbed = jax.tree.map(lambda x: x + 4.0 if eqx.is_inexact_array(x) else x, model)
+
+    updated = ema_update(model, perturbed, decay=0.75)
+    # ema_new = 0.75 * ema_old + 0.25 * model_new = 0.75 * x + 0.25 * (x + 4) = x + 1
+    original = jax.tree.leaves(eqx.filter(model, eqx.is_inexact_array))
+    result = jax.tree.leaves(eqx.filter(updated, eqx.is_inexact_array))
+    for before, after in zip(original, result, strict=True):
+        np.testing.assert_allclose(after, before + 1.0, atol=1e-5)
+
+
+def test_train_step_decreases_loss_on_fixed_batch(
+    small_config: ModelConfig, key: jax.Array
+) -> None:
+    """A few aggressive-LR steps on the same batch must lower the loss.
+
+    Uses a tiny model + repeated batch so learning is unambiguous even
+    for the stochastic MDLM objective (low-discrepancy time sampler
+    averages out most noise).
+    """
+    key, model_key = jax.random.split(key)
+    model = Transformer(small_config, key=model_key)
+    ema_model = model
+
+    train_cfg = TrainConfig(
+        learning_rate=3e-3,
+        warmup_steps=5,
+        max_steps=100,
+        weight_decay=0.0,
+        grad_clip=1.0,
+        ema_decay=0.99,
+    )
+    optimizer, _ = make_optimizer(train_cfg)
+    opt_state = optimizer.init(eqx.filter(model, eqx.is_inexact_array))
+
+    mask_id = small_config.vocab_size - 1
+    train_step = make_train_step(
+        optimizer,
+        schedule=LogLinearSchedule(),
+        mask_token_id=mask_id,
+        ema_decay=train_cfg.ema_decay,
+    )
+
+    batch = jnp.tile(
+        jnp.arange(small_config.max_seq_len, dtype=jnp.int32)
+        % (small_config.vocab_size - 1),
+        (4, 1),
+    )
+
+    losses: list[float] = []
+    for _ in range(50):
+        key, step_key = jax.random.split(key)
+        model, ema_model, opt_state, loss = train_step(
+            model, ema_model, opt_state, batch, step_key
+        )
+        losses.append(float(loss))
+
+    early = float(np.mean(losses[:5]))
+    late = float(np.mean(losses[-5:]))
+    assert late < early, f"loss did not decrease: {early:.3f} -> {late:.3f}"
+
+
+def test_train_step_updates_model_and_ema(
+    small_config: ModelConfig, key: jax.Array
+) -> None:
+    """One step should move the model *and* produce an EMA distinct from it."""
+    key, model_key = jax.random.split(key)
+    model = Transformer(small_config, key=model_key)
+    ema_model = model
+
+    train_cfg = TrainConfig(
+        learning_rate=1e-2,
+        warmup_steps=0,
+        max_steps=10,
+        ema_decay=0.5,
+    )
+    optimizer, _ = make_optimizer(train_cfg)
+    opt_state = optimizer.init(eqx.filter(model, eqx.is_inexact_array))
+
+    train_step = make_train_step(
+        optimizer,
+        schedule=LogLinearSchedule(),
+        mask_token_id=small_config.vocab_size - 1,
+        ema_decay=train_cfg.ema_decay,
+    )
+
+    batch = jnp.zeros((2, small_config.max_seq_len), dtype=jnp.int32)
+    key, step_key = jax.random.split(key)
+    new_model, new_ema, _new_opt_state, _loss = train_step(
+        model, ema_model, opt_state, batch, step_key
+    )
+
+    assert _count_inexact_leaves_that_changed(model, new_model) > 0
+    # With decay=0.5 and the EMA starting equal to the model, the new EMA
+    # must be halfway between old and new params — so it differs from both.
+    assert _count_inexact_leaves_that_changed(new_model, new_ema) > 0
+    assert _count_inexact_leaves_that_changed(model, new_ema) > 0
+
+
+def test_train_step_jits_and_is_deterministic(
+    small_config: ModelConfig, key: jax.Array
+) -> None:
+    """Same key + same batch + same init produce bitwise-identical updates."""
+    key, model_key = jax.random.split(key)
+    model = Transformer(small_config, key=model_key)
+
+    optimizer, _ = make_optimizer(TrainConfig(warmup_steps=2, max_steps=10))
+    opt_state = optimizer.init(eqx.filter(model, eqx.is_inexact_array))
+
+    train_step = make_train_step(
+        optimizer,
+        schedule=LogLinearSchedule(),
+        mask_token_id=small_config.vocab_size - 1,
+        ema_decay=0.9,
+    )
+
+    batch = jnp.zeros((2, small_config.max_seq_len), dtype=jnp.int32)
+    step_key = jax.random.PRNGKey(123)
+
+    m1, e1, _o1, l1 = train_step(model, model, opt_state, batch, step_key)
+    m2, e2, _o2, l2 = train_step(model, model, opt_state, batch, step_key)
+
+    assert float(l1) == pytest.approx(float(l2), abs=0.0)
+    for a, b in zip(
+        jax.tree.leaves(eqx.filter(m1, eqx.is_inexact_array)),
+        jax.tree.leaves(eqx.filter(m2, eqx.is_inexact_array)),
+        strict=True,
+    ):
+        np.testing.assert_array_equal(a, b)
+    for a, b in zip(
+        jax.tree.leaves(eqx.filter(e1, eqx.is_inexact_array)),
+        jax.tree.leaves(eqx.filter(e2, eqx.is_inexact_array)),
+        strict=True,
+    ):
+        np.testing.assert_array_equal(a, b)
+
+
+def test_train_step_produces_finite_updates(
+    small_config: ModelConfig, key: jax.Array
+) -> None:
+    """Sanity: no nan/inf in the post-update model or EMA."""
+    key, model_key = jax.random.split(key)
+    model = Transformer(small_config, key=model_key)
+
+    optimizer, _ = make_optimizer(TrainConfig(warmup_steps=2, max_steps=10))
+    opt_state = optimizer.init(eqx.filter(model, eqx.is_inexact_array))
+
+    train_step = make_train_step(
+        optimizer,
+        schedule=LogLinearSchedule(),
+        mask_token_id=small_config.vocab_size - 1,
+        ema_decay=0.9,
+    )
+
+    batch = jax.random.randint(
+        key, (2, small_config.max_seq_len), 0, small_config.vocab_size - 1
+    )
+    key, step_key = jax.random.split(key)
+    new_model, new_ema, _new_opt_state, loss = train_step(
+        model, model, opt_state, batch, step_key
+    )
+
+    assert jnp.isfinite(loss)
+    for tree in (new_model, new_ema):
+        for leaf in jax.tree.leaves(eqx.filter(tree, eqx.is_inexact_array)):
+            assert jnp.all(jnp.isfinite(leaf))
+
+
+def test_train_step_signature_accepts_optax_chain() -> None:
+    """Regression: closure capture of a chained optax optimizer traces cleanly."""
+    cfg = ModelConfig(
+        vocab_size=32,
+        num_layers=1,
+        hidden_dim=16,
+        num_heads=2,
+        max_seq_len=8,
+    )
+    model = Transformer(cfg, key=jax.random.PRNGKey(0))
+    optimizer = optax.chain(
+        optax.clip_by_global_norm(1.0),
+        optax.adamw(1e-3),
+    )
+    opt_state = optimizer.init(eqx.filter(model, eqx.is_inexact_array))
+
+    step = make_train_step(
+        optimizer,
+        schedule=LogLinearSchedule(),
+        mask_token_id=cfg.vocab_size - 1,
+        ema_decay=0.9,
+    )
+    batch = jnp.zeros((2, cfg.max_seq_len), dtype=jnp.int32)
+    _m, _e, _o, loss = step(model, model, opt_state, batch, jax.random.PRNGKey(1))
+    assert jnp.isfinite(loss)
+
+
+def test_make_train_step_narrows_via_trainstepfn_annotation(
+    small_config: ModelConfig, key: jax.Array
+) -> None:
+    """Generic narrowing: a ``TrainStepFn[Transformer]`` target annotation
+    pins ``M = Transformer`` on the returned step, so each of its four
+    return positions narrows to the concrete model type at call sites.
+    """
+    key, model_key = jax.random.split(key)
+    model = Transformer(small_config, key=model_key)
+
+    optimizer, _ = make_optimizer(
+        TrainConfig(warmup_steps=2, max_steps=10, ema_decay=0.9)
+    )
+    opt_state = optimizer.init(eqx.filter(model, eqx.is_inexact_array))
+
+    train_step: TrainStepFn[Transformer] = make_train_step(
+        optimizer,
+        schedule=LogLinearSchedule(),
+        mask_token_id=small_config.vocab_size - 1,
+        ema_decay=0.9,
+    )
+
+    batch = jnp.zeros((2, small_config.max_seq_len), dtype=jnp.int32)
+    key, step_key = jax.random.split(key)
+    new_model, new_ema, _new_opt_state, loss = train_step(
+        model, model, opt_state, batch, step_key
+    )
+
+    assert_type(new_model, Transformer)
+    assert_type(new_ema, Transformer)
+    # Runtime sanity: the narrowing agrees with the actual type.
+    assert type(new_model) is Transformer
+    assert type(new_ema) is Transformer
+    assert jnp.isfinite(loss)
