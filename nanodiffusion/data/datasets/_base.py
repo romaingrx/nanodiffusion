@@ -1,7 +1,7 @@
-"""Named pretraining datasets.
+"""Shared primitives for pretrain dataset factories.
 
-This is the only module that knows about Hugging Face; ``source.py`` stays
-offline-pure so its tests never touch the network.
+All network-touching code lives here so ``source.py`` stays offline-pure.
+Per-dataset modules only declare a spec and register it on import.
 """
 
 from collections.abc import Callable, Iterable
@@ -14,17 +14,17 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from nanodiffusion.data.source import ParquetTextSource, TextSource
+from nanodiffusion.registry import Registry
 
 
 @runtime_checkable
 class DatasetFactory(Protocol):
     """Callable that builds a :class:`TextSource` from a local cache dir.
 
-    ``download_options`` is honored by HTTP-backed factories and silently
-    ignored by local-only ones so the CLI can stay generic.
-
-    Named ``DatasetFactory`` rather than ``Dataset`` to avoid collision with
-    ``torch.utils.data.Dataset`` and HuggingFace ``datasets.Dataset``.
+    ``download_options`` is honored by HTTP-backed factories and
+    ignored by local-only ones so the CLI stays generic. Named
+    ``DatasetFactory`` to avoid collision with ``torch.utils.data.Dataset``
+    and HuggingFace ``datasets.Dataset``.
     """
 
     def __call__(
@@ -37,25 +37,11 @@ class DatasetFactory(Protocol):
     ) -> TextSource: ...
 
 
-DATASETS: dict[str, DatasetFactory] = {}
-
-
-def register(name: str) -> Callable[[DatasetFactory], DatasetFactory]:
-    def decorator(fn: DatasetFactory) -> DatasetFactory:
-        if name in DATASETS:
-            msg = f"Dataset {name!r} already registered"
-            raise ValueError(msg)
-        DATASETS[name] = fn
-        return fn
-
-    return decorator
+DATASETS: Registry[DatasetFactory] = Registry("dataset")
 
 
 def get_dataset(name: str) -> DatasetFactory:
-    if name not in DATASETS:
-        available = ", ".join(sorted(DATASETS)) or "(none)"
-        msg = f"Unknown dataset {name!r}. Available: {available}"
-        raise KeyError(msg)
+    """Look up a registered dataset factory by name."""
     return DATASETS[name]
 
 
@@ -90,7 +76,7 @@ def parquet_from_huggingface(
     train_idx = list(train_indices)
     val_idx = list(val_indices)
     if download:
-        _download_shards(
+        download_shards(
             repo_id=repo_id,
             filename_pattern=filename_pattern,
             indices=train_idx + val_idx,
@@ -105,7 +91,7 @@ def parquet_from_huggingface(
 _HF_RESOLVE_URL = "https://huggingface.co/datasets/{repo_id}/resolve/main/{filename}"
 
 
-def _download_shards(
+def download_shards(
     *,
     repo_id: str,
     filename_pattern: str,
@@ -125,16 +111,14 @@ def _download_shards(
         url = _HF_RESOLVE_URL.format(repo_id=repo_id, filename=filename)
         target = dest_dir / filename
         target.parent.mkdir(parents=True, exist_ok=True)
-        _download_with_backoff(
-            url, target, options=options, validator=_validate_parquet
-        )
+        download_with_backoff(url, target, options=options, validator=validate_parquet)
 
     with ThreadPoolExecutor(max_workers=options.num_workers) as pool:
         for _ in pool.map(task, todo):
             pass
 
 
-def _validate_parquet(path: Path) -> None:
+def validate_parquet(path: Path) -> None:
     """Verify the file at ``path`` is a readable parquet file.
 
     Raises :class:`ValueError` so the download retry loop treats a corrupt
@@ -142,31 +126,29 @@ def _validate_parquet(path: Path) -> None:
     transient network failure.
     """
     try:
-        # Touch metadata so parquet reads the footer instead of just opening
-        # the file handle.
         _ = pq.ParquetFile(path).metadata
     except (pa.ArrowException, OSError) as exc:
         msg = f"File at {path} is not a valid parquet"
         raise ValueError(msg) from exc
 
 
-def _download_with_backoff(
+def download_with_backoff(
     url: str,
     target: Path,
     *,
     options: DownloadOptions,
     validator: Callable[[Path], None] | None = None,
 ) -> None:
-    # Local imports keep module import cheap for callers that only touch
-    # the registry (e.g. ``data list``).
+    # Deferred imports keep ``data list`` cheap by not pulling in
+    # ``requests`` for registry-only entry points.
     import random  # noqa: PLC0415
     import time  # noqa: PLC0415
     import uuid  # noqa: PLC0415
 
     import requests  # noqa: PLC0415
 
-    # Per-call uuid lets concurrent downloads of the same shard write to
-    # different temp files; the final rename is atomic.
+    # UUID-suffixed temp file so concurrent downloads of the same
+    # shard don't clobber each other before the atomic rename.
     tmp = target.with_suffix(f"{target.suffix}.{uuid.uuid4().hex}.tmp")
     last_exc: Exception | None = None
     for attempt in range(1, options.retries + 1):
@@ -177,8 +159,8 @@ def _download_with_backoff(
                     for chunk in response.iter_content(chunk_size=options.chunk_size):
                         if chunk:
                             fh.write(chunk)
-            # Validate before rename so a corrupt payload is retried instead
-            # of being committed and then failing at read time.
+            # Validate before rename so corrupt payloads get retried
+            # rather than committed and failing later at read time.
             if validator is not None:
                 validator(tmp)
             tmp.replace(target)
@@ -187,8 +169,8 @@ def _download_with_backoff(
             if tmp.exists():
                 tmp.unlink(missing_ok=True)
             if attempt < options.retries:
-                # Capped exponential backoff with jitter to scatter a
-                # thundering herd of failed shards.
+                # Capped exponential backoff with jitter scatters a
+                # thundering herd of simultaneously-failing shards.
                 base = min(options.backoff_base**attempt, options.backoff_cap)
                 jitter = random.uniform(0.0, options.backoff_jitter * base)  # noqa: S311
                 time.sleep(base + jitter)
@@ -199,31 +181,20 @@ def _download_with_backoff(
     raise RuntimeError(msg) from last_exc
 
 
-@dataclass(frozen=True, slots=True)
-class _HFDataset:
-    repo_id: str
-    filename_pattern: str
-    num_shards: int  # train shards; val shard(s) follow
-    doc: str
+def register_hf_parquet(
+    *,
+    name: str,
+    repo_id: str,
+    filename_pattern: str,
+    num_shards: int,
+    doc: str,
+) -> DatasetFactory:
+    """Register an HF-hosted parquet dataset in one call.
 
+    ``doc`` is attached as the factory's ``__doc__`` so
+    ``nanodiffusion data list`` prints a useful description.
+    """
 
-_HF_REGISTRY: dict[str, _HFDataset] = {
-    "climbmix-400b": _HFDataset(
-        repo_id="karpathy/climbmix-400b-shuffle",
-        filename_pattern="shard_{index:05d}.parquet",
-        num_shards=6542,
-        doc="ClimbMix-400B (Karpathy). nanochat default. 6543 shards, last is val.",
-    ),
-    "fineweb-edu-10bt": _HFDataset(
-        repo_id="HuggingFaceFW/fineweb-edu",
-        filename_pattern="sample/10BT/{index:03d}_00000.parquet",
-        num_shards=13,
-        doc="FineWeb-Edu sample-10BT subset (HuggingFaceFW). 14 shards, last is val.",
-    ),
-}
-
-
-def _make_hf_factory(spec: _HFDataset) -> DatasetFactory:
     def factory(
         data_dir: Path,
         *,
@@ -232,20 +203,15 @@ def _make_hf_factory(spec: _HFDataset) -> DatasetFactory:
         download_options: DownloadOptions | None = None,
     ) -> ParquetTextSource:
         return parquet_from_huggingface(
-            repo_id=spec.repo_id,
-            filename_pattern=spec.filename_pattern,
-            train_indices=range(
-                num_train if num_train is not None else spec.num_shards
-            ),
-            val_indices=(spec.num_shards,),
+            repo_id=repo_id,
+            filename_pattern=filename_pattern,
+            train_indices=range(num_train if num_train is not None else num_shards),
+            val_indices=(num_shards,),
             data_dir=data_dir,
             download=download,
             options=download_options,
         )
 
-    factory.__doc__ = spec.doc
+    factory.__doc__ = doc
+    DATASETS.register(name)(factory)
     return factory
-
-
-for _name, _spec in _HF_REGISTRY.items():
-    register(_name)(_make_hf_factory(_spec))

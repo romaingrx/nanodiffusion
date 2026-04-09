@@ -1,54 +1,72 @@
-"""On-disk checkpoints for a pretraining run.
+"""On-disk checkpoints for a training run.
 
-A checkpoint is a directory holding four files:
+A checkpoint directory holds four equinox-serialised binary files
+(``model.eqx`` / ``ema.eqx`` / ``opt_state.eqx`` / ``meta.json``) plus
+a ``config.yaml`` sidecar written by :func:`write_config` and read on
+resume by :func:`resolve_model_config_from_checkpoint`.
 
-* ``model.eqx`` / ``ema.eqx`` — equinox-serialised diffusion models
-* ``opt_state.eqx`` — equinox-serialised optax state (matches the shape
-  produced by :func:`nanodiffusion.train.make_optimizer`)
-* ``meta.json`` — step counter and data-loader cursor for clean resume
-
-The public API is generic over the concrete diffusion-model class so the
-skeleton type flows straight through to the return of
-:func:`load_checkpoint`: pass a ``Transformer`` skeleton in, get a
-``Transformer`` back — no casts at the call site.
-
-The module is deliberately config-agnostic: the training loop owns
-``config.yaml`` so saving and loading state never re-encodes user config
-and stays out of the pydantic-versioning rabbit hole.
+Binary save/load is generic over the concrete diffusion-model class:
+pass a ``Transformer`` skeleton in, get a ``Transformer`` back, no
+casts at the call site. Only the sidecar helpers touch ``Config``, so
+a pydantic schema change can only drift through that path.
 """
 
 import shutil
+from collections.abc import Callable
 from pathlib import Path
 from typing import Literal, cast
 
 import equinox as eqx
 import optax
 import structlog
+import yaml
 from pydantic import BaseModel, ConfigDict, Field
 
-from nanodiffusion.data.source import SourcePosition
+from nanodiffusion.config import Config, ModelConfig
+from nanodiffusion.constants import (
+    CONFIG_SIDECAR_FILENAME,
+    EMA_FILENAME,
+    LATEST_LINK_NAME,
+    META_FILENAME,
+    MODEL_FILENAME,
+    OPT_STATE_FILENAME,
+)
+from nanodiffusion.data.cursors import LoaderCursor
 from nanodiffusion.model import DiffusionModel
 
 logger = structlog.get_logger(__name__)
 
 type ModelSnapshot = Literal["model", "ema"]
 
-LATEST_LINK_NAME = "latest"
-
 
 class CheckpointMeta(BaseModel):
     """Step counter + data-loader cursor persisted alongside weights.
 
-    Pydantic handles json round-trip so neither the ``step`` coercion nor
-    the ``cursor`` TypedDict shape check live in save/load. ``frozen=True``
-    mirrors the previous dataclass contract: callers treat meta as a
-    value object.
+    Pydantic handles JSON round-trip for the discriminated ``cursor``
+    union so save/load stays free of variant checks.
     """
 
     model_config = ConfigDict(frozen=True)
 
     step: int = Field(ge=0)
-    cursor: SourcePosition | None = None
+    cursor: LoaderCursor | None = None
+
+    def require_cursor[C: LoaderCursor](self, kind: type[C]) -> C | None:
+        """Return the cursor narrowed to ``kind`` or raise on mismatch.
+
+        A mismatch means the user pointed ``--resume-from`` at the
+        wrong run dir — we fail at the boundary rather than silently
+        feeding the wrong cursor type into a loader.
+        """
+        if self.cursor is None:
+            return None
+        if not isinstance(self.cursor, kind):
+            msg = (
+                f"Checkpoint cursor kind {self.cursor.kind!r} does not "
+                f"match expected kind {kind.__name__!r}"
+            )
+            raise TypeError(msg)
+        return self.cursor
 
 
 def save_checkpoint[M: DiffusionModel](
@@ -58,30 +76,20 @@ def save_checkpoint[M: DiffusionModel](
     ema_model: M,
     opt_state: optax.OptState,
     step: int,
-    cursor: SourcePosition | None,
+    cursor: LoaderCursor | None,
     update_latest: bool = False,
 ) -> None:
     """Write ``(model, ema, opt_state, meta)`` atomically to ``path``.
 
-    Files are first written under a sibling ``<path>.tmp`` directory;
-    once every leaf has landed the directory is renamed into place via
-    :func:`os.replace`, which is atomic on POSIX. A crash mid-write
-    leaves only the ``.tmp`` sibling, never a half-populated ``path``.
+    Leaves land in a sibling ``<path>.tmp`` dir first, then a single
+    :func:`os.replace` renames into place (atomic on POSIX). A crash
+    mid-write leaves only the ``.tmp`` sibling, never a partial
+    ``path``. Raises :class:`FileExistsError` if ``path`` already
+    exists — we refuse to silently overwrite a prior checkpoint.
 
-    Raises :class:`FileExistsError` if ``path`` already exists — we
-    refuse to silently overwrite a prior checkpoint. Lingering ``.tmp``
-    siblings from a previous crash are cleaned up before the fresh write.
-
-    When ``update_latest=True``, atomically point
-    ``path.parent/latest`` at ``path.name`` after the rename. The
-    symlink is updated via ``os.symlink`` + :func:`os.replace` on a
-    temp link, so readers never see a dangling target. On platforms
-    that reject symlinks (e.g. unprivileged Windows) the update is
-    logged and skipped rather than failing the save.
-
-    ``model`` and ``ema_model`` are constrained to the same concrete
-    subtype of :class:`DiffusionModel`, so a typo like swapping the EMA
-    for an unrelated module is a type error, not a silent disk write.
+    When ``update_latest=True``, point ``path.parent/latest`` at
+    ``path.name`` via a temp-link swap; platforms that reject symlinks
+    (unprivileged Windows) log and skip rather than failing the save.
     """
     if path.exists():
         msg = f"refusing to overwrite existing checkpoint at {path}"
@@ -92,11 +100,11 @@ def save_checkpoint[M: DiffusionModel](
         shutil.rmtree(tmp_path)
     tmp_path.mkdir(parents=True)
 
-    eqx.tree_serialise_leaves(tmp_path / "model.eqx", model)
-    eqx.tree_serialise_leaves(tmp_path / "ema.eqx", ema_model)
-    eqx.tree_serialise_leaves(tmp_path / "opt_state.eqx", opt_state)
+    eqx.tree_serialise_leaves(tmp_path / MODEL_FILENAME, model)
+    eqx.tree_serialise_leaves(tmp_path / EMA_FILENAME, ema_model)
+    eqx.tree_serialise_leaves(tmp_path / OPT_STATE_FILENAME, opt_state)
     meta = CheckpointMeta(step=step, cursor=cursor)
-    (tmp_path / "meta.json").write_text(meta.model_dump_json(indent=2))
+    (tmp_path / META_FILENAME).write_text(meta.model_dump_json(indent=2))
 
     tmp_path.replace(path)
 
@@ -107,13 +115,10 @@ def save_checkpoint[M: DiffusionModel](
 def _update_latest_symlink(run_dir: Path, target_name: str) -> None:
     """Atomically point ``run_dir/latest`` at ``target_name``.
 
-    Uses a relative target so the run directory is portable. The new
-    symlink is created at a temp name and renamed over the existing
-    ``latest`` link — :meth:`Path.replace` is atomic on POSIX, so a
-    reader never observes a missing ``latest`` after the first
-    successful update. ``OSError`` is caught and logged so an
-    unprivileged Windows host degrades gracefully instead of aborting
-    training.
+    Uses a relative target so the run directory is portable, and
+    renames a temp link over the existing one so readers never
+    observe a missing ``latest``. ``OSError`` is logged and swallowed
+    for filesystems that reject symlinks.
     """
     tmp_link = run_dir / (LATEST_LINK_NAME + ".tmp")
     final_link = run_dir / LATEST_LINK_NAME
@@ -135,30 +140,35 @@ def load_checkpoint[M: DiffusionModel](
     path: Path,
     *,
     model_skeleton: M,
-    opt_state_skeleton: optax.OptState,
+    opt_state_builder: Callable[[M], optax.OptState],
 ) -> tuple[M, M, optax.OptState, CheckpointMeta]:
     """Inverse of :func:`save_checkpoint`.
 
-    Skeletons must match the saved shapes; callers normally build them
-    by reconstructing a fresh model and calling ``optimizer.init`` on it
-    before deserialising. The return is bound to the skeleton's concrete
-    type via the ``M`` type var, so callers can keep using model-specific
-    attributes without downcasts.
+    ``model_skeleton`` may be either a real :class:`DiffusionModel` or
+    an abstract shape tree from :func:`eqx.filter_eval_shape`; only
+    leaf shape + dtype are read. ``opt_state_builder`` is called with
+    the freshly loaded model to shape the opt-state tree — typically
+    ``lambda m: optimizer.init(eqx.filter(m, eqx.is_inexact_array))``.
+    Threading a builder instead of a pre-built skeleton lets callers
+    skip the wasteful real-weights init on resume and keeps the
+    two-phase load hidden from every driver.
 
     ``path`` may be a ``latest`` symlink; the filesystem resolves it
-    transparently for both the equinox file reads and the meta parse.
-
-    The ``cast`` calls mirror equinox's own ``_ad.py:185`` pattern: the
-    underlying ``tree_deserialise_leaves`` is typed to return ``PyTree``,
-    which we know structurally matches the skeleton we passed in.
+    transparently. The return type is bound to the skeleton's concrete
+    type so callers keep model-specific attributes without downcasts.
     """
-    model = cast("M", eqx.tree_deserialise_leaves(path / "model.eqx", model_skeleton))
-    ema_model = cast("M", eqx.tree_deserialise_leaves(path / "ema.eqx", model_skeleton))
+    model = cast(
+        "M", eqx.tree_deserialise_leaves(path / MODEL_FILENAME, model_skeleton)
+    )
+    ema_model = cast(
+        "M", eqx.tree_deserialise_leaves(path / EMA_FILENAME, model_skeleton)
+    )
+    opt_state_skeleton = opt_state_builder(model)
     opt_state = cast(
         "optax.OptState",
-        eqx.tree_deserialise_leaves(path / "opt_state.eqx", opt_state_skeleton),
+        eqx.tree_deserialise_leaves(path / OPT_STATE_FILENAME, opt_state_skeleton),
     )
-    meta = CheckpointMeta.model_validate_json((path / "meta.json").read_text())
+    meta = CheckpointMeta.model_validate_json((path / META_FILENAME).read_text())
     return model, ema_model, opt_state, meta
 
 
@@ -170,12 +180,48 @@ def load_model[M: DiffusionModel](
 ) -> M:
     """Read just the model weights from a training checkpoint.
 
-    For inference and sampling pipelines that don't need optimizer
-    state or metadata. ``which`` picks the snapshot file — ``"ema"``
-    (the sampling default, more stable) or ``"model"`` (raw trained
-    weights). The return is bound to the skeleton's concrete type via
-    the ``M`` type var, so the caller keeps full type information
-    without a downcast.
+    For inference and sampling paths that don't need optimizer state
+    or metadata. ``which="ema"`` (more stable, sampling default) or
+    ``"model"`` (raw trained weights).
     """
-    filename = "ema.eqx" if which == "ema" else "model.eqx"
+    filename = EMA_FILENAME if which == "ema" else MODEL_FILENAME
     return cast("M", eqx.tree_deserialise_leaves(path / filename, model_skeleton))
+
+
+def write_config(run_dir: Path, config: BaseModel) -> None:
+    """Dump a resolved pydantic config to ``run_dir/config.yaml``.
+
+    Uses ``model_dump(mode="json")`` so ``Path`` and other non-yaml
+    types round-trip cleanly through :func:`yaml.safe_load`.
+    """
+    (run_dir / CONFIG_SIDECAR_FILENAME).write_text(
+        yaml.dump(config.model_dump(mode="json"))
+    )
+
+
+def resolve_model_config_from_checkpoint(
+    checkpoint: Path,
+    *,
+    fallback: ModelConfig,
+    log_event: str,
+) -> ModelConfig:
+    """Pick up a checkpoint's ``config.yaml`` model section when present.
+
+    The sidecar is authoritative for model shape since the on-disk
+    weights were produced under it. If the user-supplied ``fallback``
+    disagrees we warn under ``log_event`` and keep going; a genuinely
+    mismatched shape would fail at deserialisation one line later.
+    Missing sidecar falls back silently so hand-constructed test
+    checkpoints keep working.
+    """
+    sidecar = checkpoint / CONFIG_SIDECAR_FILENAME
+    if not sidecar.exists():
+        return fallback
+    from_disk = Config.from_yaml(sidecar)
+    if from_disk.model != fallback:
+        logger.warning(
+            log_event,
+            using=from_disk.model.model_dump(),
+            ignored=fallback.model_dump(),
+        )
+    return from_disk.model

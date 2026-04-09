@@ -6,24 +6,13 @@ dataset-specific knowledge lives in :mod:`nanodiffusion.data.datasets`.
 
 from collections.abc import Iterator
 from pathlib import Path
-from typing import Literal, Protocol, TypedDict, runtime_checkable
+from typing import Literal, Protocol, runtime_checkable
 
 import pyarrow.parquet as pq
 
+from nanodiffusion.data.cursors import PretrainCursor
+
 type Split = Literal["train", "val"]
-
-
-class SourcePosition(TypedDict):
-    """Cursor for fast-forward resume.
-
-    ``row_group_idx`` is an opaque per-implementation cursor (parquet
-    row-group index for :class:`ParquetTextSource`, batch index for
-    :class:`InMemoryTextSource`).
-    """
-
-    epoch: int
-    shard_idx: int
-    row_group_idx: int
 
 
 @runtime_checkable
@@ -31,9 +20,9 @@ class TextSource(Protocol):
     """Iterable of ``(batch, position)`` tuples with infinite iteration.
 
     After exhausting the assigned shards, implementations must loop back
-    and increment ``position["epoch"]``. ``start`` / ``step`` partition
-    the work at the implementation's natural granularity and are safe to
-    use as a data-parallel sharding hook. ``resume`` fast-forwards past a
+    and increment ``position.epoch``. ``start`` / ``step`` partition the
+    work at the implementation's natural granularity and are safe to use
+    as a data-parallel sharding hook. ``resume`` fast-forwards past a
     previously yielded position so checkpoint resumption skips already
     processed data.
     """
@@ -45,8 +34,8 @@ class TextSource(Protocol):
         start: int = 0,
         step: int = 1,
         batch_size: int = 128,
-        resume: SourcePosition | None = None,
-    ) -> Iterator[tuple[list[str], SourcePosition]]: ...
+        resume: PretrainCursor | None = None,
+    ) -> Iterator[tuple[list[str], PretrainCursor]]: ...
 
 
 def _validate_stride(start: int, step: int) -> None:
@@ -78,24 +67,24 @@ class ParquetTextSource:
         start: int = 0,
         step: int = 1,
         batch_size: int = 128,
-        resume: SourcePosition | None = None,
-    ) -> Iterator[tuple[list[str], SourcePosition]]:
+        resume: PretrainCursor | None = None,
+    ) -> Iterator[tuple[list[str], PretrainCursor]]:
         paths = self._train_paths if split == "train" else self._val_paths
         if not paths:
             msg = f"ParquetTextSource has no {split!r} shards"
             raise ValueError(msg)
         _validate_stride(start, step)
 
-        epoch = resume["epoch"] if resume else 1
+        epoch = resume.epoch if resume else 1
         skip = resume
         while True:
             yielded = False
             for shard_idx, path in enumerate(paths):
-                if skip is not None and shard_idx < skip["shard_idx"]:
+                if skip is not None and shard_idx < skip.shard_idx:
                     continue
                 pf = pq.ParquetFile(path)
-                if skip is not None and shard_idx == skip["shard_idx"]:
-                    rg_start = skip["row_group_idx"] + step
+                if skip is not None and shard_idx == skip.shard_idx:
+                    rg_start = skip.row_group_idx + step
                 else:
                     rg_start = start
                 for row_group_idx in range(rg_start, pf.num_row_groups, step):
@@ -107,11 +96,11 @@ class ParquetTextSource:
                     docs: list[str] = [v for v in column if isinstance(v, str)]
                     for offset in range(0, len(docs), batch_size):
                         batch = docs[offset : offset + batch_size]
-                        position: SourcePosition = {
-                            "epoch": epoch,
-                            "shard_idx": shard_idx,
-                            "row_group_idx": row_group_idx,
-                        }
+                        position = PretrainCursor(
+                            epoch=epoch,
+                            shard_idx=shard_idx,
+                            row_group_idx=row_group_idx,
+                        )
                         yielded = True
                         yield batch, position
             was_skipping = skip is not None
@@ -150,8 +139,8 @@ class InMemoryTextSource:
         start: int = 0,
         step: int = 1,
         batch_size: int = 128,
-        resume: SourcePosition | None = None,
-    ) -> Iterator[tuple[list[str], SourcePosition]]:
+        resume: PretrainCursor | None = None,
+    ) -> Iterator[tuple[list[str], PretrainCursor]]:
         docs = self._train if split == "train" else self._val
         if not docs:
             msg = f"InMemoryTextSource has no {split!r} docs"
@@ -159,19 +148,19 @@ class InMemoryTextSource:
         _validate_stride(start, step)
 
         batch_count = (len(docs) + batch_size - 1) // batch_size
-        epoch = resume["epoch"] if resume else 1
+        epoch = resume.epoch if resume else 1
         skip = resume
         while True:
             yielded = False
-            batch_start = skip["row_group_idx"] + step if skip is not None else start
+            batch_start = skip.row_group_idx + step if skip is not None else start
             for batch_idx in range(batch_start, batch_count, step):
                 offset = batch_idx * batch_size
                 batch = docs[offset : offset + batch_size]
-                position: SourcePosition = {
-                    "epoch": epoch,
-                    "shard_idx": 0,
-                    "row_group_idx": batch_idx,
-                }
+                position = PretrainCursor(
+                    epoch=epoch,
+                    shard_idx=0,
+                    row_group_idx=batch_idx,
+                )
                 yielded = True
                 yield batch, position
             was_skipping = skip is not None

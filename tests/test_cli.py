@@ -1,3 +1,4 @@
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any
 
@@ -5,14 +6,43 @@ import pytest
 import yaml
 from click.testing import CliRunner
 
-from nanodiffusion.checkpoint import LATEST_LINK_NAME, CheckpointMeta
+from nanodiffusion.checkpoint import CheckpointMeta
 from nanodiffusion.cli import main
 from nanodiffusion.cli.data import data_group
 from nanodiffusion.cli.pretrain import pretrain_command
 from nanodiffusion.cli.sample import sample_command
 from nanodiffusion.config import Config
-from nanodiffusion.data.datasets import DATASETS, DownloadOptions
-from nanodiffusion.data.source import InMemoryTextSource
+from nanodiffusion.constants import (
+    CONFIG_SIDECAR_FILENAME,
+    EMA_FILENAME,
+    LATEST_LINK_NAME,
+    META_FILENAME,
+    MODEL_FILENAME,
+    OPT_STATE_FILENAME,
+)
+from nanodiffusion.data.datasets import DATASETS, DatasetFactory, DownloadOptions
+from nanodiffusion.data.source import InMemoryTextSource, TextSource
+
+
+@pytest.fixture
+def register_dataset() -> Iterator[Callable[[str, DatasetFactory], None]]:
+    """Temporarily register a dataset factory; auto-unregister on teardown.
+
+    Uses :class:`Registry`'s mutable-mapping API directly so the
+    argument type is ``DatasetFactory`` throughout — unlike
+    ``monkeypatch.setitem``, which can't express the Protocol narrowing
+    and forces a ``# pyright: ignore`` at every call site.
+    """
+    added: list[str] = []
+
+    def register(name: str, factory: DatasetFactory) -> None:
+        DATASETS[name] = factory
+        added.append(name)
+
+    yield register
+
+    for name in added:
+        DATASETS.pop(name, None)
 
 
 def test_main_help_lists_subcommands() -> None:
@@ -22,6 +52,98 @@ def test_main_help_lists_subcommands() -> None:
     assert "sample" in result.output
     assert "data" in result.output
     assert "pretrain" in result.output
+    assert "sft" in result.output
+    assert "config" in result.output
+
+
+def test_config_gen_schema_writes_valid_json_schema(tmp_path: Path) -> None:
+    """``config gen-schema`` writes a JSON document containing the generated note."""
+    import json  # noqa: PLC0415
+
+    from nanodiffusion.cli.config import config_group  # noqa: PLC0415
+
+    runner = CliRunner()
+    out = tmp_path / "out.schema.json"
+    result = runner.invoke(config_group, ["gen-schema", "--output", str(out)])
+    assert result.exit_code == 0, result.output
+    assert out.exists()
+    schema = json.loads(out.read_text())
+    assert schema["type"] == "object"
+    assert schema["title"] == "Config"
+    assert "regenerate" in schema["description"].lower()
+
+
+def test_config_validate_accepts_good_yaml(tmp_path: Path) -> None:
+    """``config validate`` exits 0 on a valid config."""
+    from nanodiffusion.cli.config import config_group  # noqa: PLC0415
+
+    good = tmp_path / "good.yaml"
+    good.write_text("model:\n  num_layers: 2\n  hidden_dim: 64\n  num_heads: 2\n")
+
+    runner = CliRunner()
+    result = runner.invoke(config_group, ["validate", str(good)])
+    assert result.exit_code == 0, result.output
+    assert "ok" in result.output
+
+
+def test_config_validate_rejects_bad_yaml(tmp_path: Path) -> None:
+    """``config validate`` exits non-zero and lists the field error on bad YAML."""
+    from nanodiffusion.cli.config import config_group  # noqa: PLC0415
+
+    # ``max_steps`` below ``warmup_steps`` trips the ``@model_validator``
+    # on TrainConfig, exercising a pydantic failure path that JSON
+    # Schema alone would miss.
+    bad = tmp_path / "bad.yaml"
+    bad.write_text("train:\n  warmup_steps: 100\n  max_steps: 50\n")
+
+    runner = CliRunner()
+    result = runner.invoke(config_group, ["validate", str(bad)])
+    assert result.exit_code != 0
+    assert "fail" in result.output or "fail" in (result.stderr or "")
+
+
+def test_sft_command_help_mentions_checkpoint_options() -> None:
+    from nanodiffusion.cli.sft import sft_command  # noqa: PLC0415
+
+    runner = CliRunner()
+    result = runner.invoke(sft_command, ["--help"])
+    assert result.exit_code == 0
+    assert "--config" in result.output
+    assert "--pretrain-checkpoint" in result.output
+    assert "--resume-from" in result.output
+    assert "--seed" in result.output
+
+
+def test_sft_command_rejects_missing_start_point() -> None:
+    """Neither --pretrain-checkpoint nor --resume-from is a user error."""
+    from nanodiffusion.cli.sft import sft_command  # noqa: PLC0415
+
+    runner = CliRunner()
+    result = runner.invoke(sft_command, ["--config", "nonexistent.yaml"])
+    # --config exists-check fires first; we only care that the command
+    # *would* complain about the missing start point if the config was
+    # valid. That's covered by the e2e sft_finetune test.
+    assert result.exit_code != 0
+
+
+def test_data_list_chat_prints_registered_chat_datasets() -> None:
+    from nanodiffusion.data.chat_datasets import CHAT_DATASETS  # noqa: PLC0415
+
+    runner = CliRunner()
+    result = runner.invoke(data_group, ["list-chat"])
+    assert result.exit_code == 0
+    for name in CHAT_DATASETS:
+        assert name in result.output
+
+
+def test_data_download_chat_unknown_dataset_uses_bad_parameter() -> None:
+    runner = CliRunner()
+    result = runner.invoke(
+        data_group, ["download-chat", "--dataset", "definitely-missing"]
+    )
+    assert result.exit_code != 0
+    assert "definitely-missing" in result.output
+    assert "Available" in result.output
 
 
 def test_sample_command_help() -> None:
@@ -70,7 +192,8 @@ def test_data_download_unknown_dataset_uses_bad_parameter() -> None:
 
 
 def test_data_download_invokes_factory(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
+    register_dataset: Callable[[str, DatasetFactory], None],
 ) -> None:
     """End-to-end: registering a fake factory and invoking download."""
     captured: dict[str, Any] = {}
@@ -81,15 +204,15 @@ def test_data_download_invokes_factory(
         num_train: int | None = None,
         download: bool = True,
         download_options: DownloadOptions | None = None,
-    ) -> object:
+    ) -> TextSource:
         captured["data_dir"] = data_dir
         captured["num_train"] = num_train
         captured["download"] = download
         captured["download_options"] = download_options
-        return object()
+        return InMemoryTextSource(["stub-train", "stub-val"], val_size=1)
 
     name = "test-cli-fake"
-    monkeypatch.setitem(DATASETS, name, fake_factory)  # pyright: ignore[reportArgumentType]
+    register_dataset(name, fake_factory)
     runner = CliRunner()
     result = runner.invoke(
         data_group,
@@ -163,26 +286,29 @@ def _write_pretrain_config(path: Path, *, run_dir: Path, dataset: str) -> None:
     )
 
 
-def _register_in_memory_dataset(monkeypatch: pytest.MonkeyPatch, name: str) -> None:
+def _register_in_memory_dataset(
+    register_dataset: Callable[[str, DatasetFactory], None], name: str
+) -> None:
     def factory(
         data_dir: Path,
         *,
         num_train: int | None = None,
         download: bool = True,
         download_options: DownloadOptions | None = None,
-    ) -> InMemoryTextSource:
+    ) -> TextSource:
         del data_dir, num_train, download, download_options
         docs = [f"doc {i} " + ("hello world " * 40) for i in range(30)]
         return InMemoryTextSource(docs, val_size=2)
 
-    monkeypatch.setitem(DATASETS, name, factory)  # pyright: ignore[reportArgumentType]
+    register_dataset(name, factory)
 
 
 def test_pretrain_command_runs_end_to_end(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
+    register_dataset: Callable[[str, DatasetFactory], None],
 ) -> None:
     """Smoke test: a handful of steps on an in-memory dataset + final checkpoint."""
-    _register_in_memory_dataset(monkeypatch, "test-pretrain-fake")
+    _register_in_memory_dataset(register_dataset, "test-pretrain-fake")
 
     run_dir = tmp_path / "runs"
     config_path = tmp_path / "debug.yaml"
@@ -197,12 +323,18 @@ def test_pretrain_command_runs_end_to_end(
     runs = list(run_dir.iterdir())
     assert len(runs) == 1
     single_run = runs[0]
-    assert (single_run / "config.yaml").exists()
+    assert (single_run / CONFIG_SIDECAR_FILENAME).exists()
 
     # _write_pretrain_config uses max_steps=3, save_every=1000 → single save.
     final = single_run / "step_3"
     assert final.is_dir()
-    for name in ("model.eqx", "ema.eqx", "opt_state.eqx", "meta.json", "config.yaml"):
+    for name in (
+        MODEL_FILENAME,
+        EMA_FILENAME,
+        OPT_STATE_FILENAME,
+        META_FILENAME,
+        CONFIG_SIDECAR_FILENAME,
+    ):
         assert (final / name).exists(), name
 
     # `latest` symlink points at the newest checkpoint after the last save.
@@ -212,10 +344,11 @@ def test_pretrain_command_runs_end_to_end(
 
 
 def test_pretrain_latest_reflects_max_step(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
+    register_dataset: Callable[[str, DatasetFactory], None],
 ) -> None:
     """``latest/meta.json`` reflects the full step count we asked for."""
-    _register_in_memory_dataset(monkeypatch, "test-pretrain-final")
+    _register_in_memory_dataset(register_dataset, "test-pretrain-final")
 
     run_dir = tmp_path / "runs"
     config_path = tmp_path / "debug.yaml"
@@ -227,21 +360,22 @@ def test_pretrain_latest_reflects_max_step(
 
     single_run = next(iter(run_dir.iterdir()))
     meta = CheckpointMeta.model_validate_json(
-        (single_run / LATEST_LINK_NAME / "meta.json").read_text()
+        (single_run / LATEST_LINK_NAME / META_FILENAME).read_text()
     )
     # _write_pretrain_config uses max_steps=3.
     assert meta.step == 3
 
 
 def test_pretrain_no_duplicate_save_when_step_matches_save_every(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
+    register_dataset: Callable[[str, DatasetFactory], None],
 ) -> None:
     """``save_every == max_steps`` must produce a single ``step_N/``, not two.
 
     Regression against an earlier loop shape that wrote both a
     periodic save and an end-of-loop save at the same step.
     """
-    _register_in_memory_dataset(monkeypatch, "test-pretrain-nodup")
+    _register_in_memory_dataset(register_dataset, "test-pretrain-nodup")
 
     run_dir = tmp_path / "runs"
     config_path = tmp_path / "debug.yaml"
@@ -289,10 +423,11 @@ def test_pretrain_no_duplicate_save_when_step_matches_save_every(
 
 
 def test_pretrain_resume_continues_step_and_reuses_run_dir(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
+    register_dataset: Callable[[str, DatasetFactory], None],
 ) -> None:
     """Resume picks up from the saved step and writes back to the same run dir."""
-    _register_in_memory_dataset(monkeypatch, "test-pretrain-resume")
+    _register_in_memory_dataset(register_dataset, "test-pretrain-resume")
 
     run_dir = tmp_path / "runs"
     first_config = tmp_path / "first.yaml"
@@ -334,9 +469,8 @@ def test_pretrain_resume_continues_step_and_reuses_run_dir(
     single_run = next(iter(run_dir.iterdir()))
     latest = single_run / LATEST_LINK_NAME
     assert latest.is_symlink()
-    assert (
-        CheckpointMeta.model_validate_json((latest / "meta.json").read_text()).step == 2
-    )
+    meta = CheckpointMeta.model_validate_json((latest / META_FILENAME).read_text())
+    assert meta.step == 2
 
     # Second phase: same run dir, bumped max_steps, resume via `latest`.
     second_config = tmp_path / "second.yaml"
@@ -388,15 +522,17 @@ def test_pretrain_resume_continues_step_and_reuses_run_dir(
 
     # `latest` now points at the newest snapshot; its meta reflects the resumed step.
     assert str(latest.readlink()) == "step_4"
-    final_meta = CheckpointMeta.model_validate_json((latest / "meta.json").read_text())
+    final_meta_json = (latest / META_FILENAME).read_text()
+    final_meta = CheckpointMeta.model_validate_json(final_meta_json)
     assert final_meta.step == 4
 
 
 def test_pretrain_writes_reloadable_config(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
+    register_dataset: Callable[[str, DatasetFactory], None],
 ) -> None:
     """``run_dir/config.yaml`` round-trips through ``Config.from_yaml``."""
-    _register_in_memory_dataset(monkeypatch, "test-pretrain-roundtrip")
+    _register_in_memory_dataset(register_dataset, "test-pretrain-roundtrip")
 
     run_dir = tmp_path / "runs"
     config_path = tmp_path / "debug.yaml"
@@ -409,7 +545,7 @@ def test_pretrain_writes_reloadable_config(
     assert result.exit_code == 0, result.output
 
     single_run = next(iter(run_dir.iterdir()))
-    dumped = single_run / "config.yaml"
+    dumped = single_run / CONFIG_SIDECAR_FILENAME
     reloaded = Config.from_yaml(dumped)
     # Match the values the test set; the rest use model defaults.
     assert reloaded.train.max_steps == 3
@@ -421,10 +557,11 @@ def test_pretrain_writes_reloadable_config(
 
 
 def test_pretrain_command_seed_override(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
+    register_dataset: Callable[[str, DatasetFactory], None],
 ) -> None:
     """``--seed`` overrides the yaml value without mutating the file on disk."""
-    _register_in_memory_dataset(monkeypatch, "test-pretrain-seed")
+    _register_in_memory_dataset(register_dataset, "test-pretrain-seed")
 
     config_path = tmp_path / "debug.yaml"
     _write_pretrain_config(

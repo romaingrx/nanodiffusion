@@ -1,8 +1,15 @@
+# yaml-language-server: $schema=./config.schema.json
+
+# Tiny end-to-end debug config covering every training scenario.
+# A single file fully describes the model architecture, its pretrain
+# run, its SFT run, and the default sampler — so the checkpoint
+# sidecar is a complete spec of the trained model.
+
 model:
   num_layers: 3
   hidden_dim: 192
   num_heads: 3
-  max_seq_len: 128
+  max_seq_len: 512
   dropout_rate: 0.0
   ffn_mult: 4
 
@@ -19,10 +26,25 @@ train:
   save_every: 500
   run_dir: runs/pretrain
 
-data:
-  dataset: fineweb-edu-10bt
-  data_dir: data
-  num_train_shards: 1
+sft:
+  seed: 42
+  batch_size: 4
+  learning_rate: 1e-4
+  weight_decay: 0.0
+  warmup_steps: 50
+  max_steps: 500
+  ema_decay: 0.999
+  grad_clip: 1.0
+  log_every: 20
+  save_every: 100
+  run_dir: runs/sft
+  datasets:
+    - name: smoltalk
+      epochs: 1
+    - name: gsm8k
+      epochs: 4
+    - name: identity
+      epochs: 2
   tokenizer_batch_size: 128
   tokenizer_threads: 4
   prefetch_size: 2
@@ -34,3 +56,12 @@ sample:
   top_k: 0
   top_p: 1.0
   max_length: 128
+
+data:
+  dataset: fineweb-edu-10bt
+  data_dir: data
+  num_train_shards: 1
+  tokenizer_batch_size: 128
+  tokenizer_threads: 4
+  prefetch_size: 2
+  max_empty_passes: 100

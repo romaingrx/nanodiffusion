@@ -1,5 +1,6 @@
 """Streaming pretraining data pipeline."""
 
+from nanodiffusion.data.cursors import LoaderCursor, PretrainCursor, SFTCursor
 from nanodiffusion.data.datasets import (
     DATASETS,
     DatasetFactory,
@@ -18,7 +19,6 @@ from nanodiffusion.data.loader import (
 from nanodiffusion.data.source import (
     InMemoryTextSource,
     ParquetTextSource,
-    SourcePosition,
     Split,
     TextSource,
 )
@@ -30,9 +30,11 @@ __all__ = [
     "DownloadOptions",
     "InMemoryTextSource",
     "JaxBatch",
+    "LoaderCursor",
     "ParquetTextSource",
     "PrefetchIterator",
-    "SourcePosition",
+    "PretrainCursor",
+    "SFTCursor",
     "Split",
     "TextSource",
     "get_dataset",

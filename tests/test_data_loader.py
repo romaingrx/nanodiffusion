@@ -8,13 +8,14 @@ import numpy as np
 import pytest
 from jaxtyping import TypeCheckError
 
+from nanodiffusion.data.cursors import PretrainCursor
 from nanodiffusion.data.loader import (
     BatchOutput,
     PrefetchIterator,
     prefetch,
     pretrain_loader,
 )
-from nanodiffusion.data.source import InMemoryTextSource, SourcePosition, Split
+from nanodiffusion.data.source import InMemoryTextSource, Split
 from nanodiffusion.tokenizer import Tokenizer
 
 _ShapeError = TypeCheckError
@@ -134,8 +135,8 @@ def test_long_doc_spans_multiple_chunks(tok: Tokenizer) -> None:
     assert any((b.segments == 0).all() for b in batches)
 
 
-def _state_tuple(state: SourcePosition) -> tuple[int, int, int]:
-    return state["epoch"], state["shard_idx"], state["row_group_idx"]
+def _state_tuple(state: PretrainCursor) -> tuple[int, int, int]:
+    return state.epoch, state.shard_idx, state.row_group_idx
 
 
 def test_resume_state_advances_past_saved_position(tok: Tokenizer) -> None:
@@ -176,7 +177,7 @@ def test_state_epoch_monotonic(tok: Tokenizer) -> None:
     src = InMemoryTextSource(_docs(80), val_size=4)
     loader = pretrain_loader(src, tok, batch_size=2, seq_len=32, split="train")
     batches = list(islice(loader, 5))
-    epochs = [b.state["epoch"] for b in batches]
+    epochs = [b.state.epoch for b in batches]
     assert epochs[0] >= 1
     for a, b in itertools.pairwise(epochs):
         assert b >= a
@@ -226,14 +227,10 @@ def test_pretrain_loader_handles_finite_source(tok: Tokenizer) -> None:
             start: int = 0,
             step: int = 1,
             batch_size: int = 128,
-            resume: SourcePosition | None = None,
-        ) -> Iterator[tuple[list[str], SourcePosition]]:
+            resume: PretrainCursor | None = None,
+        ) -> Iterator[tuple[list[str], PretrainCursor]]:
             del split, start, step, batch_size, resume
-            position: SourcePosition = {
-                "epoch": 1,
-                "shard_idx": 0,
-                "row_group_idx": 0,
-            }
+            position = PretrainCursor(epoch=1, shard_idx=0, row_group_idx=0)
             yield ["just one doc"], position
 
     loader = pretrain_loader(
@@ -269,33 +266,33 @@ def test_batch_output_to_jax_returns_jax_batch(tok: Tokenizer) -> None:
 
 
 def test_batch_output_validates_shape_mismatch() -> None:
-    state = {"epoch": 1, "shard_idx": 0, "row_group_idx": 0}
+    state = PretrainCursor(epoch=1, shard_idx=0, row_group_idx=0)
     with pytest.raises(_ShapeError):
         BatchOutput(
             tokens=np.zeros((4, 8), dtype=np.int32),
             segments=np.zeros((4, 7), dtype=np.int32),
-            state=state,  # type: ignore[arg-type]
+            state=state,
         )
 
 
 def test_batch_output_validates_ndim() -> None:
-    state = {"epoch": 1, "shard_idx": 0, "row_group_idx": 0}
+    state = PretrainCursor(epoch=1, shard_idx=0, row_group_idx=0)
     with pytest.raises(_ShapeError):
         BatchOutput(
             tokens=np.zeros((8,), dtype=np.int32),
             segments=np.zeros((8,), dtype=np.int32),
-            state=state,  # type: ignore[arg-type]
+            state=state,
         )
 
 
 def test_batch_output_validates_dtype() -> None:
     """jaxtyping rejects float arrays for Int[...] annotations."""
-    state = {"epoch": 1, "shard_idx": 0, "row_group_idx": 0}
+    state = PretrainCursor(epoch=1, shard_idx=0, row_group_idx=0)
     with pytest.raises(_ShapeError):
         BatchOutput(
             tokens=np.zeros((4, 8), dtype=np.float32),
             segments=np.zeros((4, 8), dtype=np.int32),
-            state=state,  # type: ignore[arg-type]
+            state=state,
         )
 
 

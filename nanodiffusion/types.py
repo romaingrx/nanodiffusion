@@ -8,6 +8,7 @@ __all__ = [
     "Logits",
     "Mask",
     "MaskBatch",
+    "NumpyLossMaskBatch",
     "NumpySegmentBatch",
     "NumpyTokenBatch",
     "NumpyTokens",
@@ -44,3 +45,4 @@ MaskBatch: TypeAlias = Bool[Array, "batch seq"]
 NumpyTokens: TypeAlias = Int[np.ndarray, " seq"]
 NumpyTokenBatch: TypeAlias = Int[np.ndarray, "batch seq"]
 NumpySegmentBatch: TypeAlias = Int[np.ndarray, "batch seq"]
+NumpyLossMaskBatch: TypeAlias = Bool[np.ndarray, "batch seq"]

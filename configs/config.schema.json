@@ -1,0 +1,405 @@
+{
+  "$defs": {
+    "DataConfig": {
+      "properties": {
+        "dataset": {
+          "default": "climbmix-400b",
+          "title": "Dataset",
+          "type": "string"
+        },
+        "data_dir": {
+          "default": "data",
+          "format": "path",
+          "title": "Data Dir",
+          "type": "string"
+        },
+        "num_train_shards": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Num Train Shards"
+        },
+        "tokenizer_batch_size": {
+          "default": 128,
+          "title": "Tokenizer Batch Size",
+          "type": "integer"
+        },
+        "tokenizer_threads": {
+          "default": 4,
+          "title": "Tokenizer Threads",
+          "type": "integer"
+        },
+        "prefetch_size": {
+          "default": 4,
+          "title": "Prefetch Size",
+          "type": "integer"
+        },
+        "max_empty_passes": {
+          "default": 100,
+          "title": "Max Empty Passes",
+          "type": "integer"
+        }
+      },
+      "title": "DataConfig",
+      "type": "object"
+    },
+    "ModelConfig": {
+      "properties": {
+        "vocab_size": {
+          "default": 50264,
+          "title": "Vocab Size",
+          "type": "integer"
+        },
+        "num_layers": {
+          "default": 12,
+          "title": "Num Layers",
+          "type": "integer"
+        },
+        "hidden_dim": {
+          "default": 768,
+          "title": "Hidden Dim",
+          "type": "integer"
+        },
+        "num_heads": {
+          "default": 12,
+          "title": "Num Heads",
+          "type": "integer"
+        },
+        "max_seq_len": {
+          "default": 1024,
+          "title": "Max Seq Len",
+          "type": "integer"
+        },
+        "dropout_rate": {
+          "default": 0.0,
+          "title": "Dropout Rate",
+          "type": "number"
+        },
+        "ffn_mult": {
+          "default": 4,
+          "title": "Ffn Mult",
+          "type": "integer"
+        }
+      },
+      "title": "ModelConfig",
+      "type": "object"
+    },
+    "SFTConfig": {
+      "properties": {
+        "seed": {
+          "default": 42,
+          "title": "Seed",
+          "type": "integer"
+        },
+        "batch_size": {
+          "default": 8,
+          "exclusiveMinimum": 0,
+          "title": "Batch Size",
+          "type": "integer"
+        },
+        "learning_rate": {
+          "default": 0.0001,
+          "exclusiveMinimum": 0.0,
+          "title": "Learning Rate",
+          "type": "number"
+        },
+        "weight_decay": {
+          "default": 0.0,
+          "minimum": 0.0,
+          "title": "Weight Decay",
+          "type": "number"
+        },
+        "warmup_steps": {
+          "default": 50,
+          "minimum": 0,
+          "title": "Warmup Steps",
+          "type": "integer"
+        },
+        "max_steps": {
+          "default": 2000,
+          "exclusiveMinimum": 0,
+          "title": "Max Steps",
+          "type": "integer"
+        },
+        "ema_decay": {
+          "default": 0.999,
+          "maximum": 1.0,
+          "minimum": 0.0,
+          "title": "Ema Decay",
+          "type": "number"
+        },
+        "grad_clip": {
+          "default": 1.0,
+          "exclusiveMinimum": 0.0,
+          "title": "Grad Clip",
+          "type": "number"
+        },
+        "log_every": {
+          "default": 20,
+          "exclusiveMinimum": 0,
+          "title": "Log Every",
+          "type": "integer"
+        },
+        "save_every": {
+          "default": 500,
+          "exclusiveMinimum": 0,
+          "title": "Save Every",
+          "type": "integer"
+        },
+        "run_dir": {
+          "default": "runs/sft",
+          "format": "path",
+          "title": "Run Dir",
+          "type": "string"
+        },
+        "datasets": {
+          "items": {
+            "$ref": "#/$defs/SFTDatasetConfig"
+          },
+          "title": "Datasets",
+          "type": "array"
+        },
+        "tokenizer_batch_size": {
+          "default": 128,
+          "title": "Tokenizer Batch Size",
+          "type": "integer"
+        },
+        "tokenizer_threads": {
+          "default": 4,
+          "title": "Tokenizer Threads",
+          "type": "integer"
+        },
+        "prefetch_size": {
+          "default": 2,
+          "title": "Prefetch Size",
+          "type": "integer"
+        },
+        "max_empty_passes": {
+          "default": 100,
+          "title": "Max Empty Passes",
+          "type": "integer"
+        }
+      },
+      "title": "SFTConfig",
+      "type": "object"
+    },
+    "SFTDatasetConfig": {
+      "description": "One entry in an SFT task mixture.\n\n``name`` must resolve via the chat-dataset registry at run time;\n``epochs`` repeats the same source ``epochs`` times inside\n:class:`TaskMixture` to implement nanochat-style oversampling.",
+      "properties": {
+        "name": {
+          "title": "Name",
+          "type": "string"
+        },
+        "epochs": {
+          "default": 1,
+          "exclusiveMinimum": 0,
+          "title": "Epochs",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "name"
+      ],
+      "title": "SFTDatasetConfig",
+      "type": "object"
+    },
+    "SampleConfig": {
+      "properties": {
+        "steps": {
+          "default": 64,
+          "title": "Steps",
+          "type": "integer"
+        },
+        "temperature": {
+          "default": 1.0,
+          "title": "Temperature",
+          "type": "number"
+        },
+        "top_k": {
+          "default": 0,
+          "title": "Top K",
+          "type": "integer"
+        },
+        "top_p": {
+          "default": 1.0,
+          "title": "Top P",
+          "type": "number"
+        },
+        "max_length": {
+          "default": 256,
+          "title": "Max Length",
+          "type": "integer"
+        }
+      },
+      "title": "SampleConfig",
+      "type": "object"
+    },
+    "TrainConfig": {
+      "properties": {
+        "seed": {
+          "default": 42,
+          "title": "Seed",
+          "type": "integer"
+        },
+        "batch_size": {
+          "default": 32,
+          "exclusiveMinimum": 0,
+          "title": "Batch Size",
+          "type": "integer"
+        },
+        "learning_rate": {
+          "default": 0.0003,
+          "exclusiveMinimum": 0.0,
+          "title": "Learning Rate",
+          "type": "number"
+        },
+        "weight_decay": {
+          "default": 0.0,
+          "minimum": 0.0,
+          "title": "Weight Decay",
+          "type": "number"
+        },
+        "warmup_steps": {
+          "default": 2500,
+          "minimum": 0,
+          "title": "Warmup Steps",
+          "type": "integer"
+        },
+        "max_steps": {
+          "default": 100000,
+          "exclusiveMinimum": 0,
+          "title": "Max Steps",
+          "type": "integer"
+        },
+        "ema_decay": {
+          "default": 0.9999,
+          "maximum": 1.0,
+          "minimum": 0.0,
+          "title": "Ema Decay",
+          "type": "number"
+        },
+        "grad_clip": {
+          "default": 1.0,
+          "exclusiveMinimum": 0.0,
+          "title": "Grad Clip",
+          "type": "number"
+        },
+        "log_every": {
+          "default": 100,
+          "exclusiveMinimum": 0,
+          "title": "Log Every",
+          "type": "integer"
+        },
+        "save_every": {
+          "default": 5000,
+          "exclusiveMinimum": 0,
+          "title": "Save Every",
+          "type": "integer"
+        },
+        "run_dir": {
+          "default": "runs/pretrain",
+          "format": "path",
+          "title": "Run Dir",
+          "type": "string"
+        }
+      },
+      "title": "TrainConfig",
+      "type": "object"
+    }
+  },
+  "properties": {
+    "model": {
+      "$ref": "#/$defs/ModelConfig",
+      "default": {
+        "vocab_size": 50264,
+        "num_layers": 12,
+        "hidden_dim": 768,
+        "num_heads": 12,
+        "max_seq_len": 1024,
+        "dropout_rate": 0.0,
+        "ffn_mult": 4
+      }
+    },
+    "train": {
+      "$ref": "#/$defs/TrainConfig",
+      "default": {
+        "seed": 42,
+        "batch_size": 32,
+        "learning_rate": 0.0003,
+        "weight_decay": 0.0,
+        "warmup_steps": 2500,
+        "max_steps": 100000,
+        "ema_decay": 0.9999,
+        "grad_clip": 1.0,
+        "log_every": 100,
+        "save_every": 5000,
+        "run_dir": "runs/pretrain"
+      }
+    },
+    "sample": {
+      "$ref": "#/$defs/SampleConfig",
+      "default": {
+        "steps": 64,
+        "temperature": 1.0,
+        "top_k": 0,
+        "top_p": 1.0,
+        "max_length": 256
+      }
+    },
+    "data": {
+      "$ref": "#/$defs/DataConfig",
+      "default": {
+        "dataset": "climbmix-400b",
+        "data_dir": "data",
+        "num_train_shards": null,
+        "tokenizer_batch_size": 128,
+        "tokenizer_threads": 4,
+        "prefetch_size": 4,
+        "max_empty_passes": 100
+      }
+    },
+    "sft": {
+      "$ref": "#/$defs/SFTConfig",
+      "default": {
+        "seed": 42,
+        "batch_size": 8,
+        "learning_rate": 0.0001,
+        "weight_decay": 0.0,
+        "warmup_steps": 50,
+        "max_steps": 2000,
+        "ema_decay": 0.999,
+        "grad_clip": 1.0,
+        "log_every": 20,
+        "save_every": 500,
+        "run_dir": "runs/sft",
+        "datasets": [
+          {
+            "epochs": 1,
+            "name": "smoltalk"
+          },
+          {
+            "epochs": 4,
+            "name": "gsm8k"
+          },
+          {
+            "epochs": 2,
+            "name": "identity"
+          }
+        ],
+        "tokenizer_batch_size": 128,
+        "tokenizer_threads": 4,
+        "prefetch_size": 2,
+        "max_empty_passes": 100
+      }
+    }
+  },
+  "title": "Config",
+  "type": "object",
+  "description": "Generated schema for nanodiffusion.config.Config. Do not hand-edit \u2014 regenerate with `just schema`."
+}

@@ -17,4 +17,7 @@ format:
 typecheck:
     uv run basedpyright
 
+schema:
+    uv run nanodiffusion config gen-schema
+
 check: lint format typecheck test

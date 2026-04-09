@@ -38,13 +38,14 @@ def sample_command(
     from nanodiffusion.chat import render_for_completion  # noqa: PLC0415
     from nanodiffusion.checkpoint import load_model  # noqa: PLC0415
     from nanodiffusion.config import Config  # noqa: PLC0415
+    from nanodiffusion.constants import CONFIG_SIDECAR_FILENAME  # noqa: PLC0415
     from nanodiffusion.model import Transformer  # noqa: PLC0415
     from nanodiffusion.schedule import LogLinearSchedule  # noqa: PLC0415
     from nanodiffusion.tokenizer import Tokenizer  # noqa: PLC0415
 
     log = structlog.get_logger()
 
-    config = Config.from_yaml(checkpoint / "config.yaml")
+    config = Config.from_yaml(checkpoint / CONFIG_SIDECAR_FILENAME)
     tok = Tokenizer()
     schedule = LogLinearSchedule()
 

@@ -17,8 +17,8 @@ import numpy as np
 import optax
 
 from nanodiffusion.config import ModelConfig
-from nanodiffusion.loss import compute_loss
 from nanodiffusion.model.transformer import Transformer
+from nanodiffusion.pretrain import compute_loss
 from nanodiffusion.schedule import LogLinearSchedule
 from nanodiffusion.types import PRNGKeyArray
 

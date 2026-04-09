@@ -38,7 +38,7 @@ def pretrain_command(
 ) -> None:
     """Run MDLM pretraining end-to-end."""
     from nanodiffusion.config import Config  # noqa: PLC0415
-    from nanodiffusion.train import pretrain  # noqa: PLC0415
+    from nanodiffusion.pretrain import pretrain  # noqa: PLC0415
 
     config = Config.from_yaml(config_path)
     if seed is not None:

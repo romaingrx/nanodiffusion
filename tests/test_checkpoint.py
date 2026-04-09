@@ -10,12 +10,19 @@ import optax
 import pytest
 
 from nanodiffusion.checkpoint import (
-    LATEST_LINK_NAME,
     CheckpointMeta,
     load_checkpoint,
     load_model,
     save_checkpoint,
 )
+from nanodiffusion.constants import (
+    EMA_FILENAME,
+    LATEST_LINK_NAME,
+    META_FILENAME,
+    MODEL_FILENAME,
+    OPT_STATE_FILENAME,
+)
+from nanodiffusion.data.cursors import PretrainCursor
 from nanodiffusion.model import Transformer
 from tests._helpers import inexact_leaves
 
@@ -23,7 +30,6 @@ if TYPE_CHECKING:
     from pathlib import Path
 
     from nanodiffusion.config import ModelConfig
-    from nanodiffusion.data.source import SourcePosition
 
 
 def test_roundtrip_preserves_model_weights(
@@ -35,7 +41,7 @@ def test_roundtrip_preserves_model_weights(
     optimizer = optax.adamw(1e-3)
     opt_state = optimizer.init(eqx.filter(model, eqx.is_inexact_array))
 
-    cursor: SourcePosition = {"epoch": 2, "shard_idx": 5, "row_group_idx": 7}
+    cursor = PretrainCursor(epoch=2, shard_idx=5, row_group_idx=7)
     save_checkpoint(
         tmp_path / "ckpt",
         model=model,
@@ -45,18 +51,15 @@ def test_roundtrip_preserves_model_weights(
         cursor=cursor,
     )
 
-    # Build independent skeletons so we really test deserialisation rather
-    # than picking up the already-in-memory arrays.
+    # Build an independent skeleton so we really test deserialisation
+    # rather than picking up the already-in-memory arrays.
     skeleton_key = jax.random.PRNGKey(123)
     model_skeleton = Transformer(small_config, key=skeleton_key)
-    opt_state_skeleton = optimizer.init(
-        eqx.filter(model_skeleton, eqx.is_inexact_array)
-    )
 
     loaded_model, loaded_ema, _loaded_opt_state, meta = load_checkpoint(
         tmp_path / "ckpt",
         model_skeleton=model_skeleton,
-        opt_state_skeleton=opt_state_skeleton,
+        opt_state_builder=lambda m: optimizer.init(eqx.filter(m, eqx.is_inexact_array)),
     )
 
     # Generic narrowing: basedpyright must infer ``M = Transformer`` from
@@ -95,7 +98,7 @@ def test_roundtrip_with_null_cursor(
     _loaded_model, _loaded_ema, _loaded_opt_state, meta = load_checkpoint(
         tmp_path / "ckpt",
         model_skeleton=model,
-        opt_state_skeleton=opt_state,
+        opt_state_builder=lambda m: optimizer.init(eqx.filter(m, eqx.is_inexact_array)),
     )
     assert meta.step == 0
     assert meta.cursor is None
@@ -118,8 +121,8 @@ def test_save_writes_expected_files(
         cursor=None,
     )
     files = {p.name for p in ckpt.iterdir()}
-    assert {"model.eqx", "ema.eqx", "opt_state.eqx", "meta.json"} <= files
-    meta = json.loads((ckpt / "meta.json").read_text())
+    assert {MODEL_FILENAME, EMA_FILENAME, OPT_STATE_FILENAME, META_FILENAME} <= files
+    meta = json.loads((ckpt / META_FILENAME).read_text())
     assert meta["step"] == 1
     assert meta["cursor"] is None
 
@@ -232,7 +235,7 @@ def test_save_cleans_up_stale_tmp_sibling(
         step=1,
         cursor=None,
     )
-    assert (tmp_path / "step_1" / "meta.json").exists()
+    assert (tmp_path / "step_1" / META_FILENAME).exists()
     assert not stale.exists()
 
 
@@ -267,7 +270,7 @@ def test_update_latest_symlink_points_at_newest_checkpoint(
     # Relative target — stays valid if the run dir is moved.
     assert str(latest.readlink()) == "step_2"
     # Loading through the symlink resolves to the newest meta.
-    meta = CheckpointMeta.model_validate_json((latest / "meta.json").read_text())
+    meta = CheckpointMeta.model_validate_json((latest / META_FILENAME).read_text())
     assert meta.step == 2
 
 
@@ -309,11 +312,11 @@ def test_load_checkpoint_follows_latest_symlink(
     )
 
     skeleton = Transformer(small_config, key=jax.random.PRNGKey(321))
-    _, opt_state_skel = _make_opt(skeleton)
+    optimizer, _ = _make_opt(skeleton)
     _m, _e, _o, meta = load_checkpoint(
         tmp_path / LATEST_LINK_NAME,
         model_skeleton=skeleton,
-        opt_state_skeleton=opt_state_skel,
+        opt_state_builder=lambda m: optimizer.init(eqx.filter(m, eqx.is_inexact_array)),
     )
     assert meta.step == 7
 
@@ -326,10 +329,18 @@ def test_checkpoint_meta_rejects_negative_step() -> None:
 
 def test_checkpoint_meta_json_round_trip() -> None:
     """``model_dump_json`` output parses back into an equal model."""
-    cursor: SourcePosition = {"epoch": 1, "shard_idx": 2, "row_group_idx": 3}
+    cursor = PretrainCursor(epoch=1, shard_idx=2, row_group_idx=3)
     meta = CheckpointMeta(step=10, cursor=cursor)
     blob = meta.model_dump_json()
     assert CheckpointMeta.model_validate_json(blob) == meta
     # Confirm the on-wire shape hasn't drifted (downstream tooling greps it).
     parsed = json.loads(blob)
-    assert parsed == {"step": 10, "cursor": cursor}
+    assert parsed == {
+        "step": 10,
+        "cursor": {
+            "kind": "pretrain",
+            "epoch": 1,
+            "shard_idx": 2,
+            "row_group_idx": 3,
+        },
+    }

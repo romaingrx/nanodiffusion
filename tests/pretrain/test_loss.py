@@ -4,8 +4,13 @@ import jax.numpy as jnp
 import pytest
 
 from nanodiffusion.config import ModelConfig
-from nanodiffusion.loss import compute_loss, diffusion_loss, forward_mask, masked_nll
 from nanodiffusion.model.transformer import Transformer
+from nanodiffusion.pretrain.loss import (
+    compute_loss,
+    diffusion_loss,
+    forward_mask,
+    masked_nll,
+)
 from nanodiffusion.schedule import (
     CosineSchedule,
     LogLinearSchedule,
