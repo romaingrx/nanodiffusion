@@ -7,6 +7,18 @@ from jaxtyping import Array, Float
 
 from nanodiffusion.types import PRNGKeyArray
 
+# Pallas Flash Attention on TPU avoids materialising the [N, T, T] score
+# matrix that XLA's ``jax.nn.dot_product_attention`` pattern still emits
+# as a plain ``dot_general`` on TPU. The import is safe on non-TPU
+# backends (the call is what fails) so we keep the reference and gate
+# usage on the runtime backend.
+try:
+    from jax.experimental.pallas.ops.tpu.flash_attention import (
+        flash_attention as _tpu_flash_attention,
+    )
+except ImportError:
+    _tpu_flash_attention = None
+
 
 class SelfAttention(eqx.Module):
     q_proj: eqx.nn.Linear
@@ -45,23 +57,38 @@ class SelfAttention(eqx.Module):
         k = k.reshape(seq_len, self.num_heads, self.head_dim)
         v = v.reshape(seq_len, self.num_heads, self.head_dim)
 
+        # RMSNorm + RoPE are defined per head, so briefly pivot to (N, T, H).
         q = jnp.transpose(q, (1, 0, 2))
         k = jnp.transpose(k, (1, 0, 2))
-        v = jnp.transpose(v, (1, 0, 2))
-
         q = jax.vmap(jax.vmap(self.q_norm))(q)
         k = jax.vmap(jax.vmap(self.k_norm))(k)
-
         q = jax.vmap(self.rope)(q)
         k = jax.vmap(self.rope)(k)
 
         scale = 1.0 / math.sqrt(self.head_dim)
-        attn_weights = jnp.matmul(q, jnp.transpose(k, (0, 2, 1))) * scale
-        attn_weights = jax.nn.softmax(attn_weights, axis=-1)
 
-        out = jnp.matmul(attn_weights, v)
+        if _tpu_flash_attention is not None and jax.default_backend() == "tpu":
+            # Pallas Flash Attention: blocked kernel, O(T) memory, never
+            # materialises the [N, T, T] score matrix. Expects
+            # (B, N, T, H); we already have q, k in (N, T, H), just
+            # pivot v and add a unit batch dim.
+            v_nth = jnp.transpose(v, (1, 0, 2))
+            out = _tpu_flash_attention(
+                q[jnp.newaxis],
+                k[jnp.newaxis],
+                v_nth[jnp.newaxis],
+                sm_scale=scale,
+            )[0]  # (N, T, H)
+            out = jnp.transpose(out, (1, 0, 2))  # (T, N, H)
+        else:
+            # Portable fallback: jax.nn.dot_product_attention wants
+            # (T, N, H). On TPU XLA lowers this to a plain dot_general
+            # that keeps the score matrix alive, so it is strictly
+            # worse than the Pallas path; we only hit this branch on
+            # CPU and GPU.
+            q_tnh = jnp.transpose(q, (1, 0, 2))
+            k_tnh = jnp.transpose(k, (1, 0, 2))
+            out = jax.nn.dot_product_attention(q_tnh, k_tnh, v, scale=scale)
 
-        out = jnp.transpose(out, (1, 0, 2))
         out = out.reshape(seq_len, self.num_heads * self.head_dim)
-
         return jax.vmap(self.o_proj)(out)
