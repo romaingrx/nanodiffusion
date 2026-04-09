@@ -29,6 +29,7 @@ from nanodiffusion.loop import (
     resolve_run_dir,
     run_training_loop,
 )
+from nanodiffusion.loss import TimeSampler, low_discrepancy_sampler
 from nanodiffusion.model import (
     DiffusionModel,
     Transformer,
@@ -56,13 +57,19 @@ def make_train_step[M: DiffusionModel](
     schedule: NoiseSchedule,
     mask_token_id: int,
     ema_decay: float,
+    sampler: TimeSampler = low_discrepancy_sampler,
 ) -> TrainStepFn[M, TokenBatch]:
     """Build an ``eqx.filter_jit`` train step for MDLM diffusion.
 
-    Closures pin ``optimizer``, ``schedule``, ``mask_token_id``, and
-    ``ema_decay`` at trace time so the JIT cache key stays stable.
-    The callable is generic over ``M`` so the concrete model subclass
-    flows through to the returned tuple without a downcast.
+    Closures pin ``optimizer``, ``schedule``, ``mask_token_id``,
+    ``ema_decay``, and ``sampler`` at trace time so the JIT cache key
+    stays stable. The callable is generic over ``M`` so the concrete
+    model subclass flows through to the returned tuple without a
+    downcast.
+
+    ``sampler`` defaults to the stratified low-discrepancy sampler used
+    by real pretrain runs; examples that need a bounded or biased time
+    sampler (e.g. the tiny-model overfit script) can pass their own.
 
     The returned step emits a metrics dict with ``loss``, ``grad_norm``,
     and ``param_norm``. ``grad_norm`` is the pre-clip global norm (so
@@ -86,6 +93,7 @@ def make_train_step[M: DiffusionModel](
                 schedule=schedule,
                 mask_token_id=mask_token_id,
                 key=key,
+                sampler=sampler,
             )
 
         loss, grads = eqx.filter_value_and_grad(loss_fn)(model)

@@ -18,7 +18,7 @@ import optax
 
 from nanodiffusion.config import ModelConfig
 from nanodiffusion.model.transformer import Transformer
-from nanodiffusion.pretrain import compute_loss
+from nanodiffusion.pretrain import make_train_step
 from nanodiffusion.schedule import LogLinearSchedule
 from nanodiffusion.types import PRNGKeyArray
 
@@ -52,6 +52,7 @@ def bounded_sampler(batch_size: int, *, key: PRNGKeyArray) -> jax.Array:
 key = jax.random.PRNGKey(42)
 key, model_key = jax.random.split(key)
 model = Transformer(config, key=model_key)
+ema_model = model
 
 lr_schedule = optax.warmup_cosine_decay_schedule(
     init_value=0.0,
@@ -62,34 +63,22 @@ lr_schedule = optax.warmup_cosine_decay_schedule(
 optimizer = optax.chain(optax.clip_by_global_norm(1.0), optax.adamw(lr_schedule))
 opt_state = optimizer.init(eqx.filter(model, eqx.is_array))
 
-
-@eqx.filter_jit
-def train_step(
-    model: Transformer, opt_state: optax.OptState, x0: jax.Array, key: jax.Array
-) -> tuple[Transformer, optax.OptState, jax.Array]:
-    def loss_fn(m: Transformer) -> jax.Array:
-        return compute_loss(
-            m,
-            x0,
-            schedule=schedule,
-            mask_token_id=MASK_ID,
-            key=key,
-            sampler=bounded_sampler,
-        )
-
-    loss, grads = eqx.filter_value_and_grad(loss_fn)(model)
-    updates, opt_state = optimizer.update(
-        grads, opt_state, eqx.filter(model, eqx.is_array)
-    )
-    return eqx.apply_updates(model, updates), opt_state, loss
-
+train_step = make_train_step(
+    optimizer,
+    schedule=schedule,
+    mask_token_id=MASK_ID,
+    ema_decay=0.0,
+    sampler=bounded_sampler,
+)
 
 print("Training...")
 losses = []
 for step in range(NUM_STEPS):
     key, step_key = jax.random.split(key)
-    model, opt_state, loss = train_step(model, opt_state, batch, step_key)
-    losses.append(float(loss))
+    model, ema_model, opt_state, metrics = train_step(
+        model, ema_model, opt_state, batch, step_key
+    )
+    losses.append(float(metrics["loss"]))
     if step % 500 == 0 or step == NUM_STEPS - 1:
         print(f"  step {step:5d} | loss {losses[-1]:.4f}")
 
