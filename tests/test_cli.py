@@ -53,6 +53,53 @@ def test_main_help_lists_subcommands() -> None:
     assert "data" in result.output
     assert "pretrain" in result.output
     assert "sft" in result.output
+    assert "config" in result.output
+
+
+def test_config_gen_schema_writes_valid_json_schema(tmp_path: Path) -> None:
+    """``config gen-schema`` writes a JSON document containing the generated note."""
+    import json  # noqa: PLC0415
+
+    from nanodiffusion.cli.config import config_group  # noqa: PLC0415
+
+    runner = CliRunner()
+    out = tmp_path / "out.schema.json"
+    result = runner.invoke(config_group, ["gen-schema", "--output", str(out)])
+    assert result.exit_code == 0, result.output
+    assert out.exists()
+    schema = json.loads(out.read_text())
+    assert schema["type"] == "object"
+    assert schema["title"] == "Config"
+    assert "regenerate" in schema["description"].lower()
+
+
+def test_config_validate_accepts_good_yaml(tmp_path: Path) -> None:
+    """``config validate`` exits 0 on a valid config."""
+    from nanodiffusion.cli.config import config_group  # noqa: PLC0415
+
+    good = tmp_path / "good.yaml"
+    good.write_text("model:\n  num_layers: 2\n  hidden_dim: 64\n  num_heads: 2\n")
+
+    runner = CliRunner()
+    result = runner.invoke(config_group, ["validate", str(good)])
+    assert result.exit_code == 0, result.output
+    assert "ok" in result.output
+
+
+def test_config_validate_rejects_bad_yaml(tmp_path: Path) -> None:
+    """``config validate`` exits non-zero and lists the field error on bad YAML."""
+    from nanodiffusion.cli.config import config_group  # noqa: PLC0415
+
+    # ``max_steps`` below ``warmup_steps`` trips the ``@model_validator``
+    # on TrainConfig, exercising a pydantic failure path that JSON
+    # Schema alone would miss.
+    bad = tmp_path / "bad.yaml"
+    bad.write_text("train:\n  warmup_steps: 100\n  max_steps: 50\n")
+
+    runner = CliRunner()
+    result = runner.invoke(config_group, ["validate", str(bad)])
+    assert result.exit_code != 0
+    assert "fail" in result.output or "fail" in (result.stderr or "")
 
 
 def test_sft_command_help_mentions_checkpoint_options() -> None:
