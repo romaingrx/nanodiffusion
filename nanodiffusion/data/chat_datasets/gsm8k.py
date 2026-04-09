@@ -1,11 +1,11 @@
 """GSM8K grade-school math reasoning dataset.
 
-GSM8K's gold answers interleave human-readable prose with calculator
-tool-call markers ``<<expr=result>>``. Full multi-part tool-call
-support is deferred to a follow-up; for now we flatten the markers to
-plain text. The surrounding prose already contains both the expression
-and the result (e.g. ``"12/60 = $0.2 per minute"``), so stripping
-preserves answer correctness without a tokenizer vocabulary change.
+Gold answers interleave prose with ``<<expr=result>>`` calculator
+markers. We flatten the markers to plain text; the surrounding prose
+already contains both the expression and the result
+(e.g. ``"12/60 = $0.2 per minute"``), so stripping preserves answer
+correctness without a tokenizer vocabulary change. Proper multi-part
+tool-call support is deferred.
 """
 
 import re

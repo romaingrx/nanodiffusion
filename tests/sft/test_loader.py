@@ -20,7 +20,7 @@ from nanodiffusion.data.sft_loader import (
     sft_loader,
 )
 from nanodiffusion.model.transformer import Transformer
-from nanodiffusion.pretrain.train import make_optimizer
+from nanodiffusion.optimizer import make_optimizer
 from nanodiffusion.tokenizer import Tokenizer
 
 

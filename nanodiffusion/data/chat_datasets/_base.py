@@ -1,11 +1,8 @@
 """Shared primitives for chat dataset factories.
 
-Per-dataset modules (``smoltalk.py``, ``gsm8k.py``, ``identity.py``, ...)
-live alongside this file and only declare their row decoder + a single
-``register_hf_chat`` call. HuggingFace-hosted datasets go through
-:class:`HuggingFaceChatSource`; anything else (e.g. the identity JSONL
-bundle on S3) can hand-roll its own factory and call
-``CHAT_DATASETS.register`` directly.
+Per-dataset modules declare a row decoder plus a single
+``register_hf_chat`` call. Non-HF bundles hand-roll a factory and
+call ``CHAT_DATASETS.register`` directly.
 """
 
 import json
@@ -16,7 +13,7 @@ from typing import TYPE_CHECKING, Protocol, runtime_checkable
 from nanodiffusion.chat import Conversation, Message
 from nanodiffusion.data.chat_source import ChatSource
 from nanodiffusion.data.datasets import DownloadOptions
-from nanodiffusion.data.registry import Registry
+from nanodiffusion.registry import Registry
 
 if TYPE_CHECKING:
     from datasets import Dataset
@@ -28,9 +25,8 @@ type RowToConversation = Callable[[dict[str, object]], Conversation]
 class ChatDatasetFactory(Protocol):
     """Builds a :class:`ChatSource` from a local cache directory.
 
-    Mirrors :class:`nanodiffusion.data.datasets.DatasetFactory` — same
-    ``(data_dir, download, download_options)`` triplet — so the same
-    CLI shape can drive both pretrain and SFT downloads.
+    Parallel to :class:`nanodiffusion.data.datasets.DatasetFactory` so
+    the same CLI shape drives both pretrain and SFT downloads.
     """
 
     def __call__(
@@ -53,15 +49,10 @@ def get_chat_dataset(name: str) -> ChatDatasetFactory:
 class HuggingFaceChatSource:
     """Wraps a :class:`datasets.Dataset` as a :class:`ChatSource`.
 
-    Schema-specific decoding — e.g. GSM8K's tool-call flattening — lives
-    in a caller-supplied ``row_to_conversation`` callable so this class
-    stays dataset-agnostic. The wrapped ``Dataset`` handles caching,
-    random access, and the underlying parquet read so neither this class
-    nor the chat-loader has to reimplement that machinery.
-
-    ``row_to_conversation`` must not return ``None``: rows that cannot be
-    decoded should raise so misconfigured datasets fail loudly at load
-    time rather than silently dropping training signal.
+    Schema-specific decoding lives in the caller-supplied
+    ``row_to_conversation`` so this class stays dataset-agnostic.
+    ``row_to_conversation`` must raise on undecodable rows rather
+    than returning ``None`` — silent drops would cost training signal.
     """
 
     def __init__(
@@ -85,9 +76,8 @@ class HuggingFaceChatSource:
 class JsonlChatSource:
     """Reads one conversation per line from a JSONL file.
 
-    Each line must be a JSON array of ``{role, content}`` dicts matching
-    :class:`Message`. Used for small bundles (e.g. the identity
-    conversations) that aren't on the HuggingFace hub.
+    Each line is a JSON array of ``{role, content}`` dicts matching
+    :class:`Message`. For small non-HF bundles.
     """
 
     def __init__(self, path: Path) -> None:
@@ -120,12 +110,8 @@ class JsonlChatSource:
 def normalize_message(raw: object) -> Message:
     """Coerce a dataset row entry into a :class:`Message`.
 
-    Raises on missing fields or unsupported roles rather than returning
-    ``None`` — a single bad row should abort the load so the caller
-    notices and fixes the schema drift instead of training on a silently
-    truncated dataset. The ``match`` on role narrows to the
-    :data:`~nanodiffusion.chat.Role` literal so the return dict
-    satisfies the :class:`Message` TypedDict without a cast.
+    Raises on missing fields or unsupported roles so a bad row aborts
+    the load loudly instead of silently dropping training signal.
     """
     if not isinstance(raw, dict):
         err = f"Expected dict message, got {type(raw).__name__}"
@@ -152,14 +138,7 @@ def register_hf_chat(
     row_to_conversation: RowToConversation,
     doc: str,
 ) -> ChatDatasetFactory:
-    """Register an HF-hosted chat dataset in one call.
-
-    Per-dataset modules declare their spec as a single call to this
-    helper plus the row decoder it references; the ``datasets`` library
-    is imported lazily inside the factory so just listing the registry
-    (e.g. ``data list-chat``) doesn't pull the heavy dependency into
-    process memory.
-    """
+    """Register an HF-hosted chat dataset in one call."""
 
     def factory(
         data_dir: Path,
@@ -167,14 +146,11 @@ def register_hf_chat(
         download: bool = True,  # noqa: ARG001 -- datasets lib caches automatically
         download_options: DownloadOptions | None = None,  # noqa: ARG001
     ) -> ChatSource:
-        # The ``datasets`` library is heavy — defer the import so that
-        # just listing the registry doesn't pull it into process memory.
+        # Deferred import: the ``datasets`` library is heavy and
+        # listing the registry shouldn't pull it into process memory.
         from datasets import load_dataset  # noqa: PLC0415
 
         data_dir.mkdir(parents=True, exist_ok=True)
-        # Passing ``split`` narrows ``load_dataset``'s return to
-        # ``Dataset`` in the stubs, so :class:`HuggingFaceChatSource`
-        # accepts it directly without a cast or isinstance check.
         dataset = load_dataset(
             repo_id,
             subset,

@@ -11,16 +11,13 @@ from nanodiffusion.model.transformer import Transformer
 
 
 def transformer_skeleton(config: ModelConfig) -> Transformer:
-    """Zero-cost :class:`Transformer` shape tree via ``filter_eval_shape``.
+    """Zero-cost :class:`Transformer` shape tree for deserialisation.
 
-    ``eqx.filter_eval_shape`` traces the constructor abstractly: no
-    parameter tensors are allocated, no PRNG normal draws happen, and
-    the returned tree has ``ShapeDtypeStruct`` leaves that
-    :func:`eqx.tree_deserialise_leaves` fills in from disk. Saves
-    several seconds (and a full copy of the model's memory) at startup
-    of every resume-from-checkpoint path. ``key`` is required by the
-    constructor but never drawn from under ``filter_eval_shape``; any
-    fixed seed works.
+    ``eqx.filter_eval_shape`` traces the constructor abstractly — no
+    parameter tensors are allocated and no PRNG draws happen — so the
+    returned tree has ``ShapeDtypeStruct`` leaves that
+    :func:`eqx.tree_deserialise_leaves` can fill in from disk. ``key``
+    is required by the constructor signature but is not actually drawn.
     """
     return cast(
         "Transformer",

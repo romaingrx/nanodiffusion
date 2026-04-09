@@ -1,14 +1,11 @@
 """Pad-per-row SFT data loader.
 
-Consumes any :class:`ChatSource` and emits ``(batch, seq_len)`` batches
-carrying a parallel boolean ``loss_mask`` per position. Conversations
-are rendered once via :func:`nanodiffusion.chat.render_conversation`
-(which already merges optional system messages and asserts role
-alternation), right-padded with EOS if they fit, or skipped if they
-don't. The loader is stateless across epochs modulo a seeded shuffle
-of the source's index space, so resuming from a saved
-:class:`SFTCursor` gives a deterministic continuation of the
-iteration order.
+Consumes any :class:`ChatSource` and emits ``(batch, seq_len)``
+batches with a parallel boolean ``loss_mask``. Conversations are
+rendered via :func:`nanodiffusion.chat.render_conversation`, right-
+padded with EOS if they fit, or skipped if they don't. Iteration
+order is a seeded per-epoch shuffle so saved :class:`SFTCursor`
+resumes pick up where they left off.
 """
 
 import random
@@ -34,10 +31,9 @@ from nanodiffusion.types import (
 class SFTJaxBatch(eqx.Module):
     """JIT-visible pytree: tokens + loss_mask only, no host-side cursor.
 
-    ``eqx.Module`` registration means this class is a proper JAX pytree
-    — equinox's JIT treats the fields as leaves and hashes the static
-    structure, avoiding the ``unhashable ArrayImpl`` error a plain
-    ``@dataclass(frozen=True)`` would hit inside ``equinox/_jit.py``.
+    Inheriting from :class:`eqx.Module` registers this as a proper JAX
+    pytree — a plain ``@dataclass(frozen=True)`` would hit an
+    ``unhashable ArrayImpl`` error inside ``equinox/_jit.py``.
     """
 
     tokens: TokenBatch
@@ -48,8 +44,8 @@ class SFTJaxBatch(eqx.Module):
 class SFTBatchOutput:
     """Host-side SFT batch: numpy arrays plus resume cursor.
 
-    Mirrors :class:`nanodiffusion.data.loader.BatchOutput`'s split so
-    the cursor never enters JIT and ``prefetch`` can still wrap it.
+    The cursor is kept on this host-side wrapper so it never enters
+    JIT; :meth:`to_jax` returns the pytree-only :class:`SFTJaxBatch`.
     """
 
     tokens: NumpyTokenBatch
@@ -66,12 +62,10 @@ class SFTBatchOutput:
 def _epoch_permutation(seed: int, epoch: int, n: int) -> list[int]:
     """Deterministic per-epoch shuffle of ``range(n)``.
 
-    Keying the RNG off an ``(seed, epoch)`` mix means two runs with the
-    same seed produce identical iteration orders, and resume-from-cursor
-    reproduces the second half of an interrupted epoch exactly. We
-    combine seed and epoch via a cheap 64-bit hash instead of passing a
-    tuple — ``random.Random`` accepts ints but the stubs don't allow
-    tuples.
+    The ``(seed, epoch)`` pair is mixed via Knuth's multiplicative
+    hash into a single 64-bit int so two runs with the same seed
+    produce identical iteration orders and resume reproduces the
+    second half of an interrupted epoch exactly.
     """
     combined = (seed * 2654435761 + epoch) & 0xFFFFFFFFFFFFFFFF
     rng = random.Random(combined)  # noqa: S311  # deterministic, not crypto
@@ -106,21 +100,13 @@ def sft_loader(
 ) -> Iterator[SFTBatchOutput]:
     """Yield SFT batches from ``source`` indefinitely.
 
-    Each epoch is a fresh seeded shuffle of the source index space.
-    Conversations that don't fit in ``seq_len`` after rendering are
-    skipped (not truncated) — nanochat's approach, and safer than
-    slicing off chat delimiters that the model never saw at pretrain.
-    Short conversations are right-padded with EOS (``loss_mask=0`` on
-    pad), since EOS already means "document boundary" to the pretrained
-    model.
-
-    ``resume_state`` fast-forwards into the middle of an epoch so
-    resumption is deterministic given the same seed.
-
-    ``max_empty_passes`` bounds the number of consecutive skipped
-    conversations (too long or no supervised tokens) before the loader
-    aborts — same safety net as the pretrain loader against
-    silently-empty data.
+    Oversized conversations are skipped (not truncated) — slicing off
+    chat delimiters would feed the model a distribution pretrain
+    never saw. Short conversations are EOS-padded with
+    ``loss_mask=0`` on the pad, since EOS already means "document
+    boundary" to the pretrained model. ``max_empty_passes`` bounds
+    consecutive skips before the loader aborts, guarding against a
+    source where nothing fits ``seq_len``.
     """
     if batch_size <= 0 or seq_len <= 0:
         msg = f"batch_size and seq_len must be positive, got {batch_size}, {seq_len}"

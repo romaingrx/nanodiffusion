@@ -7,20 +7,13 @@ from nanodiffusion.pretrain.loss import (
     forward_mask,
     masked_nll,
 )
-from nanodiffusion.pretrain.train import (
-    ema_update,
-    make_optimizer,
-    make_train_step,
-    pretrain,
-)
+from nanodiffusion.pretrain.train import make_train_step, pretrain
 
 __all__ = [
     "TrainStepFn",
     "compute_loss",
     "diffusion_loss",
-    "ema_update",
     "forward_mask",
-    "make_optimizer",
     "make_train_step",
     "masked_nll",
     "pretrain",

@@ -10,11 +10,17 @@ import optax
 import pytest
 
 from nanodiffusion.checkpoint import (
-    LATEST_LINK_NAME,
     CheckpointMeta,
     load_checkpoint,
     load_model,
     save_checkpoint,
+)
+from nanodiffusion.constants import (
+    EMA_FILENAME,
+    LATEST_LINK_NAME,
+    META_FILENAME,
+    MODEL_FILENAME,
+    OPT_STATE_FILENAME,
 )
 from nanodiffusion.data.cursors import PretrainCursor
 from nanodiffusion.model import Transformer
@@ -115,8 +121,8 @@ def test_save_writes_expected_files(
         cursor=None,
     )
     files = {p.name for p in ckpt.iterdir()}
-    assert {"model.eqx", "ema.eqx", "opt_state.eqx", "meta.json"} <= files
-    meta = json.loads((ckpt / "meta.json").read_text())
+    assert {MODEL_FILENAME, EMA_FILENAME, OPT_STATE_FILENAME, META_FILENAME} <= files
+    meta = json.loads((ckpt / META_FILENAME).read_text())
     assert meta["step"] == 1
     assert meta["cursor"] is None
 
@@ -229,7 +235,7 @@ def test_save_cleans_up_stale_tmp_sibling(
         step=1,
         cursor=None,
     )
-    assert (tmp_path / "step_1" / "meta.json").exists()
+    assert (tmp_path / "step_1" / META_FILENAME).exists()
     assert not stale.exists()
 
 
@@ -264,7 +270,7 @@ def test_update_latest_symlink_points_at_newest_checkpoint(
     # Relative target — stays valid if the run dir is moved.
     assert str(latest.readlink()) == "step_2"
     # Loading through the symlink resolves to the newest meta.
-    meta = CheckpointMeta.model_validate_json((latest / "meta.json").read_text())
+    meta = CheckpointMeta.model_validate_json((latest / META_FILENAME).read_text())
     assert meta.step == 2
 
 

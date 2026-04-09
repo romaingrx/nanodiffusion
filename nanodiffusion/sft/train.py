@@ -1,13 +1,4 @@
-"""SFT training loop: JIT train step + end-to-end ``sft_finetune`` driver.
-
-Shares the loop body, optimizer factory, EMA helper, and run-dir
-plumbing with :mod:`nanodiffusion.pretrain.train` via
-:mod:`nanodiffusion.loop`. This file owns the SFT-specific bits: the
-JIT train step (which unpacks ``SFTJaxBatch`` tokens + loss_mask), the
-batch-prepare callback that surfaces the supervised-token count, and
-the top-level ``sft_finetune`` driver that distinguishes a fresh
-fine-tune from pretrain vs a resumed SFT run.
-"""
+"""SFT driver: JIT train step, state loader, ``sft_finetune`` entry."""
 
 import dataclasses
 from pathlib import Path
@@ -17,7 +8,12 @@ import jax
 import optax
 import structlog
 
-from nanodiffusion.checkpoint import load_checkpoint, load_model
+from nanodiffusion.checkpoint import (
+    load_checkpoint,
+    load_model,
+    resolve_model_config_from_checkpoint,
+    write_config,
+)
 from nanodiffusion.config import Config
 from nanodiffusion.data.chat_datasets import get_chat_dataset
 from nanodiffusion.data.chat_source import ChatSource, TaskMixture
@@ -28,13 +24,11 @@ from nanodiffusion.loop import (
     LoopState,
     StepStats,
     TrainStepFn,
-    resolve_model_config_from_checkpoint,
     resolve_run_dir,
     run_training_loop,
-    write_config,
 )
 from nanodiffusion.model import DiffusionModel, Transformer, transformer_skeleton
-from nanodiffusion.pretrain.train import ema_update, make_optimizer
+from nanodiffusion.optimizer import ema_update, make_optimizer
 from nanodiffusion.schedule import LogLinearSchedule, NoiseSchedule
 from nanodiffusion.sft.loss import compute_sft_loss
 from nanodiffusion.tokenizer import Tokenizer
@@ -55,11 +49,10 @@ def make_sft_train_step[M: DiffusionModel](
 ) -> SFTTrainStepFn[M]:
     """Build an ``eqx.filter_jit`` train step for SFT.
 
-    Mirrors :func:`nanodiffusion.pretrain.train.make_train_step` but the
-    loss function unpacks an :class:`SFTJaxBatch` into the tokens +
-    loss_mask pair that :func:`compute_sft_loss` expects. Closures pin
-    ``optimizer``, ``schedule``, ``mask_token_id`` and ``ema_decay`` at
-    trace time so the JIT cache key stays stable across calls.
+    Unpacks the :class:`SFTJaxBatch` tokens + loss_mask pair that
+    :func:`compute_sft_loss` expects. Closures pin ``optimizer``,
+    ``schedule``, ``mask_token_id``, and ``ema_decay`` at trace time
+    so the JIT cache key stays stable.
     """
 
     @eqx.filter_jit
@@ -96,9 +89,8 @@ def _prepare_sft_batch(
 ) -> tuple[SFTJaxBatch, SFTCursor, StepStats]:
     """Host → JAX conversion for SFT batches.
 
-    ``supervised_tokens`` is counted from the numpy-side ``loss_mask``
-    *before* :meth:`SFTBatchOutput.to_jax` to avoid a JAX→host sync on
-    every step in the training loop.
+    ``supervised_tokens`` is counted on the numpy side *before*
+    :meth:`SFTBatchOutput.to_jax` to avoid a JAX→host sync each step.
     """
     supervised = int(batch.loss_mask.sum())
     return batch.to_jax(), batch.state, StepStats(supervised_tokens=supervised)
@@ -108,8 +100,8 @@ def _build_task_mixture(config: Config) -> TaskMixture:
     """Resolve ``config.sft.datasets`` into a seeded :class:`TaskMixture`.
 
     Each ``SFTDatasetConfig(name, epochs)`` contributes its source
-    ``epochs`` times via duplicate entries in the mixture list — the
-    same oversampling trick nanochat uses in ``chat_sft.py``.
+    ``epochs`` times via duplicate entries — that's how oversampling
+    is expressed without a separate multiplier.
     """
     sources: list[ChatSource] = []
     for entry in config.sft.datasets:
@@ -121,13 +113,7 @@ def _build_task_mixture(config: Config) -> TaskMixture:
 
 @dataclasses.dataclass(frozen=True, slots=True)
 class _SFTInitialState:
-    """Everything :func:`sft_finetune`'s loop needs at step 0.
-
-    The single-struct return from :func:`_load_sft_initial_state` keeps
-    the narrowing + raise logic around ``pretrain_checkpoint`` /
-    ``resume_from`` in one place so the main driver never juggles the
-    ``Path | None`` pair directly.
-    """
+    """Everything :func:`sft_finetune`'s loop needs at step 0."""
 
     model: Transformer
     ema_model: Transformer
@@ -146,10 +132,7 @@ def _load_sft_initial_state(
     """Validate the starting-point XOR and load weights into one state.
 
     Exactly one of ``pretrain_checkpoint`` or ``resume_from`` must be
-    non-``None``; any other combination raises :class:`ValueError`. On
-    resume, the saved cursor must be an :class:`SFTCursor` — a
-    pretrain cursor lands here only if a user mistakenly points the
-    ``--resume-from`` flag at a pretrain run, and we refuse it loudly.
+    non-``None``; anything else raises :class:`ValueError`.
     """
     if pretrain_checkpoint is not None and resume_from is not None:
         msg = (
@@ -232,15 +215,13 @@ def sft_finetune(
     Exactly one of ``pretrain_checkpoint`` or ``resume_from`` must be
     provided:
 
-    * ``pretrain_checkpoint`` — start a fresh SFT run from a pretrain
-      checkpoint. Loads the raw model weights (``which="model"``, not
-      EMA — EMA is a sampling-time smoothing artifact that would lag
-      the optimizer's starting point) and builds a fresh EMA,
-      optimizer state, step counter, and cursor.
+    * ``pretrain_checkpoint`` — fresh SFT run from pretrain weights.
+      Loads the raw model (``which="model"``, not EMA, since EMA is a
+      sampling-time smoothing that would lag the optimizer's starting
+      point) and builds fresh EMA, opt-state, step, and cursor.
     * ``resume_from`` — continue an interrupted SFT run. Loads model,
-      EMA, optimizer state, and cursor from the saved checkpoint and
-      resumes the loader at the saved permutation index so no
-      conversations are re-ingested.
+      EMA, opt-state, and cursor; the loader fast-forwards past the
+      saved permutation index so no conversations are re-ingested.
     """
     optimizer, lr_schedule = make_optimizer(config.sft)
     start = _load_sft_initial_state(

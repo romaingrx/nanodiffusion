@@ -6,12 +6,20 @@ import pytest
 import yaml
 from click.testing import CliRunner
 
-from nanodiffusion.checkpoint import LATEST_LINK_NAME, CheckpointMeta
+from nanodiffusion.checkpoint import CheckpointMeta
 from nanodiffusion.cli import main
 from nanodiffusion.cli.data import data_group
 from nanodiffusion.cli.pretrain import pretrain_command
 from nanodiffusion.cli.sample import sample_command
 from nanodiffusion.config import Config
+from nanodiffusion.constants import (
+    CONFIG_SIDECAR_FILENAME,
+    EMA_FILENAME,
+    LATEST_LINK_NAME,
+    META_FILENAME,
+    MODEL_FILENAME,
+    OPT_STATE_FILENAME,
+)
 from nanodiffusion.data.datasets import DATASETS, DatasetFactory, DownloadOptions
 from nanodiffusion.data.source import InMemoryTextSource, TextSource
 
@@ -268,12 +276,18 @@ def test_pretrain_command_runs_end_to_end(
     runs = list(run_dir.iterdir())
     assert len(runs) == 1
     single_run = runs[0]
-    assert (single_run / "config.yaml").exists()
+    assert (single_run / CONFIG_SIDECAR_FILENAME).exists()
 
     # _write_pretrain_config uses max_steps=3, save_every=1000 → single save.
     final = single_run / "step_3"
     assert final.is_dir()
-    for name in ("model.eqx", "ema.eqx", "opt_state.eqx", "meta.json", "config.yaml"):
+    for name in (
+        MODEL_FILENAME,
+        EMA_FILENAME,
+        OPT_STATE_FILENAME,
+        META_FILENAME,
+        CONFIG_SIDECAR_FILENAME,
+    ):
         assert (final / name).exists(), name
 
     # `latest` symlink points at the newest checkpoint after the last save.
@@ -299,7 +313,7 @@ def test_pretrain_latest_reflects_max_step(
 
     single_run = next(iter(run_dir.iterdir()))
     meta = CheckpointMeta.model_validate_json(
-        (single_run / LATEST_LINK_NAME / "meta.json").read_text()
+        (single_run / LATEST_LINK_NAME / META_FILENAME).read_text()
     )
     # _write_pretrain_config uses max_steps=3.
     assert meta.step == 3
@@ -408,9 +422,8 @@ def test_pretrain_resume_continues_step_and_reuses_run_dir(
     single_run = next(iter(run_dir.iterdir()))
     latest = single_run / LATEST_LINK_NAME
     assert latest.is_symlink()
-    assert (
-        CheckpointMeta.model_validate_json((latest / "meta.json").read_text()).step == 2
-    )
+    meta = CheckpointMeta.model_validate_json((latest / META_FILENAME).read_text())
+    assert meta.step == 2
 
     # Second phase: same run dir, bumped max_steps, resume via `latest`.
     second_config = tmp_path / "second.yaml"
@@ -462,7 +475,8 @@ def test_pretrain_resume_continues_step_and_reuses_run_dir(
 
     # `latest` now points at the newest snapshot; its meta reflects the resumed step.
     assert str(latest.readlink()) == "step_4"
-    final_meta = CheckpointMeta.model_validate_json((latest / "meta.json").read_text())
+    final_meta_json = (latest / META_FILENAME).read_text()
+    final_meta = CheckpointMeta.model_validate_json(final_meta_json)
     assert final_meta.step == 4
 
 
@@ -484,7 +498,7 @@ def test_pretrain_writes_reloadable_config(
     assert result.exit_code == 0, result.output
 
     single_run = next(iter(run_dir.iterdir()))
-    dumped = single_run / "config.yaml"
+    dumped = single_run / CONFIG_SIDECAR_FILENAME
     reloaded = Config.from_yaml(dumped)
     # Match the values the test set; the rest use model defaults.
     assert reloaded.train.max_steps == 3

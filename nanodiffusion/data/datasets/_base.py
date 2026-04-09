@@ -1,9 +1,7 @@
 """Shared primitives for pretrain dataset factories.
 
-All network-touching code lives here so ``source.py`` stays offline-pure
-and its tests never fetch from the hub. Per-dataset modules
-(``fineweb_edu.py``, ``climbmix_400b.py``, ...) only declare the spec
-and register it on import.
+All network-touching code lives here so ``source.py`` stays offline-pure.
+Per-dataset modules only declare a spec and register it on import.
 """
 
 from collections.abc import Callable, Iterable
@@ -15,19 +13,18 @@ from typing import Protocol, runtime_checkable
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from nanodiffusion.data.registry import Registry
 from nanodiffusion.data.source import ParquetTextSource, TextSource
+from nanodiffusion.registry import Registry
 
 
 @runtime_checkable
 class DatasetFactory(Protocol):
     """Callable that builds a :class:`TextSource` from a local cache dir.
 
-    ``download_options`` is honored by HTTP-backed factories and silently
-    ignored by local-only ones so the CLI can stay generic.
-
-    Named ``DatasetFactory`` rather than ``Dataset`` to avoid collision with
-    ``torch.utils.data.Dataset`` and HuggingFace ``datasets.Dataset``.
+    ``download_options`` is honored by HTTP-backed factories and
+    ignored by local-only ones so the CLI stays generic. Named
+    ``DatasetFactory`` to avoid collision with ``torch.utils.data.Dataset``
+    and HuggingFace ``datasets.Dataset``.
     """
 
     def __call__(
@@ -142,16 +139,16 @@ def download_with_backoff(
     options: DownloadOptions,
     validator: Callable[[Path], None] | None = None,
 ) -> None:
-    # Local imports keep module import cheap for callers that only touch
-    # the registry (e.g. ``data list``).
+    # Deferred imports keep ``data list`` cheap by not pulling in
+    # ``requests`` for registry-only entry points.
     import random  # noqa: PLC0415
     import time  # noqa: PLC0415
     import uuid  # noqa: PLC0415
 
     import requests  # noqa: PLC0415
 
-    # Per-call uuid lets concurrent downloads of the same shard write to
-    # different temp files; the final rename is atomic.
+    # UUID-suffixed temp file so concurrent downloads of the same
+    # shard don't clobber each other before the atomic rename.
     tmp = target.with_suffix(f"{target.suffix}.{uuid.uuid4().hex}.tmp")
     last_exc: Exception | None = None
     for attempt in range(1, options.retries + 1):
@@ -162,8 +159,8 @@ def download_with_backoff(
                     for chunk in response.iter_content(chunk_size=options.chunk_size):
                         if chunk:
                             fh.write(chunk)
-            # Validate before rename so a corrupt payload is retried instead
-            # of being committed and then failing at read time.
+            # Validate before rename so corrupt payloads get retried
+            # rather than committed and failing later at read time.
             if validator is not None:
                 validator(tmp)
             tmp.replace(target)
@@ -172,8 +169,8 @@ def download_with_backoff(
             if tmp.exists():
                 tmp.unlink(missing_ok=True)
             if attempt < options.retries:
-                # Capped exponential backoff with jitter to scatter a
-                # thundering herd of failed shards.
+                # Capped exponential backoff with jitter scatters a
+                # thundering herd of simultaneously-failing shards.
                 base = min(options.backoff_base**attempt, options.backoff_cap)
                 jitter = random.uniform(0.0, options.backoff_jitter * base)  # noqa: S311
                 time.sleep(base + jitter)
@@ -194,11 +191,8 @@ def register_hf_parquet(
 ) -> DatasetFactory:
     """Register an HF-hosted parquet dataset in one call.
 
-    Per-dataset modules only need this helper plus their own constants —
-    no class, no factory boilerplate — so adding a new dataset is a
-    handful of lines and a file name. The registered factory keeps the
-    one-line ``doc`` as its ``__doc__`` so ``nanodiffusion data list``
-    prints a useful description.
+    ``doc`` is attached as the factory's ``__doc__`` so
+    ``nanodiffusion data list`` prints a useful description.
     """
 
     def factory(

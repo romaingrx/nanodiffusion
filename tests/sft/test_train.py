@@ -10,12 +10,13 @@ import pytest
 from nanodiffusion.chat import Conversation
 from nanodiffusion.checkpoint import save_checkpoint
 from nanodiffusion.config import Config, ModelConfig, SFTConfig, SFTDatasetConfig
+from nanodiffusion.constants import CONFIG_SIDECAR_FILENAME, LATEST_LINK_NAME
 from nanodiffusion.data.chat_datasets import CHAT_DATASETS, register_chat
 from nanodiffusion.data.chat_source import ChatSource, InMemoryChatSource
 from nanodiffusion.data.datasets import DownloadOptions
 from nanodiffusion.data.sft_loader import SFTJaxBatch
 from nanodiffusion.model import Transformer
-from nanodiffusion.pretrain.train import make_optimizer
+from nanodiffusion.optimizer import make_optimizer
 from nanodiffusion.schedule import LogLinearSchedule
 from nanodiffusion.sft import SFTTrainStepFn, make_sft_train_step, sft_finetune
 from tests._helpers import inexact_leaves
@@ -237,7 +238,7 @@ def test_sft_finetune_end_to_end_smoke(
     import yaml  # noqa: PLC0415
 
     ckpt_config = Config(model=small_config)
-    (ckpt_dir / "config.yaml").write_text(
+    (ckpt_dir / CONFIG_SIDECAR_FILENAME).write_text(
         yaml.dump(ckpt_config.model_dump(mode="json"))
     )
 
@@ -257,8 +258,8 @@ def test_sft_finetune_end_to_end_smoke(
 
     run_dir = sft_finetune(sft_config, pretrain_checkpoint=ckpt_dir)
     assert run_dir.exists()
-    assert (run_dir / "config.yaml").exists()
-    assert (run_dir / "latest").exists()
+    assert (run_dir / CONFIG_SIDECAR_FILENAME).exists()
+    assert (run_dir / LATEST_LINK_NAME).exists()
     # max_steps=3 with save_every=2 → step_2/ exists, step_3/ final save
     step_dirs = sorted(d.name for d in run_dir.iterdir() if d.name.startswith("step_"))
     assert step_dirs, f"no step_ dirs in {run_dir}"
@@ -315,7 +316,7 @@ def test_sft_finetune_resumes_from_saved_sft_checkpoint(
         step=0,
         cursor=None,
     )
-    (pretrain_dir / "config.yaml").write_text(
+    (pretrain_dir / CONFIG_SIDECAR_FILENAME).write_text(
         yaml.dump(Config(model=small_config).model_dump(mode="json"))
     )
 

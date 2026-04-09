@@ -1,10 +1,4 @@
-"""MDLM pretraining primitives: optimizer, EMA, JIT train step, loop.
-
-The public surface is the :func:`pretrain` entry point the CLI calls.
-Everything below it is factored into small helpers so they can be unit
-tested without spinning up the data pipeline: :func:`make_optimizer`,
-:func:`ema_update`, and :func:`make_train_step`.
-"""
+"""MDLM pretraining driver: JIT train step, state loader, ``pretrain`` entry."""
 
 import dataclasses
 from pathlib import Path
@@ -15,8 +9,12 @@ import jax.numpy as jnp
 import optax
 import structlog
 
-from nanodiffusion.checkpoint import load_checkpoint
-from nanodiffusion.config import Config, OptimizerHyperparams
+from nanodiffusion.checkpoint import (
+    load_checkpoint,
+    resolve_model_config_from_checkpoint,
+    write_config,
+)
+from nanodiffusion.config import Config
 from nanodiffusion.data.cursors import PretrainCursor
 from nanodiffusion.data.datasets import get_dataset
 from nanodiffusion.data.loader import BatchOutput, pretrain_loader
@@ -26,62 +24,21 @@ from nanodiffusion.loop import (
     LoopState,
     StepStats,
     TrainStepFn,
-    resolve_model_config_from_checkpoint,
     resolve_run_dir,
     run_training_loop,
-    write_config,
 )
 from nanodiffusion.model import (
     DiffusionModel,
     Transformer,
     transformer_skeleton,
 )
+from nanodiffusion.optimizer import ema_update, make_optimizer
 from nanodiffusion.pretrain.loss import compute_loss
 from nanodiffusion.schedule import LogLinearSchedule, NoiseSchedule
 from nanodiffusion.tokenizer import Tokenizer
 from nanodiffusion.types import PRNGKeyArray, Scalar, TokenBatch
 
 logger = structlog.get_logger(__name__)
-
-
-def make_optimizer(
-    hp: OptimizerHyperparams,
-) -> tuple[optax.GradientTransformation, optax.Schedule]:
-    """Warmup + cosine-decay AdamW with global-norm grad clipping.
-
-    Typed against :class:`OptimizerHyperparams` so both ``TrainConfig``
-    (pretrain) and ``SFTConfig`` (fine-tuning) satisfy it structurally
-    — this keeps SFT from dragging in a pretrain config reference just
-    to reuse the optimizer factory. Returns the optimizer and the lr
-    schedule; the schedule is exposed separately so callers can log
-    the current learning rate without reaching into opt_state internals.
-    """
-    lr_schedule = optax.warmup_cosine_decay_schedule(
-        init_value=0.0,
-        peak_value=hp.learning_rate,
-        warmup_steps=hp.warmup_steps,
-        decay_steps=hp.max_steps,
-    )
-    optimizer = optax.chain(
-        optax.clip_by_global_norm(hp.grad_clip),
-        optax.adamw(lr_schedule, weight_decay=hp.weight_decay),
-    )
-    return optimizer, lr_schedule
-
-
-def ema_update[M: eqx.Module](ema_model: M, model: M, decay: float) -> M:
-    """Polyak EMA on the float leaves only.
-
-    ``ema_new = decay * ema_old + (1 - decay) * model``. Non-inexact
-    leaves (ints, static fields, strings) are left untouched so integer
-    bookkeeping arrays are never silently cast to float.
-    """
-    ema_arrays, static = eqx.partition(ema_model, eqx.is_inexact_array)
-    model_arrays, _ = eqx.partition(model, eqx.is_inexact_array)
-    new_ema_arrays = jax.tree.map(
-        lambda e, m: decay * e + (1.0 - decay) * m, ema_arrays, model_arrays
-    )
-    return eqx.combine(new_ema_arrays, static)
 
 
 def make_train_step[M: DiffusionModel](
@@ -93,11 +50,10 @@ def make_train_step[M: DiffusionModel](
 ) -> TrainStepFn[M, TokenBatch]:
     """Build an ``eqx.filter_jit`` train step for MDLM diffusion.
 
-    Closing over ``optimizer``, ``schedule``, ``mask_token_id`` and
-    ``ema_decay`` pins them at trace time so the JIT cache key stays
-    stable across calls. The returned callable is generic over ``M``
-    so its first positional argument ties the model, EMA, and returned
-    tuple together at the caller's concrete subclass.
+    Closures pin ``optimizer``, ``schedule``, ``mask_token_id``, and
+    ``ema_decay`` at trace time so the JIT cache key stays stable.
+    The callable is generic over ``M`` so the concrete model subclass
+    flows through to the returned tuple without a downcast.
     """
 
     @eqx.filter_jit
@@ -142,22 +98,16 @@ def _prepare_batch(
 ) -> tuple[TokenBatch, PretrainCursor, StepStats]:
     """Host → JAX conversion for pretrain batches.
 
-    Pretrain doesn't track supervised tokens separately — every token
-    contributes to the unconditional diffusion loss — so the stats
-    payload is empty and the shared loop omits the
-    ``supervised_tok_per_s`` field from its log output.
+    Every pretrain token contributes to the unconditional diffusion
+    loss, so the stats payload stays at 0 and the loop omits the
+    derived ``supervised_tok_per_s`` log field.
     """
     return jnp.asarray(batch.tokens), batch.state, StepStats()
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
 class _PretrainInitialState:
-    """Everything :func:`pretrain`'s loop needs at step 0.
-
-    Mirrors :class:`nanodiffusion.sft.train._SFTInitialState`; keeping
-    the shape identical lets the two drivers be read side-by-side with
-    no structural differences beyond the paradigm-specific cursor type.
-    """
+    """Everything :func:`pretrain`'s loop needs at step 0."""
 
     model: Transformer
     ema_model: Transformer
@@ -173,13 +123,7 @@ def _load_pretrain_initial_state(
     resume_from: Path | None,
     model_key: PRNGKeyArray,
 ) -> _PretrainInitialState:
-    """Build the step-0 state for a fresh run or resume from a checkpoint.
-
-    Resume uses :func:`transformer_skeleton` so the abstract shape
-    tree feeds :func:`load_checkpoint` without allocating real
-    parameter tensors first — the two-phase load is hidden inside
-    :func:`load_checkpoint` via the ``opt_state_builder`` callback.
-    """
+    """Build the step-0 state for a fresh run or resume from a checkpoint."""
     if resume_from is not None:
         return _load_resumed_pretrain_state(config, optimizer, resume_from)
     return _load_fresh_pretrain_state(config, optimizer, model_key)
@@ -206,10 +150,6 @@ def _load_resumed_pretrain_state(
     optimizer: optax.GradientTransformation,
     checkpoint: Path,
 ) -> _PretrainInitialState:
-    # ``transformer_skeleton`` builds a zero-cost shape tree so we
-    # avoid a full real-weights init on resume. ``load_checkpoint``
-    # internally does the two-phase load via ``opt_state_builder`` —
-    # see its docstring.
     model_config = resolve_model_config_from_checkpoint(
         checkpoint,
         fallback=config.model,

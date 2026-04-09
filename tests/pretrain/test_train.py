@@ -10,12 +10,8 @@ from pydantic import ValidationError
 
 from nanodiffusion.config import ModelConfig, TrainConfig
 from nanodiffusion.model import Transformer
-from nanodiffusion.pretrain.train import (
-    TrainStepFn,
-    ema_update,
-    make_optimizer,
-    make_train_step,
-)
+from nanodiffusion.optimizer import ema_update, make_optimizer
+from nanodiffusion.pretrain.train import TrainStepFn, make_train_step
 from nanodiffusion.schedule import LogLinearSchedule
 from tests._helpers import inexact_leaves
 

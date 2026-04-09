@@ -1,22 +1,15 @@
-"""Generic named-factory registry.
-
-Shared by pretrain datasets and SFT chat datasets so both can use the
-same register/get/iterate surface without copy-pasting the glue. Inherits
-from :class:`collections.abc.MutableMapping` so ``monkeypatch.setitem``
-and the tests' ``.pop`` / ``.update`` / ``.clear`` idioms keep working
-unchanged.
-"""
+"""Generic named-factory registry with duplicate-guard on registration."""
 
 from collections.abc import Callable, Iterator, MutableMapping
 
 
 class Registry[T](MutableMapping[str, T]):
-    """Named-factory store with duplicate-guard on ``register``.
+    """Named-factory store.
 
-    ``kind`` is the human-readable noun that prefixes error messages
-    ("Unknown dataset 'foo'" / "Unknown chat dataset 'foo'") so the two
-    registries surface distinct errors without each maintaining its own
-    formatting code.
+    ``kind`` is the human-readable noun used in error messages so
+    different registries ("dataset", "chat dataset", ...) surface
+    distinct lookup failures. Inheriting from :class:`MutableMapping`
+    keeps ``monkeypatch.setitem`` and dict-style test idioms working.
     """
 
     def __init__(self, kind: str) -> None:
@@ -45,9 +38,9 @@ class Registry[T](MutableMapping[str, T]):
     def register(self, name: str) -> Callable[[T], T]:
         """Decorator adding ``fn`` under ``name``; raises on duplicate.
 
-        The duplicate-guard lives here, not in ``__setitem__``, so that
-        ``monkeypatch.setitem(DATASETS, "foo", fake)`` can still override
-        a registered factory for the lifetime of a test.
+        The guard lives here rather than in ``__setitem__`` so
+        ``monkeypatch.setitem`` can still override for the lifetime of
+        a test.
         """
 
         def decorator(fn: T) -> T:

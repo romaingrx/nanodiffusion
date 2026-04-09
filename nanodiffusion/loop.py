@@ -1,14 +1,8 @@
 """Shared training loop driving pretrain and SFT.
 
-Both paradigms run the same three-phase step — pull a host batch from a
-prefetched loader, convert it to a JAX batch, run the JIT'd train step —
-and share the same throughput-window logging, periodic save, and
-first-post-compile timing reset. Only two things genuinely differ:
-the batch pytree the train step consumes, and the optional per-step
-metrics pretrain doesn't track (e.g. SFT's supervised-token count).
-A small :class:`PrepareBatch` callback threads both through, so
-:func:`run_training_loop` owns the hairy timing/saving logic and each
-paradigm stays focused on its loss and its batch shape.
+Paradigm-specific differences (batch pytree shape, optional per-step
+metrics) are threaded through a :class:`PrepareBatch` callback so
+:func:`run_training_loop` owns the timing/saving logic once.
 """
 
 import dataclasses
@@ -21,11 +15,9 @@ import jax
 import jax.numpy as jnp
 import optax
 import structlog
-import yaml
 from pydantic import BaseModel
 
-from nanodiffusion.checkpoint import save_checkpoint
-from nanodiffusion.config import Config, ModelConfig
+from nanodiffusion.checkpoint import save_checkpoint, write_config
 from nanodiffusion.data.cursors import LoaderCursor
 from nanodiffusion.data.loader import prefetch
 from nanodiffusion.model import DiffusionModel
@@ -39,52 +31,12 @@ def make_run_id() -> str:
     return datetime.datetime.now(tz=datetime.UTC).strftime("%Y%m%d-%H%M%S")
 
 
-def write_config(run_dir: Path, config: BaseModel) -> None:
-    """Dump a resolved pydantic config to ``run_dir/config.yaml``.
-
-    Uses ``model_dump(mode="json")`` so ``Path`` and other non-yaml
-    types serialize cleanly — matches what :func:`yaml.safe_load` will
-    accept back when we reload the config at sampling time.
-    """
-    (run_dir / "config.yaml").write_text(yaml.dump(config.model_dump(mode="json")))
-
-
-def resolve_model_config_from_checkpoint(
-    checkpoint: Path,
-    *,
-    fallback: ModelConfig,
-    log_event: str,
-) -> ModelConfig:
-    """Pick up a checkpoint's ``config.yaml`` model section when present.
-
-    The sidecar is the authoritative source for model shape because the
-    on-disk weights were produced under it. If the user-supplied
-    ``fallback`` disagrees we warn under ``log_event`` and keep going
-    under the sidecar — deserialising into a mismatched skeleton would
-    fail noisily one line later anyway, which is the right failure
-    mode. Missing sidecar falls back silently: hand-constructed
-    checkpoints in tests don't need one to work.
-    """
-    sidecar = checkpoint / "config.yaml"
-    if not sidecar.exists():
-        return fallback
-    from_disk = Config.from_yaml(sidecar)
-    if from_disk.model != fallback:
-        logger.warning(
-            log_event,
-            using=from_disk.model.model_dump(),
-            ignored=fallback.model_dump(),
-        )
-    return from_disk.model
-
-
 def resolve_run_dir(run_dir_root: Path, *, resume_from: Path | None) -> Path:
     """Fresh timestamped run dir, or reuse ``resume_from.parent`` on resume.
 
-    Either way the returned directory exists on disk; callers are
-    expected to drop their own ``config.yaml`` / logger.info lines on
-    top so that pretrain and SFT can keep their event-name and log-field
-    conventions separate.
+    The returned directory exists on disk; callers drop their own
+    ``config.yaml`` and ``logger.info`` on top so pretrain and SFT keep
+    their event-name conventions separate.
     """
     if resume_from is not None:
         run_dir = resume_from.parent.resolve()
@@ -98,10 +50,9 @@ def resolve_run_dir(run_dir_root: Path, *, resume_from: Path | None) -> Path:
 class StepStats:
     """Per-step metrics returned by the batch-prepare hook.
 
-    ``supervised_tokens`` is non-zero only for SFT, where the loader's
-    ``loss_mask`` picks out which positions actually contribute
-    gradient. Pretrain leaves it at 0 and the loop omits the derived
-    ``supervised_tok_per_s`` field from its log output in that case.
+    ``supervised_tokens`` is non-zero only for SFT; pretrain leaves it
+    at 0 and the loop omits the derived ``supervised_tok_per_s`` field
+    from its log output in that case.
     """
 
     supervised_tokens: int = 0
@@ -123,9 +74,9 @@ class LoopHyperparams:
 class LoopState[M: DiffusionModel, C: LoaderCursor]:
     """Mutable per-iteration state threaded through the loop body.
 
-    Not a JAX pytree — equinox never sees this; it's plain Python so
-    the loop can update ``step`` / ``cursor`` / ``last_saved_step``
-    with normal assignment between jit'd train-step calls.
+    Plain Python — not a JAX pytree — so the loop can update
+    ``step`` / ``cursor`` / ``last_saved_step`` with normal
+    assignment between JIT'd train-step calls.
     """
 
     model: M
@@ -158,15 +109,13 @@ def run_training_loop[M: DiffusionModel, B, JB, C: LoaderCursor](
 ) -> None:
     """Drive the training loop in place.
 
-    Mutates ``state`` (model, ema, opt_state, key, step, cursor) via
-    Python assignment between JIT'd train-step calls; the function is
-    deliberately *not* JIT'd so the prefetch thread, logging, and
-    checkpointing can interleave with device work cleanly.
-
-    The throughput window is reset once after the first post-compile
-    step so JIT compile latency is excluded from the first ``tok_per_s``
-    report, and the end-of-training save is skipped when a periodic
-    save already landed on the terminal step.
+    Deliberately not JIT'd: mutates ``state`` via Python assignment
+    between JIT'd train-step calls so prefetch, logging, and
+    checkpointing interleave with device work. The throughput window is
+    reset once after the first post-compile step so JIT compile latency
+    is excluded from the first ``tok_per_s`` report; the end-of-training
+    save is skipped when a periodic save already landed on the terminal
+    step.
     """
     initial_step = state.step
     last_log_step = state.step
