@@ -7,6 +7,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
+from nanodiffusion.chat import Conversation
 from nanodiffusion.checkpoint import save_checkpoint
 from nanodiffusion.config import Config, ModelConfig, SFTConfig, SFTDatasetConfig
 from nanodiffusion.data.chat_datasets import CHAT_DATASETS, register_chat
@@ -177,7 +178,7 @@ def test_make_sft_train_step_narrows_via_sfttrainstepfn_annotation(
     assert jnp.isfinite(loss)
 
 
-def _make_sft_conv(i: int) -> dict[str, list[dict[str, str]]]:
+def _make_sft_conv(i: int) -> Conversation:
     return {
         "messages": [
             {"role": "user", "content": f"q{i}"},
@@ -193,7 +194,7 @@ def _tiny_inmem_factory(
     download_options: DownloadOptions | None = None,
 ) -> ChatSource:
     del data_dir, download, download_options
-    return InMemoryChatSource([_make_sft_conv(i) for i in range(8)])  # pyright: ignore[reportArgumentType]
+    return InMemoryChatSource([_make_sft_conv(i) for i in range(8)])
 
 
 @pytest.fixture
@@ -232,7 +233,7 @@ def test_sft_finetune_end_to_end_smoke(
         step=0,
         cursor=None,
     )
-    # Drop a config.yaml alongside so _resolve_model_skeleton reads it.
+    # Drop a config.yaml alongside so _resolve_model_config reads it.
     import yaml  # noqa: PLC0415
 
     ckpt_config = Config(model=small_config)
@@ -254,10 +255,102 @@ def test_sft_finetune_end_to_end_smoke(
         ),
     )
 
-    run_dir = sft_finetune(sft_config, checkpoint=ckpt_dir)
+    run_dir = sft_finetune(sft_config, pretrain_checkpoint=ckpt_dir)
     assert run_dir.exists()
     assert (run_dir / "config.yaml").exists()
     assert (run_dir / "latest").exists()
     # max_steps=3 with save_every=2 → step_2/ exists, step_3/ final save
     step_dirs = sorted(d.name for d in run_dir.iterdir() if d.name.startswith("step_"))
     assert step_dirs, f"no step_ dirs in {run_dir}"
+
+
+def test_sft_finetune_requires_exactly_one_start_point(
+    small_config: ModelConfig, tmp_path: Path, tiny_chat_factory: str
+) -> None:
+    """Passing both or neither of the start-point kwargs must fail fast."""
+    sft_config = Config(
+        model=small_config,
+        sft=SFTConfig(
+            warmup_steps=1,
+            max_steps=3,
+            batch_size=2,
+            datasets=[SFTDatasetConfig(name=tiny_chat_factory)],
+            run_dir=tmp_path / "sft_runs",
+        ),
+    )
+    with pytest.raises(ValueError, match="got neither"):
+        sft_finetune(sft_config)
+    with pytest.raises(ValueError, match="got both"):
+        sft_finetune(
+            sft_config,
+            pretrain_checkpoint=tmp_path / "a",
+            resume_from=tmp_path / "b",
+        )
+
+
+def test_sft_finetune_resumes_from_saved_sft_checkpoint(
+    small_config: ModelConfig, tmp_path: Path, tiny_chat_factory: str
+) -> None:
+    """Run → interrupt → resume: the second run must pick up where the first left off.
+
+    End-to-end guarantee that opt_state, EMA, step counter, and SFT
+    cursor all survive the save/load roundtrip. The saved checkpoint's
+    cursor drives the loader's permutation fast-forward so resume does
+    not re-ingest the same conversations.
+    """
+    import yaml  # noqa: PLC0415
+
+    pretrain_dir = tmp_path / "pretrain_latest"
+    key = jax.random.PRNGKey(0)
+    model = Transformer(small_config, key=key)
+    pretrain_optimizer, _ = make_optimizer(SFTConfig(warmup_steps=1, max_steps=5))
+    pretrain_opt_state = pretrain_optimizer.init(
+        eqx.filter(model, eqx.is_inexact_array)
+    )
+    save_checkpoint(
+        pretrain_dir,
+        model=model,
+        ema_model=model,
+        opt_state=pretrain_opt_state,
+        step=0,
+        cursor=None,
+    )
+    (pretrain_dir / "config.yaml").write_text(
+        yaml.dump(Config(model=small_config).model_dump(mode="json"))
+    )
+
+    # First run stops cleanly at step 2 (max_steps == save_every), so
+    # the periodic save and the end-of-training save collapse into a
+    # single step_2 checkpoint and there's no step_4/step_6 lying
+    # around to collide with the resumed run's new saves.
+    first_config = Config(
+        model=small_config,
+        sft=SFTConfig(
+            warmup_steps=1,
+            max_steps=2,
+            batch_size=2,
+            log_every=1,
+            save_every=2,
+            run_dir=tmp_path / "sft_runs",
+            datasets=[SFTDatasetConfig(name=tiny_chat_factory)],
+            prefetch_size=1,
+        ),
+    )
+    first_run = sft_finetune(first_config, pretrain_checkpoint=pretrain_dir)
+    mid_ckpt = first_run / "step_2"
+    assert mid_ckpt.exists(), sorted(p.name for p in first_run.iterdir())
+
+    # Second run resumes and trains to step 6 → expect fresh step_4 + step_6.
+    resumed_config = first_config.model_copy(
+        update={"sft": first_config.sft.model_copy(update={"max_steps": 6})}
+    )
+    second_run = sft_finetune(resumed_config, resume_from=mid_ckpt)
+    # Resume reuses the same run dir per resolve_run_dir semantics.
+    assert second_run == first_run
+
+    final_ckpts = sorted(
+        d.name for d in second_run.iterdir() if d.name.startswith("step_")
+    )
+    assert "step_2" in final_ckpts
+    assert "step_4" in final_ckpts
+    assert "step_6" in final_ckpts

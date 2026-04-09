@@ -1,6 +1,5 @@
 from itertools import islice
 from pathlib import Path
-from typing import TYPE_CHECKING
 
 import jax.numpy as jnp
 import numpy as np
@@ -12,8 +11,9 @@ from nanodiffusion.checkpoint import (
     load_checkpoint,
     save_checkpoint,
 )
-from nanodiffusion.config import ModelConfig
+from nanodiffusion.config import ModelConfig, SFTConfig
 from nanodiffusion.data.chat_source import InMemoryChatSource
+from nanodiffusion.data.cursors import SFTCursor
 from nanodiffusion.data.sft_loader import (
     SFTBatchOutput,
     SFTJaxBatch,
@@ -22,9 +22,6 @@ from nanodiffusion.data.sft_loader import (
 from nanodiffusion.model.transformer import Transformer
 from nanodiffusion.pretrain.train import make_optimizer
 from nanodiffusion.tokenizer import Tokenizer
-
-if TYPE_CHECKING:
-    from nanodiffusion.data.source import SourcePosition
 
 
 def _short_conv(i: int) -> Conversation:
@@ -174,12 +171,12 @@ def test_epoch_wraps_around(tok: Tokenizer) -> None:
     src = _make_source(n=5)
     loader = sft_loader(src, tok, batch_size=2, seq_len=48, seed=3)
     batches = list(islice(loader, 4))  # 4 batches of 2 rows each = 8 rows > 5 src
-    final_epoch = batches[-1].state["epoch"]
+    final_epoch = batches[-1].state.epoch
     assert final_epoch >= 2
 
 
 def test_to_jax_drops_cursor(tok: Tokenizer) -> None:
-    """SFTJaxBatch must be a clean pytree without the host-side SourcePosition."""
+    """SFTJaxBatch must be a clean pytree without the host-side cursor."""
     src = _make_source()
     loader = sft_loader(src, tok, batch_size=2, seq_len=32)
     batch = next(loader)
@@ -195,13 +192,14 @@ def test_cursor_roundtrip_through_checkpoint(
 ) -> None:
     """Save the loader's cursor via CheckpointMeta, reload, continue.
 
-    Verifies the ``SourcePosition`` TypedDict reuse between pretrain and
-    SFT survives the pydantic json roundtrip, and that resuming from the
-    cursor yields the same next batch as continuing a non-saved loader.
+    Verifies the :class:`SFTCursor` discriminated-union variant survives
+    the pydantic JSON roundtrip, and that resuming from the cursor
+    yields the same next batch as continuing a non-saved loader.
     """
     src = _make_source()
     first = next(sft_loader(src, tok, batch_size=2, seq_len=32, seed=9))
     cursor = first.state
+    assert isinstance(cursor, SFTCursor)
 
     import jax  # noqa: PLC0415
 
@@ -209,19 +207,7 @@ def test_cursor_roundtrip_through_checkpoint(
     model = Transformer(small_config, key=model_key)
     import equinox as eqx  # noqa: PLC0415
 
-    optimizer, _ = make_optimizer(
-        type(
-            "_HP",
-            (),
-            {
-                "learning_rate": 1e-4,
-                "warmup_steps": 1,
-                "max_steps": 10,
-                "weight_decay": 0.0,
-                "grad_clip": 1.0,
-            },
-        )()
-    )
+    optimizer, _ = make_optimizer(SFTConfig(warmup_steps=1, max_steps=10))
     opt_state = optimizer.init(eqx.filter(model, eqx.is_inexact_array))
 
     ckpt_dir = tmp_path / "step_1"
@@ -234,10 +220,13 @@ def test_cursor_roundtrip_through_checkpoint(
         cursor=cursor,
     )
     _m, _e, _o, meta = load_checkpoint(
-        ckpt_dir, model_skeleton=model, opt_state_skeleton=opt_state
+        ckpt_dir,
+        model_skeleton=model,
+        opt_state_builder=lambda m: optimizer.init(eqx.filter(m, eqx.is_inexact_array)),
     )
     assert isinstance(meta, CheckpointMeta)
     assert meta.cursor == cursor
+    assert isinstance(meta.cursor, SFTCursor)
 
     resumed = next(
         sft_loader(src, tok, batch_size=2, seq_len=32, seed=9, resume_state=meta.cursor)
@@ -265,11 +254,12 @@ def test_batch_output_is_frozen(tok: Tokenizer) -> None:
         batch.tokens = np.zeros_like(batch.tokens)  # type: ignore[misc]
 
 
-def test_resume_state_type_matches_source_position(tok: Tokenizer) -> None:
-    """The cursor dict produced must be a valid SourcePosition TypedDict."""
+def test_resume_state_is_sft_cursor(tok: Tokenizer) -> None:
+    """The cursor produced must be an :class:`SFTCursor` with the right shape."""
     src = _make_source()
     loader = sft_loader(src, tok, batch_size=2, seq_len=32)
     batch = next(loader)
-    state: SourcePosition = batch.state
-    assert set(state.keys()) == {"epoch", "shard_idx", "row_group_idx"}
-    assert state["shard_idx"] == 0
+    assert isinstance(batch.state, SFTCursor)
+    assert batch.state.kind == "sft"
+    assert batch.state.epoch >= 1
+    assert batch.state.permutation_idx >= 0

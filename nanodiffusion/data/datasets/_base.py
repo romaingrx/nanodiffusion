@@ -1,7 +1,9 @@
-"""Named pretraining datasets.
+"""Shared primitives for pretrain dataset factories.
 
-This is the only module that knows about Hugging Face; ``source.py`` stays
-offline-pure so its tests never touch the network.
+All network-touching code lives here so ``source.py`` stays offline-pure
+and its tests never fetch from the hub. Per-dataset modules
+(``fineweb_edu.py``, ``climbmix_400b.py``, ...) only declare the spec
+and register it on import.
 """
 
 from collections.abc import Callable, Iterable
@@ -13,6 +15,7 @@ from typing import Protocol, runtime_checkable
 import pyarrow as pa
 import pyarrow.parquet as pq
 
+from nanodiffusion.data.registry import Registry
 from nanodiffusion.data.source import ParquetTextSource, TextSource
 
 
@@ -37,25 +40,11 @@ class DatasetFactory(Protocol):
     ) -> TextSource: ...
 
 
-DATASETS: dict[str, DatasetFactory] = {}
-
-
-def register(name: str) -> Callable[[DatasetFactory], DatasetFactory]:
-    def decorator(fn: DatasetFactory) -> DatasetFactory:
-        if name in DATASETS:
-            msg = f"Dataset {name!r} already registered"
-            raise ValueError(msg)
-        DATASETS[name] = fn
-        return fn
-
-    return decorator
+DATASETS: Registry[DatasetFactory] = Registry("dataset")
 
 
 def get_dataset(name: str) -> DatasetFactory:
-    if name not in DATASETS:
-        available = ", ".join(sorted(DATASETS)) or "(none)"
-        msg = f"Unknown dataset {name!r}. Available: {available}"
-        raise KeyError(msg)
+    """Look up a registered dataset factory by name."""
     return DATASETS[name]
 
 
@@ -140,8 +129,6 @@ def validate_parquet(path: Path) -> None:
     transient network failure.
     """
     try:
-        # Touch metadata so parquet reads the footer instead of just opening
-        # the file handle.
         _ = pq.ParquetFile(path).metadata
     except (pa.ArrowException, OSError) as exc:
         msg = f"File at {path} is not a valid parquet"
@@ -197,31 +184,23 @@ def download_with_backoff(
     raise RuntimeError(msg) from last_exc
 
 
-@dataclass(frozen=True, slots=True)
-class _HFDataset:
-    repo_id: str
-    filename_pattern: str
-    num_shards: int  # train shards; val shard(s) follow
-    doc: str
+def register_hf_parquet(
+    *,
+    name: str,
+    repo_id: str,
+    filename_pattern: str,
+    num_shards: int,
+    doc: str,
+) -> DatasetFactory:
+    """Register an HF-hosted parquet dataset in one call.
 
+    Per-dataset modules only need this helper plus their own constants —
+    no class, no factory boilerplate — so adding a new dataset is a
+    handful of lines and a file name. The registered factory keeps the
+    one-line ``doc`` as its ``__doc__`` so ``nanodiffusion data list``
+    prints a useful description.
+    """
 
-_HF_REGISTRY: dict[str, _HFDataset] = {
-    "climbmix-400b": _HFDataset(
-        repo_id="karpathy/climbmix-400b-shuffle",
-        filename_pattern="shard_{index:05d}.parquet",
-        num_shards=6542,
-        doc="ClimbMix-400B (Karpathy). nanochat default. 6543 shards, last is val.",
-    ),
-    "fineweb-edu-10bt": _HFDataset(
-        repo_id="HuggingFaceFW/fineweb-edu",
-        filename_pattern="sample/10BT/{index:03d}_00000.parquet",
-        num_shards=13,
-        doc="FineWeb-Edu sample-10BT subset (HuggingFaceFW). 14 shards, last is val.",
-    ),
-}
-
-
-def _make_hf_factory(spec: _HFDataset) -> DatasetFactory:
     def factory(
         data_dir: Path,
         *,
@@ -230,20 +209,15 @@ def _make_hf_factory(spec: _HFDataset) -> DatasetFactory:
         download_options: DownloadOptions | None = None,
     ) -> ParquetTextSource:
         return parquet_from_huggingface(
-            repo_id=spec.repo_id,
-            filename_pattern=spec.filename_pattern,
-            train_indices=range(
-                num_train if num_train is not None else spec.num_shards
-            ),
-            val_indices=(spec.num_shards,),
+            repo_id=repo_id,
+            filename_pattern=filename_pattern,
+            train_indices=range(num_train if num_train is not None else num_shards),
+            val_indices=(num_shards,),
             data_dir=data_dir,
             download=download,
             options=download_options,
         )
 
-    factory.__doc__ = spec.doc
+    factory.__doc__ = doc
+    DATASETS.register(name)(factory)
     return factory
-
-
-for _name, _spec in _HF_REGISTRY.items():
-    register(_name)(_make_hf_factory(_spec))

@@ -7,7 +7,7 @@ are rendered once via :func:`nanodiffusion.chat.render_conversation`
 alternation), right-padded with EOS if they fit, or skipped if they
 don't. The loader is stateless across epochs modulo a seeded shuffle
 of the source's index space, so resuming from a saved
-:class:`SourcePosition` gives a deterministic continuation of the
+:class:`SFTCursor` gives a deterministic continuation of the
 iteration order.
 """
 
@@ -18,11 +18,10 @@ from dataclasses import dataclass
 import equinox as eqx
 import jax.numpy as jnp
 import numpy as np
-import structlog
 
 from nanodiffusion.chat import render_conversation
 from nanodiffusion.data.chat_source import ChatSource
-from nanodiffusion.data.source import SourcePosition
+from nanodiffusion.data.cursors import SFTCursor
 from nanodiffusion.tokenizer import Tokenizer
 from nanodiffusion.types import (
     MaskBatch,
@@ -30,8 +29,6 @@ from nanodiffusion.types import (
     NumpyTokenBatch,
     TokenBatch,
 )
-
-logger = structlog.get_logger(__name__)
 
 
 class SFTJaxBatch(eqx.Module):
@@ -57,7 +54,7 @@ class SFTBatchOutput:
 
     tokens: NumpyTokenBatch
     loss_mask: NumpyLossMaskBatch
-    state: SourcePosition
+    state: SFTCursor
 
     def to_jax(self) -> SFTJaxBatch:
         return SFTJaxBatch(
@@ -104,7 +101,7 @@ def sft_loader(
     batch_size: int,
     seq_len: int,
     seed: int = 42,
-    resume_state: SourcePosition | None = None,
+    resume_state: SFTCursor | None = None,
     max_empty_passes: int = 100,
 ) -> Iterator[SFTBatchOutput]:
     """Yield SFT batches from ``source`` indefinitely.
@@ -117,9 +114,8 @@ def sft_loader(
     pad), since EOS already means "document boundary" to the pretrained
     model.
 
-    ``resume_state`` fast-forwards into the middle of an epoch; the
-    cursor's ``row_group_idx`` is reused as the index within the
-    permutation order so resumption is deterministic.
+    ``resume_state`` fast-forwards into the middle of an epoch so
+    resumption is deterministic given the same seed.
 
     ``max_empty_passes`` bounds the number of consecutive skipped
     conversations (too long or no supervised tokens) before the loader
@@ -135,8 +131,8 @@ def sft_loader(
         raise ValueError(err)
 
     eos = tokenizer.eos_token_id
-    epoch = resume_state["epoch"] if resume_state is not None else 1
-    cursor = resume_state["row_group_idx"] + 1 if resume_state else 0
+    epoch = resume_state.epoch if resume_state is not None else 1
+    cursor = resume_state.permutation_idx + 1 if resume_state is not None else 0
     permutation = _epoch_permutation(seed, epoch, n)
     consecutive_skips = 0
 
@@ -175,9 +171,5 @@ def sft_loader(
         yield SFTBatchOutput(
             tokens=np.stack(rows_tokens),
             loss_mask=np.stack(rows_mask),
-            state={
-                "epoch": epoch,
-                "shard_idx": 0,
-                "row_group_idx": last_idx_in_epoch,
-            },
+            state=SFTCursor(epoch=epoch, permutation_idx=last_idx_in_epoch),
         )

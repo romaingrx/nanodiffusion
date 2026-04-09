@@ -8,12 +8,16 @@ from nanodiffusion.data.chat_datasets import (
     ChatDatasetFactory,
     HuggingFaceChatSource,
     JsonlChatSource,
-    _gsm8k_row_to_conversation,
-    _normalize_message,
-    _smoltalk_row_to_conversation,
-    _strip_gsm8k_tool_calls,
     get_chat_dataset,
+    normalize_message,
     register_chat,
+)
+from nanodiffusion.data.chat_datasets.gsm8k import (
+    row_to_conversation as gsm8k_row_to_conversation,
+)
+from nanodiffusion.data.chat_datasets.gsm8k import strip_tool_calls
+from nanodiffusion.data.chat_datasets.smoltalk import (
+    row_to_conversation as smoltalk_row_to_conversation,
 )
 from nanodiffusion.data.chat_source import ChatSource
 from nanodiffusion.data.datasets import DownloadOptions
@@ -45,7 +49,7 @@ def _smoltalk_dataset_fixture() -> Dataset:
 
 def test_huggingface_chat_source_len_and_getitem() -> None:
     src = HuggingFaceChatSource(
-        _smoltalk_dataset_fixture(), _smoltalk_row_to_conversation
+        _smoltalk_dataset_fixture(), smoltalk_row_to_conversation
     )
     assert len(src) == 2
     first = src[0]
@@ -56,7 +60,7 @@ def test_huggingface_chat_source_len_and_getitem() -> None:
 def test_huggingface_chat_source_rejects_empty_dataset() -> None:
     empty = Dataset.from_dict({"messages": []})
     with pytest.raises(ValueError, match="empty dataset"):
-        HuggingFaceChatSource(empty, _smoltalk_row_to_conversation)
+        HuggingFaceChatSource(empty, smoltalk_row_to_conversation)
 
 
 def test_smoltalk_row_preserves_system_message_for_later_merge() -> None:
@@ -70,7 +74,7 @@ def test_smoltalk_row_preserves_system_message_for_later_merge() -> None:
             {"role": "assistant", "content": "A"},
         ],
     }
-    conv = _smoltalk_row_to_conversation(row)
+    conv = smoltalk_row_to_conversation(row)
     roles = [m["role"] for m in conv["messages"]]
     assert roles == ["system", "user", "assistant"]
 
@@ -78,17 +82,17 @@ def test_smoltalk_row_preserves_system_message_for_later_merge() -> None:
 def test_smoltalk_row_raises_on_short_conversation() -> None:
     row = {"messages": [{"role": "user", "content": "solo"}]}
     with pytest.raises(ValueError, match="fewer than 2"):
-        _smoltalk_row_to_conversation(row)
+        smoltalk_row_to_conversation(row)
 
 
-def test_normalize_message_rejects_unknown_role() -> None:
+def testnormalize_message_rejects_unknown_role() -> None:
     with pytest.raises(ValueError, match="unsupported role"):
-        _normalize_message({"role": "tool", "content": "x"})
+        normalize_message({"role": "tool", "content": "x"})
 
 
-def test_normalize_message_rejects_non_string_content() -> None:
-    with pytest.raises(TypeError, match="bad role/content"):
-        _normalize_message({"role": "user", "content": 42})
+def testnormalize_message_rejects_non_string_content() -> None:
+    with pytest.raises(TypeError, match="bad content type"):
+        normalize_message({"role": "user", "content": 42})
 
 
 def test_gsm8k_row_strips_tool_markers() -> None:
@@ -100,7 +104,7 @@ def test_gsm8k_row_strips_tool_markers() -> None:
             "#### 10"
         ),
     }
-    conv = _gsm8k_row_to_conversation(row)
+    conv = gsm8k_row_to_conversation(row)
     assistant = conv["messages"][-1]
     assert "<<" not in assistant["content"]
     assert ">>" not in assistant["content"]
@@ -114,14 +118,14 @@ def test_gsm8k_flattening_does_not_eat_bare_delimiters() -> None:
     ``>>`` in natural text from being silently consumed.
     """
     answer = "The quoted snippet was '<<not a tool call>> says the book'. #### 0"
-    stripped = _strip_gsm8k_tool_calls(answer)
+    stripped = strip_tool_calls(answer)
     assert stripped == answer
 
 
 def test_gsm8k_flattening_handles_empty_expression() -> None:
     """A truly broken marker should still strip cleanly, not raise."""
     answer = "Some weird <<=>> marker. #### 1"
-    stripped = _strip_gsm8k_tool_calls(answer)
+    stripped = strip_tool_calls(answer)
     assert "<<" not in stripped
     assert "#### 1" in stripped
 

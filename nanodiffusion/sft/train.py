@@ -1,34 +1,39 @@
 """SFT training loop: JIT train step + end-to-end ``sft_finetune`` driver.
 
-Shares the optimizer factory and EMA helper with
-:mod:`nanodiffusion.pretrain.train` via structural typing
-(:class:`nanodiffusion.config.OptimizerHyperparams`) and the small
-run-dir helpers in :mod:`nanodiffusion._loop_utils`. The loop body is
-deliberately duplicated from the pretrain path — it is ~40 lines of
-mostly-linear state mutation, and sharing it would force a
-``BatchAdapter`` indirection that hurts readability more than it helps.
+Shares the loop body, optimizer factory, EMA helper, and run-dir
+plumbing with :mod:`nanodiffusion.pretrain.train` via
+:mod:`nanodiffusion.loop`. This file owns the SFT-specific bits: the
+JIT train step (which unpacks ``SFTJaxBatch`` tokens + loss_mask), the
+batch-prepare callback that surfaces the supervised-token count, and
+the top-level ``sft_finetune`` driver that distinguishes a fresh
+fine-tune from pretrain vs a resumed SFT run.
 """
 
 import dataclasses
-import time
-from collections.abc import Callable, Iterator
 from pathlib import Path
 
 import equinox as eqx
 import jax
-import jax.numpy as jnp
 import optax
 import structlog
 
-from nanodiffusion._loop_utils import make_run_id, write_config
-from nanodiffusion.checkpoint import load_model, save_checkpoint
+from nanodiffusion.checkpoint import load_checkpoint, load_model
 from nanodiffusion.config import Config
 from nanodiffusion.data.chat_datasets import get_chat_dataset
 from nanodiffusion.data.chat_source import ChatSource, TaskMixture
-from nanodiffusion.data.loader import prefetch
+from nanodiffusion.data.cursors import SFTCursor
 from nanodiffusion.data.sft_loader import SFTBatchOutput, SFTJaxBatch, sft_loader
-from nanodiffusion.data.source import SourcePosition
-from nanodiffusion.model import DiffusionModel, Transformer
+from nanodiffusion.loop import (
+    LoopHyperparams,
+    LoopState,
+    StepStats,
+    TrainStepFn,
+    resolve_model_config_from_checkpoint,
+    resolve_run_dir,
+    run_training_loop,
+    write_config,
+)
+from nanodiffusion.model import DiffusionModel, Transformer, transformer_skeleton
 from nanodiffusion.pretrain.train import ema_update, make_optimizer
 from nanodiffusion.schedule import LogLinearSchedule, NoiseSchedule
 from nanodiffusion.sft.loss import compute_sft_loss
@@ -38,10 +43,7 @@ from nanodiffusion.types import PRNGKeyArray, Scalar
 logger = structlog.get_logger(__name__)
 
 
-type SFTTrainStepFn[M: DiffusionModel] = Callable[
-    [M, M, optax.OptState, SFTJaxBatch, PRNGKeyArray],
-    tuple[M, M, optax.OptState, Scalar],
-]
+type SFTTrainStepFn[M: DiffusionModel] = TrainStepFn[M, SFTJaxBatch]
 
 
 def make_sft_train_step[M: DiffusionModel](
@@ -89,6 +91,19 @@ def make_sft_train_step[M: DiffusionModel](
     return train_step
 
 
+def _prepare_sft_batch(
+    batch: SFTBatchOutput,
+) -> tuple[SFTJaxBatch, SFTCursor, StepStats]:
+    """Host → JAX conversion for SFT batches.
+
+    ``supervised_tokens`` is counted from the numpy-side ``loss_mask``
+    *before* :meth:`SFTBatchOutput.to_jax` to avoid a JAX→host sync on
+    every step in the training loop.
+    """
+    supervised = int(batch.loss_mask.sum())
+    return batch.to_jax(), batch.state, StepStats(supervised_tokens=supervised)
+
+
 def _build_task_mixture(config: Config) -> TaskMixture:
     """Resolve ``config.sft.datasets`` into a seeded :class:`TaskMixture`.
 
@@ -104,46 +119,139 @@ def _build_task_mixture(config: Config) -> TaskMixture:
     return TaskMixture(sources, seed=config.sft.seed)
 
 
-def _resolve_model_skeleton(checkpoint: Path, config: Config) -> Transformer:
-    """Build a Transformer skeleton shape-matching the saved checkpoint.
+@dataclasses.dataclass(frozen=True, slots=True)
+class _SFTInitialState:
+    """Everything :func:`sft_finetune`'s loop needs at step 0.
 
-    Reads ``<checkpoint>/config.yaml`` when available and uses its
-    ``model`` section, logging a warning if it differs from the current
-    SFT config. Falls back to the current config if the checkpoint
-    directory has no sidecar — the resulting shape mismatch will raise
-    at deserialization time, which is the right failure mode.
+    The single-struct return from :func:`_load_sft_initial_state` keeps
+    the narrowing + raise logic around ``pretrain_checkpoint`` /
+    ``resume_from`` in one place so the main driver never juggles the
+    ``Path | None`` pair directly.
     """
-    ckpt_config_path = checkpoint / "config.yaml"
-    model_config = config.model
-    if ckpt_config_path.exists():
-        ckpt_config = Config.from_yaml(ckpt_config_path)
-        if ckpt_config.model != config.model:
-            logger.warning(
-                "sft_model_config_override",
-                using=ckpt_config.model.model_dump(),
-                ignored=config.model.model_dump(),
-            )
-        model_config = ckpt_config.model
-    key = jax.random.PRNGKey(config.sft.seed)
-    return Transformer(model_config, key=key)
 
-
-@dataclasses.dataclass
-class _SFTLoopState[M: DiffusionModel]:
-    """Mutable state threaded through the SFT loop body."""
-
-    model: M
-    ema_model: M
+    model: Transformer
+    ema_model: Transformer
     opt_state: optax.OptState
-    key: PRNGKeyArray
     step: int
-    cursor: SourcePosition | None
-    last_saved_step: int | None = None
+    cursor: SFTCursor | None
 
 
-def _init_sft_run_dir(config: Config, *, starting_step: int) -> Path:
-    run_dir = config.sft.run_dir / make_run_id()
-    run_dir.mkdir(parents=True, exist_ok=True)
+def _load_sft_initial_state(
+    config: Config,
+    optimizer: optax.GradientTransformation,
+    *,
+    pretrain_checkpoint: Path | None,
+    resume_from: Path | None,
+) -> _SFTInitialState:
+    """Validate the starting-point XOR and load weights into one state.
+
+    Exactly one of ``pretrain_checkpoint`` or ``resume_from`` must be
+    non-``None``; any other combination raises :class:`ValueError`. On
+    resume, the saved cursor must be an :class:`SFTCursor` — a
+    pretrain cursor lands here only if a user mistakenly points the
+    ``--resume-from`` flag at a pretrain run, and we refuse it loudly.
+    """
+    if pretrain_checkpoint is not None and resume_from is not None:
+        msg = (
+            "sft_finetune requires exactly one of 'pretrain_checkpoint' "
+            "or 'resume_from' (got both)"
+        )
+        raise ValueError(msg)
+    if pretrain_checkpoint is not None:
+        return _load_fresh_sft_state(config, optimizer, pretrain_checkpoint)
+    if resume_from is not None:
+        return _load_resumed_sft_state(config, optimizer, resume_from)
+    msg = (
+        "sft_finetune requires exactly one of 'pretrain_checkpoint' "
+        "or 'resume_from' (got neither)"
+    )
+    raise ValueError(msg)
+
+
+def _load_fresh_sft_state(
+    config: Config,
+    optimizer: optax.GradientTransformation,
+    checkpoint: Path,
+) -> _SFTInitialState:
+    model_config = resolve_model_config_from_checkpoint(
+        checkpoint,
+        fallback=config.model,
+        log_event="sft_model_config_override",
+    )
+    skeleton = transformer_skeleton(model_config)
+    model = load_model(checkpoint, model_skeleton=skeleton, which="model")
+    opt_state = optimizer.init(eqx.filter(model, eqx.is_inexact_array))
+    return _SFTInitialState(
+        model=model,
+        ema_model=model,
+        opt_state=opt_state,
+        step=0,
+        cursor=None,
+    )
+
+
+def _load_resumed_sft_state(
+    config: Config,
+    optimizer: optax.GradientTransformation,
+    checkpoint: Path,
+) -> _SFTInitialState:
+    model_config = resolve_model_config_from_checkpoint(
+        checkpoint,
+        fallback=config.model,
+        log_event="sft_model_config_override",
+    )
+    skeleton = transformer_skeleton(model_config)
+
+    def build_opt_state(m: Transformer) -> optax.OptState:
+        return optimizer.init(eqx.filter(m, eqx.is_inexact_array))
+
+    model, ema_model, opt_state, meta = load_checkpoint(
+        checkpoint,
+        model_skeleton=skeleton,
+        opt_state_builder=build_opt_state,
+    )
+    cursor = meta.require_cursor(SFTCursor)
+    logger.info("sft_resumed", path=str(checkpoint), step=meta.step)
+    return _SFTInitialState(
+        model=model,
+        ema_model=ema_model,
+        opt_state=opt_state,
+        step=meta.step,
+        cursor=cursor,
+    )
+
+
+def sft_finetune(
+    config: Config,
+    *,
+    pretrain_checkpoint: Path | None = None,
+    resume_from: Path | None = None,
+) -> Path:
+    """Run an SFT fine-tuning job end-to-end.
+
+    Exactly one of ``pretrain_checkpoint`` or ``resume_from`` must be
+    provided:
+
+    * ``pretrain_checkpoint`` — start a fresh SFT run from a pretrain
+      checkpoint. Loads the raw model weights (``which="model"``, not
+      EMA — EMA is a sampling-time smoothing artifact that would lag
+      the optimizer's starting point) and builds a fresh EMA,
+      optimizer state, step counter, and cursor.
+    * ``resume_from`` — continue an interrupted SFT run. Loads model,
+      EMA, optimizer state, and cursor from the saved checkpoint and
+      resumes the loader at the saved permutation index so no
+      conversations are re-ingested.
+    """
+    optimizer, lr_schedule = make_optimizer(config.sft)
+    start = _load_sft_initial_state(
+        config,
+        optimizer,
+        pretrain_checkpoint=pretrain_checkpoint,
+        resume_from=resume_from,
+    )
+
+    tok = Tokenizer(encode_threads=config.sft.tokenizer_threads)
+    run_dir = resolve_run_dir(config.sft.run_dir, resume_from=resume_from)
     write_config(run_dir, config)
     logger.info(
         "sft_start",
@@ -152,121 +260,9 @@ def _init_sft_run_dir(config: Config, *, starting_step: int) -> Path:
         max_steps=config.sft.max_steps,
         batch_size=config.sft.batch_size,
         seq_len=config.model.max_seq_len,
-        starting_step=starting_step,
+        starting_step=start.step,
+        resumed=resume_from is not None,
     )
-    return run_dir
-
-
-def _run_sft_loop[M: DiffusionModel](
-    state: _SFTLoopState[M],
-    *,
-    config: Config,
-    run_dir: Path,
-    train_step: SFTTrainStepFn[M],
-    lr_schedule: optax.Schedule,
-    base_loader: Iterator[SFTBatchOutput],
-) -> None:
-    """Inner SFT training loop.
-
-    Mirrors :func:`nanodiffusion.pretrain.train._run_loop`'s shape — the
-    duplication is deliberate; see the module docstring for rationale.
-    Throughput logging reports both nominal ``tok_per_s`` (fixed-per-step,
-    same as pretrain) and ``supervised_tok_per_s`` derived from the
-    batch's loss_mask, since SFT's effective learning signal per step is
-    a fraction of ``batch_size * seq_len``.
-    """
-    initial_step = state.step
-    last_log_step = state.step
-    nominal_tokens_per_step = config.sft.batch_size * config.model.max_seq_len
-    supervised_tokens_in_window = 0
-
-    def _save() -> None:
-        ckpt_dir = run_dir / f"step_{state.step}"
-        save_checkpoint(
-            ckpt_dir,
-            model=state.model,
-            ema_model=state.ema_model,
-            opt_state=state.opt_state,
-            step=state.step,
-            cursor=state.cursor,
-            update_latest=True,
-        )
-        write_config(ckpt_dir, config)
-        state.last_saved_step = state.step
-        logger.info("checkpoint_saved", path=str(ckpt_dir), step=state.step)
-
-    t_window_start = time.monotonic()
-    with prefetch(base_loader, size=config.sft.prefetch_size) as loader:
-        for batch_output in loader:
-            if state.step >= config.sft.max_steps:
-                break
-            state.cursor = batch_output.state
-            batch = batch_output.to_jax()
-            supervised_tokens_in_window += int(batch.loss_mask.sum())
-            state.key, step_key = jax.random.split(state.key)
-            state.model, state.ema_model, state.opt_state, loss = train_step(
-                state.model, state.ema_model, state.opt_state, batch, step_key
-            )
-            state.step += 1
-
-            if state.step == initial_step + 1:
-                # First post-compile step: restart throughput window to
-                # exclude JIT compile time from the first tok/s report.
-                t_window_start = time.monotonic()
-                last_log_step = state.step
-                supervised_tokens_in_window = 0
-
-            if state.step % config.sft.log_every == 0 and state.step > last_log_step:
-                elapsed = time.monotonic() - t_window_start
-                steps_in_window = state.step - last_log_step
-                tok_per_s = int(
-                    steps_in_window * nominal_tokens_per_step / max(elapsed, 1e-9)
-                )
-                supervised_tok_per_s = int(
-                    supervised_tokens_in_window / max(elapsed, 1e-9)
-                )
-                logger.info(
-                    "train",
-                    step=state.step,
-                    loss=float(loss),
-                    lr=jnp.asarray(lr_schedule(state.step)).item(),
-                    tok_per_s=tok_per_s,
-                    supervised_tok_per_s=supervised_tok_per_s,
-                )
-                t_window_start = time.monotonic()
-                last_log_step = state.step
-                supervised_tokens_in_window = 0
-
-            if state.step % config.sft.save_every == 0:
-                _save()
-
-    if state.step > initial_step and state.last_saved_step != state.step:
-        _save()
-
-
-def sft_finetune(
-    config: Config,
-    *,
-    checkpoint: Path,
-) -> Path:
-    """Run an SFT fine-tuning job end-to-end.
-
-    Starts from the raw trained weights in ``<checkpoint>/model.eqx``
-    (``which="model"``, not the EMA — EMA is a sampling-time smoothing
-    artifact that would lag the optimizer's starting point). Builds a
-    fresh EMA, optimizer state, step counter, and cursor, so SFT is
-    always a logically new training run even though the model weights
-    are hot from pretrain.
-    """
-    skeleton = _resolve_model_skeleton(checkpoint, config)
-    model = load_model(checkpoint, model_skeleton=skeleton, which="model")
-    ema_model = model
-
-    optimizer, lr_schedule = make_optimizer(config.sft)
-    opt_state = optimizer.init(eqx.filter(model, eqx.is_inexact_array))
-
-    tok = Tokenizer(encode_threads=config.sft.tokenizer_threads)
-    run_dir = _init_sft_run_dir(config, starting_step=0)
 
     train_step = make_sft_train_step(
         optimizer,
@@ -282,24 +278,35 @@ def sft_finetune(
         batch_size=config.sft.batch_size,
         seq_len=config.model.max_seq_len,
         seed=config.sft.seed,
+        resume_state=start.cursor,
         max_empty_passes=config.sft.max_empty_passes,
     )
 
-    state = _SFTLoopState(
-        model=model,
-        ema_model=ema_model,
-        opt_state=opt_state,
+    state: LoopState[Transformer, SFTCursor] = LoopState(
+        model=start.model,
+        ema_model=start.ema_model,
+        opt_state=start.opt_state,
         key=jax.random.PRNGKey(config.sft.seed),
-        step=0,
-        cursor=None,
+        step=start.step,
+        cursor=start.cursor,
     )
-    _run_sft_loop(
+    settings = LoopHyperparams(
+        max_steps=config.sft.max_steps,
+        log_every=config.sft.log_every,
+        save_every=config.sft.save_every,
+        prefetch_size=config.sft.prefetch_size,
+        nominal_tokens_per_step=config.sft.batch_size * config.model.max_seq_len,
+        event_name="sft_train",
+    )
+    run_training_loop(
         state,
         config=config,
         run_dir=run_dir,
         train_step=train_step,
         lr_schedule=lr_schedule,
         base_loader=base_loader,
+        settings=settings,
+        prepare_batch=_prepare_sft_batch,
     )
 
     logger.info("sft_done", step=state.step, run_dir=str(run_dir))

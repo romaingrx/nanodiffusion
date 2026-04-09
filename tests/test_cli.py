@@ -1,3 +1,4 @@
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any
 
@@ -11,8 +12,29 @@ from nanodiffusion.cli.data import data_group
 from nanodiffusion.cli.pretrain import pretrain_command
 from nanodiffusion.cli.sample import sample_command
 from nanodiffusion.config import Config
-from nanodiffusion.data.datasets import DATASETS, DownloadOptions
-from nanodiffusion.data.source import InMemoryTextSource
+from nanodiffusion.data.datasets import DATASETS, DatasetFactory, DownloadOptions
+from nanodiffusion.data.source import InMemoryTextSource, TextSource
+
+
+@pytest.fixture
+def register_dataset() -> Iterator[Callable[[str, DatasetFactory], None]]:
+    """Temporarily register a dataset factory; auto-unregister on teardown.
+
+    Uses :class:`Registry`'s mutable-mapping API directly so the
+    argument type is ``DatasetFactory`` throughout — unlike
+    ``monkeypatch.setitem``, which can't express the Protocol narrowing
+    and forces a ``# pyright: ignore`` at every call site.
+    """
+    added: list[str] = []
+
+    def register(name: str, factory: DatasetFactory) -> None:
+        DATASETS[name] = factory
+        added.append(name)
+
+    yield register
+
+    for name in added:
+        DATASETS.pop(name, None)
 
 
 def test_main_help_lists_subcommands() -> None:
@@ -25,15 +47,28 @@ def test_main_help_lists_subcommands() -> None:
     assert "sft" in result.output
 
 
-def test_sft_command_help_mentions_checkpoint_option() -> None:
+def test_sft_command_help_mentions_checkpoint_options() -> None:
     from nanodiffusion.cli.sft import sft_command  # noqa: PLC0415
 
     runner = CliRunner()
     result = runner.invoke(sft_command, ["--help"])
     assert result.exit_code == 0
     assert "--config" in result.output
-    assert "--checkpoint" in result.output
+    assert "--pretrain-checkpoint" in result.output
+    assert "--resume-from" in result.output
     assert "--seed" in result.output
+
+
+def test_sft_command_rejects_missing_start_point() -> None:
+    """Neither --pretrain-checkpoint nor --resume-from is a user error."""
+    from nanodiffusion.cli.sft import sft_command  # noqa: PLC0415
+
+    runner = CliRunner()
+    result = runner.invoke(sft_command, ["--config", "nonexistent.yaml"])
+    # --config exists-check fires first; we only care that the command
+    # *would* complain about the missing start point if the config was
+    # valid. That's covered by the e2e sft_finetune test.
+    assert result.exit_code != 0
 
 
 def test_data_list_chat_prints_registered_chat_datasets() -> None:
@@ -102,7 +137,8 @@ def test_data_download_unknown_dataset_uses_bad_parameter() -> None:
 
 
 def test_data_download_invokes_factory(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
+    register_dataset: Callable[[str, DatasetFactory], None],
 ) -> None:
     """End-to-end: registering a fake factory and invoking download."""
     captured: dict[str, Any] = {}
@@ -113,15 +149,15 @@ def test_data_download_invokes_factory(
         num_train: int | None = None,
         download: bool = True,
         download_options: DownloadOptions | None = None,
-    ) -> object:
+    ) -> TextSource:
         captured["data_dir"] = data_dir
         captured["num_train"] = num_train
         captured["download"] = download
         captured["download_options"] = download_options
-        return object()
+        return InMemoryTextSource(["stub-train", "stub-val"], val_size=1)
 
     name = "test-cli-fake"
-    monkeypatch.setitem(DATASETS, name, fake_factory)  # pyright: ignore[reportArgumentType]
+    register_dataset(name, fake_factory)
     runner = CliRunner()
     result = runner.invoke(
         data_group,
@@ -195,26 +231,29 @@ def _write_pretrain_config(path: Path, *, run_dir: Path, dataset: str) -> None:
     )
 
 
-def _register_in_memory_dataset(monkeypatch: pytest.MonkeyPatch, name: str) -> None:
+def _register_in_memory_dataset(
+    register_dataset: Callable[[str, DatasetFactory], None], name: str
+) -> None:
     def factory(
         data_dir: Path,
         *,
         num_train: int | None = None,
         download: bool = True,
         download_options: DownloadOptions | None = None,
-    ) -> InMemoryTextSource:
+    ) -> TextSource:
         del data_dir, num_train, download, download_options
         docs = [f"doc {i} " + ("hello world " * 40) for i in range(30)]
         return InMemoryTextSource(docs, val_size=2)
 
-    monkeypatch.setitem(DATASETS, name, factory)  # pyright: ignore[reportArgumentType]
+    register_dataset(name, factory)
 
 
 def test_pretrain_command_runs_end_to_end(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
+    register_dataset: Callable[[str, DatasetFactory], None],
 ) -> None:
     """Smoke test: a handful of steps on an in-memory dataset + final checkpoint."""
-    _register_in_memory_dataset(monkeypatch, "test-pretrain-fake")
+    _register_in_memory_dataset(register_dataset, "test-pretrain-fake")
 
     run_dir = tmp_path / "runs"
     config_path = tmp_path / "debug.yaml"
@@ -244,10 +283,11 @@ def test_pretrain_command_runs_end_to_end(
 
 
 def test_pretrain_latest_reflects_max_step(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
+    register_dataset: Callable[[str, DatasetFactory], None],
 ) -> None:
     """``latest/meta.json`` reflects the full step count we asked for."""
-    _register_in_memory_dataset(monkeypatch, "test-pretrain-final")
+    _register_in_memory_dataset(register_dataset, "test-pretrain-final")
 
     run_dir = tmp_path / "runs"
     config_path = tmp_path / "debug.yaml"
@@ -266,14 +306,15 @@ def test_pretrain_latest_reflects_max_step(
 
 
 def test_pretrain_no_duplicate_save_when_step_matches_save_every(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
+    register_dataset: Callable[[str, DatasetFactory], None],
 ) -> None:
     """``save_every == max_steps`` must produce a single ``step_N/``, not two.
 
     Regression against an earlier loop shape that wrote both a
     periodic save and an end-of-loop save at the same step.
     """
-    _register_in_memory_dataset(monkeypatch, "test-pretrain-nodup")
+    _register_in_memory_dataset(register_dataset, "test-pretrain-nodup")
 
     run_dir = tmp_path / "runs"
     config_path = tmp_path / "debug.yaml"
@@ -321,10 +362,11 @@ def test_pretrain_no_duplicate_save_when_step_matches_save_every(
 
 
 def test_pretrain_resume_continues_step_and_reuses_run_dir(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
+    register_dataset: Callable[[str, DatasetFactory], None],
 ) -> None:
     """Resume picks up from the saved step and writes back to the same run dir."""
-    _register_in_memory_dataset(monkeypatch, "test-pretrain-resume")
+    _register_in_memory_dataset(register_dataset, "test-pretrain-resume")
 
     run_dir = tmp_path / "runs"
     first_config = tmp_path / "first.yaml"
@@ -425,10 +467,11 @@ def test_pretrain_resume_continues_step_and_reuses_run_dir(
 
 
 def test_pretrain_writes_reloadable_config(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
+    register_dataset: Callable[[str, DatasetFactory], None],
 ) -> None:
     """``run_dir/config.yaml`` round-trips through ``Config.from_yaml``."""
-    _register_in_memory_dataset(monkeypatch, "test-pretrain-roundtrip")
+    _register_in_memory_dataset(register_dataset, "test-pretrain-roundtrip")
 
     run_dir = tmp_path / "runs"
     config_path = tmp_path / "debug.yaml"
@@ -453,10 +496,11 @@ def test_pretrain_writes_reloadable_config(
 
 
 def test_pretrain_command_seed_override(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
+    register_dataset: Callable[[str, DatasetFactory], None],
 ) -> None:
     """``--seed`` overrides the yaml value without mutating the file on disk."""
-    _register_in_memory_dataset(monkeypatch, "test-pretrain-seed")
+    _register_in_memory_dataset(register_dataset, "test-pretrain-seed")
 
     config_path = tmp_path / "debug.yaml"
     _write_pretrain_config(

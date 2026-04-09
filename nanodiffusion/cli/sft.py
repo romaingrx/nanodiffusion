@@ -14,13 +14,24 @@ import click
     help="Path to a YAML config matching nanodiffusion.config.Config.",
 )
 @click.option(
-    "--checkpoint",
-    required=True,
+    "--pretrain-checkpoint",
     type=click.Path(exists=True, file_okay=False, path_type=Path),
+    default=None,
     help=(
-        "Directory of a pretrain checkpoint to fine-tune from. Can be an "
-        "explicit step dir (runs/pretrain/<id>/step_1000) or the 'latest' "
-        "symlink (runs/pretrain/<id>/latest)."
+        "Directory of a pretrain checkpoint to start fine-tuning from. "
+        "Mutually exclusive with --resume-from. Can be an explicit step "
+        "dir (runs/pretrain/<id>/step_1000) or the 'latest' symlink."
+    ),
+)
+@click.option(
+    "--resume-from",
+    type=click.Path(exists=True, file_okay=False, path_type=Path),
+    default=None,
+    help=(
+        "Directory of an interrupted SFT checkpoint to resume. "
+        "Mutually exclusive with --pretrain-checkpoint. The run "
+        "directory, optimizer state, EMA, step counter, and loader "
+        "cursor are all carried over from the saved run."
     ),
 )
 @click.option(
@@ -32,14 +43,23 @@ import click
 def sft_command(
     *,
     config_path: Path,
-    checkpoint: Path,
+    pretrain_checkpoint: Path | None,
+    resume_from: Path | None,
     seed: int | None,
 ) -> None:
-    """Run SFT on a pretrained checkpoint end-to-end."""
+    """Run SFT from a pretrain checkpoint or resume an interrupted run."""
     from nanodiffusion.config import Config  # noqa: PLC0415
     from nanodiffusion.sft import sft_finetune  # noqa: PLC0415
+
+    if (pretrain_checkpoint is None) == (resume_from is None):
+        msg = "pass exactly one of --pretrain-checkpoint or --resume-from"
+        raise click.UsageError(msg)
 
     config = Config.from_yaml(config_path)
     if seed is not None:
         config.sft.seed = seed
-    sft_finetune(config, checkpoint=checkpoint)
+    sft_finetune(
+        config,
+        pretrain_checkpoint=pretrain_checkpoint,
+        resume_from=resume_from,
+    )

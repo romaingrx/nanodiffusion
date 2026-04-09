@@ -18,6 +18,7 @@ and stays out of the pydantic-versioning rabbit hole.
 """
 
 import shutil
+from collections.abc import Callable
 from pathlib import Path
 from typing import Literal, cast
 
@@ -26,7 +27,7 @@ import optax
 import structlog
 from pydantic import BaseModel, ConfigDict, Field
 
-from nanodiffusion.data.source import SourcePosition
+from nanodiffusion.data.cursors import LoaderCursor
 from nanodiffusion.model import DiffusionModel
 
 logger = structlog.get_logger(__name__)
@@ -39,16 +40,36 @@ LATEST_LINK_NAME = "latest"
 class CheckpointMeta(BaseModel):
     """Step counter + data-loader cursor persisted alongside weights.
 
-    Pydantic handles json round-trip so neither the ``step`` coercion nor
-    the ``cursor`` TypedDict shape check live in save/load. ``frozen=True``
-    mirrors the previous dataclass contract: callers treat meta as a
-    value object.
+    Pydantic handles json round-trip for the discriminated ``cursor``
+    union so neither the step coercion nor the cursor variant check live
+    in save/load. ``frozen=True`` mirrors the previous dataclass
+    contract: callers treat meta as a value object.
     """
 
     model_config = ConfigDict(frozen=True)
 
     step: int = Field(ge=0)
-    cursor: SourcePosition | None = None
+    cursor: LoaderCursor | None = None
+
+    def require_cursor[C: LoaderCursor](self, kind: type[C]) -> C | None:
+        """Return the cursor narrowed to ``kind`` or raise on mismatch.
+
+        Pretrain drivers call ``meta.require_cursor(PretrainCursor)``
+        and SFT drivers call ``meta.require_cursor(SFTCursor)`` to
+        assert that a resumed checkpoint belongs to the matching
+        paradigm. A mismatch means the user pointed their resume flag
+        at the wrong run dir — caught at the boundary instead of
+        silently feeding a pretrain cursor into an SFT loader.
+        """
+        if self.cursor is None:
+            return None
+        if not isinstance(self.cursor, kind):
+            msg = (
+                f"Checkpoint cursor kind {self.cursor.kind!r} does not "
+                f"match expected kind {kind.__name__!r}"
+            )
+            raise TypeError(msg)
+        return self.cursor
 
 
 def save_checkpoint[M: DiffusionModel](
@@ -58,7 +79,7 @@ def save_checkpoint[M: DiffusionModel](
     ema_model: M,
     opt_state: optax.OptState,
     step: int,
-    cursor: SourcePosition | None,
+    cursor: LoaderCursor | None,
     update_latest: bool = False,
 ) -> None:
     """Write ``(model, ema, opt_state, meta)`` atomically to ``path``.
@@ -135,25 +156,34 @@ def load_checkpoint[M: DiffusionModel](
     path: Path,
     *,
     model_skeleton: M,
-    opt_state_skeleton: optax.OptState,
+    opt_state_builder: Callable[[M], optax.OptState],
 ) -> tuple[M, M, optax.OptState, CheckpointMeta]:
     """Inverse of :func:`save_checkpoint`.
 
-    Skeletons must match the saved shapes; callers normally build them
-    by reconstructing a fresh model and calling ``optimizer.init`` on it
-    before deserialising. The return is bound to the skeleton's concrete
-    type via the ``M`` type var, so callers can keep using model-specific
-    attributes without downcasts.
+    ``model_skeleton`` can be either a real :class:`DiffusionModel`
+    with initialised parameters or an abstract shape tree produced by
+    :func:`eqx.filter_eval_shape` — the deserializer only reads
+    shape + dtype per leaf. ``opt_state_builder`` is called with the
+    freshly loaded model to produce the opt-state tree that the
+    opt_state.eqx leaves are read into; usually just
+    ``lambda m: optimizer.init(eqx.filter(m, eqx.is_inexact_array))``.
+    Threading a builder instead of a pre-built skeleton lets the
+    caller skip the wasteful real-weights init on resume paths and
+    keeps the two-phase load dance inside this module instead of
+    leaking into every driver.
 
     ``path`` may be a ``latest`` symlink; the filesystem resolves it
     transparently for both the equinox file reads and the meta parse.
 
-    The ``cast`` calls mirror equinox's own ``_ad.py:185`` pattern: the
-    underlying ``tree_deserialise_leaves`` is typed to return ``PyTree``,
-    which we know structurally matches the skeleton we passed in.
+    The return is bound to the skeleton's concrete type via the ``M``
+    type var, so callers keep model-specific attributes without
+    downcasts. The ``cast`` calls mirror equinox's own ``_ad.py:185``
+    pattern: ``tree_deserialise_leaves`` is typed to return
+    ``PyTree``, which we know structurally matches the skeleton.
     """
     model = cast("M", eqx.tree_deserialise_leaves(path / "model.eqx", model_skeleton))
     ema_model = cast("M", eqx.tree_deserialise_leaves(path / "ema.eqx", model_skeleton))
+    opt_state_skeleton = opt_state_builder(model)
     opt_state = cast(
         "optax.OptState",
         eqx.tree_deserialise_leaves(path / "opt_state.eqx", opt_state_skeleton),

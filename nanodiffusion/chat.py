@@ -163,15 +163,7 @@ def render_for_completion(
     _validate_alternation(messages)
     if messages[-1]["role"] == "assistant":
         messages = messages[:-1]
-    # Recurse through render_conversation for the BOS/turn rendering, but
-    # bypass its validators: we already ran them on the pre-drop sequence,
-    # and a single trailing ``user`` here is expected after the drop.
-    b = SequenceBuilder(tok)
-    b.special(SpecialToken.BOS)
-    for msg in messages:
-        b.message(msg)
-    b.special(SpecialToken.EOS)
-    ids = b.ids
-    # SequenceBuilder always ends with EOS; replace it to prime generation.
+    ids, _ = render_conversation(tok, {"messages": messages})
+    # render_conversation always ends with EOS; replace it to prime generation.
     ids[-1] = tok.encode_special(SpecialToken.ASSISTANT_START)
     return ids

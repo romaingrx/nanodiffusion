@@ -7,8 +7,6 @@ tested without spinning up the data pipeline: :func:`make_optimizer`,
 """
 
 import dataclasses
-import time
-from collections.abc import Callable
 from pathlib import Path
 
 import equinox as eqx
@@ -17,25 +15,33 @@ import jax.numpy as jnp
 import optax
 import structlog
 
-from nanodiffusion._loop_utils import make_run_id, write_config
-from nanodiffusion.checkpoint import load_checkpoint, save_checkpoint
+from nanodiffusion.checkpoint import load_checkpoint
 from nanodiffusion.config import Config, OptimizerHyperparams
+from nanodiffusion.data.cursors import PretrainCursor
 from nanodiffusion.data.datasets import get_dataset
-from nanodiffusion.data.loader import prefetch, pretrain_loader
-from nanodiffusion.data.source import SourcePosition, TextSource
-from nanodiffusion.model import DiffusionModel, Transformer
+from nanodiffusion.data.loader import BatchOutput, pretrain_loader
+from nanodiffusion.data.source import TextSource
+from nanodiffusion.loop import (
+    LoopHyperparams,
+    LoopState,
+    StepStats,
+    TrainStepFn,
+    resolve_model_config_from_checkpoint,
+    resolve_run_dir,
+    run_training_loop,
+    write_config,
+)
+from nanodiffusion.model import (
+    DiffusionModel,
+    Transformer,
+    transformer_skeleton,
+)
 from nanodiffusion.pretrain.loss import compute_loss
 from nanodiffusion.schedule import LogLinearSchedule, NoiseSchedule
 from nanodiffusion.tokenizer import Tokenizer
 from nanodiffusion.types import PRNGKeyArray, Scalar, TokenBatch
 
 logger = structlog.get_logger(__name__)
-
-
-type TrainStepFn[M: DiffusionModel] = Callable[
-    [M, M, optax.OptState, TokenBatch, PRNGKeyArray],
-    tuple[M, M, optax.OptState, Scalar],
-]
 
 
 def make_optimizer(
@@ -84,7 +90,7 @@ def make_train_step[M: DiffusionModel](
     schedule: NoiseSchedule,
     mask_token_id: int,
     ema_decay: float,
-) -> TrainStepFn[M]:
+) -> TrainStepFn[M, TokenBatch]:
     """Build an ``eqx.filter_jit`` train step for MDLM diffusion.
 
     Closing over ``optimizer``, ``schedule``, ``mask_token_id`` and
@@ -122,35 +128,6 @@ def make_train_step[M: DiffusionModel](
     return train_step
 
 
-def _init_run_dir(
-    config: Config, *, starting_step: int, resume_from: Path | None
-) -> Path:
-    """Resolve the run directory for this invocation.
-
-    Fresh runs land under ``config.train.run_dir/<timestamp>``. Resumes
-    reuse ``resume_from.parent`` so every artifact of a logical run —
-    logs, checkpoints, config — stays in one place, and a user can
-    ``tail -f`` across restarts.
-    """
-    if resume_from is not None:
-        run_dir = resume_from.parent.resolve()
-    else:
-        run_dir = config.train.run_dir / make_run_id()
-    run_dir.mkdir(parents=True, exist_ok=True)
-    write_config(run_dir, config)
-    logger.info(
-        "pretrain_start",
-        run_dir=str(run_dir),
-        dataset=config.data.dataset,
-        max_steps=config.train.max_steps,
-        batch_size=config.train.batch_size,
-        seq_len=config.model.max_seq_len,
-        starting_step=starting_step,
-        resumed=resume_from is not None,
-    )
-    return run_dir
-
-
 def _init_source(config: Config) -> TextSource:
     factory = get_dataset(config.data.dataset)
     return factory(
@@ -160,101 +137,103 @@ def _init_source(config: Config) -> TextSource:
     )
 
 
-@dataclasses.dataclass
-class _LoopState[M: DiffusionModel]:
-    """Mutable per-iteration state threaded through the training loop.
+def _prepare_batch(
+    batch: BatchOutput,
+) -> tuple[TokenBatch, PretrainCursor, StepStats]:
+    """Host → JAX conversion for pretrain batches.
 
-    Bundled into a dataclass so :func:`_run_loop` keeps a flat signature
-    and :func:`pretrain` stays under the 50-statement lint limit. Not a
-    pytree — equinox never sees this.
+    Pretrain doesn't track supervised tokens separately — every token
+    contributes to the unconditional diffusion loss — so the stats
+    payload is empty and the shared loop omits the
+    ``supervised_tok_per_s`` field from its log output.
+    """
+    return jnp.asarray(batch.tokens), batch.state, StepStats()
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class _PretrainInitialState:
+    """Everything :func:`pretrain`'s loop needs at step 0.
+
+    Mirrors :class:`nanodiffusion.sft.train._SFTInitialState`; keeping
+    the shape identical lets the two drivers be read side-by-side with
+    no structural differences beyond the paradigm-specific cursor type.
     """
 
-    model: M
-    ema_model: M
+    model: Transformer
+    ema_model: Transformer
     opt_state: optax.OptState
-    key: PRNGKeyArray
     step: int
-    cursor: SourcePosition | None
-    last_saved_step: int | None = None
+    cursor: PretrainCursor | None
 
 
-def _run_loop[M: DiffusionModel](
-    state: _LoopState[M],
-    *,
+def _load_pretrain_initial_state(
     config: Config,
-    run_dir: Path,
-    train_step: TrainStepFn[M],
-    lr_schedule: optax.Schedule,
-    base_loader: "object",
-) -> None:
-    """Inner training loop.
+    optimizer: optax.GradientTransformation,
+    *,
+    resume_from: Path | None,
+    model_key: PRNGKeyArray,
+) -> _PretrainInitialState:
+    """Build the step-0 state for a fresh run or resume from a checkpoint.
 
-    Mutates ``state`` in place (Python semantics; not a jit'd function).
-    ``base_loader`` is typed as ``object`` because the data loader's
-    iterator type lives in ``nanodiffusion.data.loader`` and importing
-    it here creates a cycle; the value is only passed straight through
-    to :func:`prefetch`.
+    Resume uses :func:`transformer_skeleton` so the abstract shape
+    tree feeds :func:`load_checkpoint` without allocating real
+    parameter tensors first — the two-phase load is hidden inside
+    :func:`load_checkpoint` via the ``opt_state_builder`` callback.
     """
-    initial_step = state.step
-    last_log_step = state.step
-    tokens_per_step = config.train.batch_size * config.model.max_seq_len
+    if resume_from is not None:
+        return _load_resumed_pretrain_state(config, optimizer, resume_from)
+    return _load_fresh_pretrain_state(config, optimizer, model_key)
 
-    def _save() -> None:
-        ckpt_dir = run_dir / f"step_{state.step}"
-        save_checkpoint(
-            ckpt_dir,
-            model=state.model,
-            ema_model=state.ema_model,
-            opt_state=state.opt_state,
-            step=state.step,
-            cursor=state.cursor,
-            update_latest=True,
-        )
-        write_config(ckpt_dir, config)
-        state.last_saved_step = state.step
-        logger.info("checkpoint_saved", path=str(ckpt_dir), step=state.step)
 
-    t_window_start = time.monotonic()
-    with prefetch(base_loader, size=config.data.prefetch_size) as loader:  # pyright: ignore[reportArgumentType]
-        for batch in loader:
-            if state.step >= config.train.max_steps:
-                break
-            state.cursor = batch.state
-            tokens = jnp.asarray(batch.tokens)
-            state.key, step_key = jax.random.split(state.key)
-            state.model, state.ema_model, state.opt_state, loss = train_step(
-                state.model, state.ema_model, state.opt_state, tokens, step_key
-            )
-            state.step += 1
+def _load_fresh_pretrain_state(
+    config: Config,
+    optimizer: optax.GradientTransformation,
+    model_key: PRNGKeyArray,
+) -> _PretrainInitialState:
+    model = Transformer(config.model, key=model_key)
+    opt_state = optimizer.init(eqx.filter(model, eqx.is_inexact_array))
+    return _PretrainInitialState(
+        model=model,
+        ema_model=model,
+        opt_state=opt_state,
+        step=0,
+        cursor=None,
+    )
 
-            if state.step == initial_step + 1:
-                # First post-compile step: restart throughput window to
-                # exclude JIT compile time from the first tok/s report.
-                t_window_start = time.monotonic()
-                last_log_step = state.step
 
-            if state.step % config.train.log_every == 0 and state.step > last_log_step:
-                elapsed = time.monotonic() - t_window_start
-                steps_in_window = state.step - last_log_step
-                tok_per_s = int(steps_in_window * tokens_per_step / max(elapsed, 1e-9))
-                logger.info(
-                    "train",
-                    step=state.step,
-                    loss=float(loss),
-                    lr=jnp.asarray(lr_schedule(state.step)).item(),
-                    tok_per_s=tok_per_s,
-                )
-                t_window_start = time.monotonic()
-                last_log_step = state.step
+def _load_resumed_pretrain_state(
+    config: Config,
+    optimizer: optax.GradientTransformation,
+    checkpoint: Path,
+) -> _PretrainInitialState:
+    # ``transformer_skeleton`` builds a zero-cost shape tree so we
+    # avoid a full real-weights init on resume. ``load_checkpoint``
+    # internally does the two-phase load via ``opt_state_builder`` —
+    # see its docstring.
+    model_config = resolve_model_config_from_checkpoint(
+        checkpoint,
+        fallback=config.model,
+        log_event="pretrain_model_config_override",
+    )
+    skeleton = transformer_skeleton(model_config)
 
-            if state.step % config.train.save_every == 0:
-                _save()
+    def build_opt_state(m: Transformer) -> optax.OptState:
+        return optimizer.init(eqx.filter(m, eqx.is_inexact_array))
 
-    # End-of-training save. Skipped if the loop was a no-op (resume at
-    # max_steps) or the previous iteration already wrote this step via
-    # the periodic branch — ``latest`` still points at the right place.
-    if state.step > initial_step and state.last_saved_step != state.step:
-        _save()
+    model, ema_model, opt_state, meta = load_checkpoint(
+        checkpoint,
+        model_skeleton=skeleton,
+        opt_state_builder=build_opt_state,
+    )
+    cursor = meta.require_cursor(PretrainCursor)
+    logger.info("resumed_checkpoint", path=str(checkpoint), step=meta.step)
+    return _PretrainInitialState(
+        model=model,
+        ema_model=ema_model,
+        opt_state=opt_state,
+        step=meta.step,
+        cursor=cursor,
+    )
 
 
 def pretrain(
@@ -270,23 +249,28 @@ def pretrain(
     key = jax.random.PRNGKey(config.train.seed)
     key, model_key = jax.random.split(key)
 
-    model = Transformer(config.model, key=model_key)
-    ema_model = model
     optimizer, lr_schedule = make_optimizer(config.train)
-    opt_state = optimizer.init(eqx.filter(model, eqx.is_inexact_array))
-
-    step = 0
-    cursor: SourcePosition | None = None
-    if resume_from is not None:
-        model, ema_model, opt_state, meta = load_checkpoint(
-            resume_from, model_skeleton=model, opt_state_skeleton=opt_state
-        )
-        step, cursor = meta.step, meta.cursor
-        logger.info("resumed_checkpoint", path=str(resume_from), step=step)
+    start = _load_pretrain_initial_state(
+        config,
+        optimizer,
+        resume_from=resume_from,
+        model_key=model_key,
+    )
 
     tok = Tokenizer(encode_threads=config.data.tokenizer_threads)
     source = _init_source(config)
-    run_dir = _init_run_dir(config, starting_step=step, resume_from=resume_from)
+    run_dir = resolve_run_dir(config.train.run_dir, resume_from=resume_from)
+    write_config(run_dir, config)
+    logger.info(
+        "pretrain_start",
+        run_dir=str(run_dir),
+        dataset=config.data.dataset,
+        max_steps=config.train.max_steps,
+        batch_size=config.train.batch_size,
+        seq_len=config.model.max_seq_len,
+        starting_step=start.step,
+        resumed=resume_from is not None,
+    )
 
     train_step = make_train_step(
         optimizer,
@@ -301,25 +285,35 @@ def pretrain(
         seq_len=config.model.max_seq_len,
         split="train",
         tokenizer_batch_size=config.data.tokenizer_batch_size,
-        resume_state=cursor,
+        resume_state=start.cursor,
         max_empty_passes=config.data.max_empty_passes,
     )
 
-    state = _LoopState(
-        model=model,
-        ema_model=ema_model,
-        opt_state=opt_state,
+    state: LoopState[Transformer, PretrainCursor] = LoopState(
+        model=start.model,
+        ema_model=start.ema_model,
+        opt_state=start.opt_state,
         key=key,
-        step=step,
-        cursor=cursor,
+        step=start.step,
+        cursor=start.cursor,
     )
-    _run_loop(
+    settings = LoopHyperparams(
+        max_steps=config.train.max_steps,
+        log_every=config.train.log_every,
+        save_every=config.train.save_every,
+        prefetch_size=config.data.prefetch_size,
+        nominal_tokens_per_step=config.train.batch_size * config.model.max_seq_len,
+        event_name="train",
+    )
+    run_training_loop(
         state,
         config=config,
         run_dir=run_dir,
         train_step=train_step,
         lr_schedule=lr_schedule,
         base_loader=base_loader,
+        settings=settings,
+        prepare_batch=_prepare_batch,
     )
 
     logger.info("pretrain_done", step=state.step, run_dir=str(run_dir))

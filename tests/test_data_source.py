@@ -3,10 +3,10 @@ from pathlib import Path
 
 import pytest
 
+from nanodiffusion.data.cursors import PretrainCursor
 from nanodiffusion.data.source import (
     InMemoryTextSource,
     ParquetTextSource,
-    SourcePosition,
     TextSource,
 )
 from tests._helpers import write_parquet
@@ -38,16 +38,16 @@ def test_in_memory_source_batches_respect_batch_size() -> None:
         ["doc2", "doc3"],
         ["doc0", "doc1"],
     ]
-    assert batches[0][1]["epoch"] == 1
-    assert batches[1][1]["epoch"] == 1
-    assert batches[2][1]["epoch"] == 2
+    assert batches[0][1].epoch == 1
+    assert batches[1][1].epoch == 1
+    assert batches[2][1].epoch == 2
 
 
 def test_in_memory_source_row_group_idx_is_batch_index() -> None:
     """The position uses batch-index semantics, matching parquet."""
     src = InMemoryTextSource([f"doc{i}" for i in range(8)], val_size=1)
     batches = list(islice(src.iter_documents("train", batch_size=2), 4))
-    rg_indices = [b[1]["row_group_idx"] for b in batches]
+    rg_indices = [b[1].row_group_idx for b in batches]
     # 7 train docs in batches of 2 -> batch_count = 4 (last batch has 1 doc)
     assert rg_indices == [0, 1, 2, 3]
 
@@ -104,8 +104,8 @@ def test_in_memory_source_resume_advances_past_saved_position() -> None:
 
     resumed_first = next(src.iter_documents("train", batch_size=2, resume=saved))
     new_state = resumed_first[1]
-    saved_tup = (saved["epoch"], saved["shard_idx"], saved["row_group_idx"])
-    new_tup = (new_state["epoch"], new_state["shard_idx"], new_state["row_group_idx"])
+    saved_tup = (saved.epoch, saved.shard_idx, saved.row_group_idx)
+    new_tup = (new_state.epoch, new_state.shard_idx, new_state.row_group_idx)
     assert new_tup > saved_tup
     # The doc at the saved batch must not appear again immediately after resume.
     assert resumed_first[0] != first[-1][0]
@@ -118,7 +118,7 @@ def test_in_memory_source_resume_at_last_position_advances_epoch() -> None:
     saved = all_first_epoch[-1][1]
 
     resumed = next(src.iter_documents("train", batch_size=2, resume=saved))
-    assert resumed[1]["epoch"] == saved["epoch"] + 1
+    assert resumed[1].epoch == saved.epoch + 1
 
 
 def test_parquet_source_round_trip(tmp_path: Path) -> None:
@@ -158,13 +158,13 @@ def test_parquet_source_position_advances(tmp_path: Path) -> None:
     write_parquet(val, ["v"], row_group_size=1)
 
     src = ParquetTextSource([train], [val])
-    positions: list[SourcePosition] = [
+    positions: list[PretrainCursor] = [
         b[1] for b in islice(src.iter_documents("train", batch_size=2), 2)
     ]
-    assert positions[0]["shard_idx"] == 0
-    assert positions[1]["shard_idx"] == 0
-    assert positions[0]["row_group_idx"] == 0
-    assert positions[1]["row_group_idx"] == 1
+    assert positions[0].shard_idx == 0
+    assert positions[1].shard_idx == 0
+    assert positions[0].row_group_idx == 0
+    assert positions[1].row_group_idx == 1
 
 
 def test_parquet_source_loops_and_increments_epoch(tmp_path: Path) -> None:
@@ -175,7 +175,7 @@ def test_parquet_source_loops_and_increments_epoch(tmp_path: Path) -> None:
 
     src = ParquetTextSource([train], [val])
     batches = list(islice(src.iter_documents("train", batch_size=10), 3))
-    epochs = [b[1]["epoch"] for b in batches]
+    epochs = [b[1].epoch for b in batches]
     assert epochs[0] == 1
     assert epochs[-1] == 3
 
@@ -246,8 +246,8 @@ def test_parquet_source_resume_advances_past_saved_row_group(tmp_path: Path) -> 
 
     resumed_first = next(src.iter_documents("train", batch_size=10, resume=saved))
     new_state = resumed_first[1]
-    saved_tup = (saved["epoch"], saved["shard_idx"], saved["row_group_idx"])
-    new_tup = (new_state["epoch"], new_state["shard_idx"], new_state["row_group_idx"])
+    saved_tup = (saved.epoch, saved.shard_idx, saved.row_group_idx)
+    new_tup = (new_state.epoch, new_state.shard_idx, new_state.row_group_idx)
     assert new_tup > saved_tup
     assert resumed_first[0] != first[-1][0]
 
@@ -262,9 +262,9 @@ def test_parquet_source_resume_across_shards(tmp_path: Path) -> None:
     write_parquet(val, ["v"], row_group_size=1)
     src = ParquetTextSource([train_a, train_b], [val])
 
-    saved: SourcePosition = {"epoch": 1, "shard_idx": 0, "row_group_idx": 1}
+    saved = PretrainCursor(epoch=1, shard_idx=0, row_group_idx=1)
     batches = list(islice(src.iter_documents("train", batch_size=10, resume=saved), 2))
     # Shard 0 row group 1 is skipped; next is shard 1 row group 0.
-    assert batches[0][1]["shard_idx"] == 1
-    assert batches[0][1]["row_group_idx"] == 0
+    assert batches[0][1].shard_idx == 1
+    assert batches[0][1].row_group_idx == 0
     assert batches[0][0] == ["b0"]

@@ -14,7 +14,8 @@ import jax.numpy as jnp
 import numpy as np
 import structlog
 
-from nanodiffusion.data.source import SourcePosition, Split, TextSource
+from nanodiffusion.data.cursors import PretrainCursor
+from nanodiffusion.data.source import Split, TextSource
 from nanodiffusion.tokenizer import TokenizerLike
 from nanodiffusion.types import (
     NumpySegmentBatch,
@@ -30,14 +31,14 @@ logger = structlog.get_logger(__name__)
 class JaxBatch:
     tokens: TokenBatch
     segments: SegmentBatch
-    state: SourcePosition
+    state: PretrainCursor
 
 
 @dataclass(frozen=True, slots=True)
 class BatchOutput:
     tokens: NumpyTokenBatch
     segments: NumpySegmentBatch
-    state: SourcePosition
+    state: PretrainCursor
 
     def to_jax(self) -> JaxBatch:
         return JaxBatch(
@@ -108,7 +109,7 @@ def pretrain_loader(
     tokenizer_batch_size: int = 128,
     start: int = 0,
     step: int = 1,
-    resume_state: SourcePosition | None = None,
+    resume_state: PretrainCursor | None = None,
     max_empty_passes: int = 100,
 ) -> Iterator[BatchOutput]:
     """Greedy-concat pretrain loader with EOS document separators.
@@ -134,11 +135,9 @@ def pretrain_loader(
     empty_passes = 0
     # Sentinel state; the first source pull always overwrites this before
     # any yield since chunk_size > 0.
-    last_state: SourcePosition = resume_state or {
-        "epoch": 1,
-        "shard_idx": 0,
-        "row_group_idx": 0,
-    }
+    last_state: PretrainCursor = resume_state or PretrainCursor(
+        epoch=1, shard_idx=0, row_group_idx=0
+    )
 
     docs_iter = source.iter_documents(
         split,
