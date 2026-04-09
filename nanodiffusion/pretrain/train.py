@@ -1,6 +1,7 @@
 """MDLM pretraining driver: JIT train step, state loader, ``pretrain`` entry."""
 
 import dataclasses
+from functools import partial
 from pathlib import Path
 
 import equinox as eqx
@@ -22,6 +23,7 @@ from nanodiffusion.data.source import TextSource
 from nanodiffusion.loop import (
     LoopHyperparams,
     LoopState,
+    StepMetrics,
     StepStats,
     TrainStepFn,
     resolve_run_dir,
@@ -34,6 +36,13 @@ from nanodiffusion.model import (
 )
 from nanodiffusion.optimizer import ema_update, make_optimizer
 from nanodiffusion.pretrain.loss import compute_loss
+from nanodiffusion.reporter import (
+    JsonlSink,
+    Reporter,
+    SinkFactory,
+    StructlogSink,
+    WandbSink,
+)
 from nanodiffusion.schedule import LogLinearSchedule, NoiseSchedule
 from nanodiffusion.tokenizer import Tokenizer
 from nanodiffusion.types import PRNGKeyArray, Scalar, TokenBatch
@@ -54,6 +63,12 @@ def make_train_step[M: DiffusionModel](
     ``ema_decay`` at trace time so the JIT cache key stays stable.
     The callable is generic over ``M`` so the concrete model subclass
     flows through to the returned tuple without a downcast.
+
+    The returned step emits a metrics dict with ``loss``, ``grad_norm``,
+    and ``param_norm``. ``grad_norm`` is the pre-clip global norm (so
+    the logged value reflects what the optimizer actually saw before
+    clipping kicked in), and ``param_norm`` tracks post-update weight
+    magnitude as a coarse divergence signal.
     """
 
     @eqx.filter_jit
@@ -63,7 +78,7 @@ def make_train_step[M: DiffusionModel](
         opt_state: optax.OptState,
         batch: TokenBatch,
         key: PRNGKeyArray,
-    ) -> tuple[M, M, optax.OptState, Scalar]:
+    ) -> tuple[M, M, optax.OptState, StepMetrics]:
         def loss_fn(m: M) -> Scalar:
             return compute_loss(
                 m,
@@ -74,12 +89,19 @@ def make_train_step[M: DiffusionModel](
             )
 
         loss, grads = eqx.filter_value_and_grad(loss_fn)(model)
+        grad_norm = optax.tree.norm(grads)
         updates, new_opt_state = optimizer.update(
             grads, opt_state, eqx.filter(model, eqx.is_inexact_array)
         )
         new_model = eqx.apply_updates(model, updates)
         new_ema_model = ema_update(ema_model, new_model, ema_decay)
-        return new_model, new_ema_model, new_opt_state, loss
+        param_norm = optax.tree.norm(eqx.filter(new_model, eqx.is_inexact_array))
+        metrics: StepMetrics = {
+            "loss": loss,
+            "grad_norm": grad_norm,
+            "param_norm": param_norm,
+        }
+        return new_model, new_ema_model, new_opt_state, metrics
 
     return train_step
 
@@ -176,10 +198,44 @@ def _load_resumed_pretrain_state(
     )
 
 
+def _default_pretrain_sinks(
+    run_dir: Path,
+    *,
+    config: Config,
+    wandb_project: str | None,
+    wandb_entity: str | None,
+) -> list[SinkFactory]:
+    """Assemble the default sink stack for a pretrain run.
+
+    Always emits structlog (so console output stays identical to the
+    pre-reporter world) plus a per-run JSONL file under ``run_dir`` for
+    offline analysis. Wandb is optional and only enabled when a
+    project is supplied; when enabled it runs in the reporter's worker
+    process and never imports inside the training process.
+    """
+    factories: list[SinkFactory] = [
+        partial(StructlogSink, "train"),
+        partial(JsonlSink, run_dir / "metrics.jsonl"),
+    ]
+    if wandb_project is not None:
+        factories.append(
+            partial(
+                WandbSink,
+                project=wandb_project,
+                entity=wandb_entity,
+                run_name=run_dir.name,
+                config=config.model_dump(mode="json"),
+            )
+        )
+    return factories
+
+
 def pretrain(
     config: Config,
     *,
     resume_from: Path | None = None,
+    wandb_project: str | None = None,
+    wandb_entity: str | None = None,
 ) -> Path:
     """Run an MDLM pretraining job end-to-end.
 
@@ -210,6 +266,7 @@ def pretrain(
         seq_len=config.model.max_seq_len,
         starting_step=start.step,
         resumed=resume_from is not None,
+        wandb=wandb_project,
     )
 
     train_step = make_train_step(
@@ -245,16 +302,24 @@ def pretrain(
         nominal_tokens_per_step=config.train.batch_size * config.model.max_seq_len,
         event_name="train",
     )
-    run_training_loop(
-        state,
+    sink_factories = _default_pretrain_sinks(
+        run_dir,
         config=config,
-        run_dir=run_dir,
-        train_step=train_step,
-        lr_schedule=lr_schedule,
-        base_loader=base_loader,
-        settings=settings,
-        prepare_batch=_prepare_batch,
+        wandb_project=wandb_project,
+        wandb_entity=wandb_entity,
     )
+    with Reporter(sink_factories) as reporter:
+        run_training_loop(
+            state,
+            config=config,
+            run_dir=run_dir,
+            train_step=train_step,
+            lr_schedule=lr_schedule,
+            base_loader=base_loader,
+            settings=settings,
+            prepare_batch=_prepare_batch,
+            reporter=reporter,
+        )
 
     logger.info("pretrain_done", step=state.step, run_dir=str(run_dir))
     return run_dir

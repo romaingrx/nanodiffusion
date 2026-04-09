@@ -1,12 +1,17 @@
 """Shared training loop driving pretrain and SFT.
 
 Paradigm-specific differences (batch pytree shape, optional per-step
-metrics) are threaded through a :class:`PrepareBatch` callback so
-:func:`run_training_loop` owns the timing/saving logic once.
+metrics) are threaded through a :class:`PrepareBatch` callback and the
+``StepMetrics`` dict returned by :data:`TrainStepFn`, so
+:func:`run_training_loop` owns the timing/saving/metric-forwarding
+logic once. The loop never imports wandb or any other metric backend;
+it calls into a :class:`~nanodiffusion.reporter.MetricReporter` which
+fans out to whatever sinks the caller configured.
 """
 
 import dataclasses
 import datetime
+import math
 import time
 from collections.abc import Callable, Iterator
 from pathlib import Path
@@ -21,9 +26,19 @@ from nanodiffusion.checkpoint import save_checkpoint, write_config
 from nanodiffusion.data.cursors import LoaderCursor
 from nanodiffusion.data.loader import prefetch
 from nanodiffusion.model import DiffusionModel
+from nanodiffusion.reporter import MetricReporter
 from nanodiffusion.types import PRNGKeyArray, Scalar
 
 logger = structlog.get_logger(__name__)
+
+
+type StepMetrics = dict[str, Scalar]
+"""Per-step metrics returned from a JIT'd train step.
+
+Keys are paradigm-specific (pretrain vs SFT decide what to expose), but
+the loop requires the ``"loss"`` key to be present so it can run the
+divergence (non-finite) guard at each log boundary.
+"""
 
 
 def make_run_id() -> str:
@@ -90,7 +105,7 @@ class LoopState[M: DiffusionModel, C: LoaderCursor]:
 
 type TrainStepFn[M: DiffusionModel, JB] = Callable[
     [M, M, optax.OptState, JB, PRNGKeyArray],
-    tuple[M, M, optax.OptState, Scalar],
+    tuple[M, M, optax.OptState, StepMetrics],
 ]
 
 type PrepareBatch[B, JB, C: LoaderCursor] = Callable[[B], tuple[JB, C, StepStats]]
@@ -106,6 +121,7 @@ def run_training_loop[M: DiffusionModel, B, JB, C: LoaderCursor](
     base_loader: Iterator[B],
     settings: LoopHyperparams,
     prepare_batch: PrepareBatch[B, JB, C],
+    reporter: MetricReporter,
 ) -> None:
     """Drive the training loop in place.
 
@@ -116,10 +132,15 @@ def run_training_loop[M: DiffusionModel, B, JB, C: LoaderCursor](
     is excluded from the first ``tok_per_s`` report; the end-of-training
     save is skipped when a periodic save already landed on the terminal
     step.
+
+    Non-finite losses surface as a :class:`RuntimeError` at the next
+    log boundary so a divergent run fails fast instead of burning
+    budget on garbage updates.
     """
     initial_step = state.step
     last_log_step = state.step
     supervised_tokens_in_window = 0
+    latest_metrics: StepMetrics = {}
 
     def _save() -> None:
         ckpt_dir = run_dir / f"step_{state.step}"
@@ -145,7 +166,7 @@ def run_training_loop[M: DiffusionModel, B, JB, C: LoaderCursor](
             state.cursor = cursor
             supervised_tokens_in_window += stats.supervised_tokens
             state.key, step_key = jax.random.split(state.key)
-            state.model, state.ema_model, state.opt_state, loss = train_step(
+            state.model, state.ema_model, state.opt_state, latest_metrics = train_step(
                 state.model, state.ema_model, state.opt_state, jax_batch, step_key
             )
             state.step += 1
@@ -163,19 +184,20 @@ def run_training_loop[M: DiffusionModel, B, JB, C: LoaderCursor](
                     * settings.nominal_tokens_per_step
                     / max(elapsed, 1e-9)
                 )
-                extras: dict[str, int] = {}
+                host_metrics: dict[str, float | int | str] = {
+                    k: float(v) for k, v in latest_metrics.items()
+                }
+                loss_value = host_metrics.get("loss")
+                if loss_value is None or not math.isfinite(float(loss_value)):
+                    msg = f"training diverged at step {state.step}: loss={loss_value}"
+                    raise RuntimeError(msg)
+                host_metrics["lr"] = jnp.asarray(lr_schedule(state.step)).item()
+                host_metrics["tok_per_s"] = tok_per_s
                 if supervised_tokens_in_window > 0:
-                    extras["supervised_tok_per_s"] = int(
+                    host_metrics["supervised_tok_per_s"] = int(
                         supervised_tokens_in_window / max(elapsed, 1e-9)
                     )
-                logger.info(
-                    settings.event_name,
-                    step=state.step,
-                    loss=float(loss),
-                    lr=jnp.asarray(lr_schedule(state.step)).item(),
-                    tok_per_s=tok_per_s,
-                    **extras,
-                )
+                reporter.log(step=state.step, metrics=host_metrics)
                 t_window_start = time.monotonic()
                 last_log_step = state.step
                 supervised_tokens_in_window = 0

@@ -1,6 +1,7 @@
 """SFT driver: JIT train step, state loader, ``sft_finetune`` entry."""
 
 import dataclasses
+from functools import partial
 from pathlib import Path
 
 import equinox as eqx
@@ -22,6 +23,7 @@ from nanodiffusion.data.sft_loader import SFTBatchOutput, SFTJaxBatch, sft_loade
 from nanodiffusion.loop import (
     LoopHyperparams,
     LoopState,
+    StepMetrics,
     StepStats,
     TrainStepFn,
     resolve_run_dir,
@@ -29,6 +31,13 @@ from nanodiffusion.loop import (
 )
 from nanodiffusion.model import DiffusionModel, Transformer, transformer_skeleton
 from nanodiffusion.optimizer import ema_update, make_optimizer
+from nanodiffusion.reporter import (
+    JsonlSink,
+    Reporter,
+    SinkFactory,
+    StructlogSink,
+    WandbSink,
+)
 from nanodiffusion.schedule import LogLinearSchedule, NoiseSchedule
 from nanodiffusion.sft.loss import compute_sft_loss
 from nanodiffusion.tokenizer import Tokenizer
@@ -53,6 +62,10 @@ def make_sft_train_step[M: DiffusionModel](
     :func:`compute_sft_loss` expects. Closures pin ``optimizer``,
     ``schedule``, ``mask_token_id``, and ``ema_decay`` at trace time
     so the JIT cache key stays stable.
+
+    Returns a metrics dict with ``loss``, ``grad_norm``, and
+    ``param_norm`` matching the pretrain step so the loop can forward
+    them to sinks uniformly.
     """
 
     @eqx.filter_jit
@@ -62,7 +75,7 @@ def make_sft_train_step[M: DiffusionModel](
         opt_state: optax.OptState,
         batch: SFTJaxBatch,
         key: PRNGKeyArray,
-    ) -> tuple[M, M, optax.OptState, Scalar]:
+    ) -> tuple[M, M, optax.OptState, StepMetrics]:
         def loss_fn(m: M) -> Scalar:
             return compute_sft_loss(
                 m,
@@ -74,12 +87,19 @@ def make_sft_train_step[M: DiffusionModel](
             )
 
         loss, grads = eqx.filter_value_and_grad(loss_fn)(model)
+        grad_norm = optax.tree.norm(grads)
         updates, new_opt_state = optimizer.update(
             grads, opt_state, eqx.filter(model, eqx.is_inexact_array)
         )
         new_model = eqx.apply_updates(model, updates)
         new_ema_model = ema_update(ema_model, new_model, ema_decay)
-        return new_model, new_ema_model, new_opt_state, loss
+        param_norm = optax.tree.norm(eqx.filter(new_model, eqx.is_inexact_array))
+        metrics: StepMetrics = {
+            "loss": loss,
+            "grad_norm": grad_norm,
+            "param_norm": param_norm,
+        }
+        return new_model, new_ema_model, new_opt_state, metrics
 
     return train_step
 
@@ -204,11 +224,43 @@ def _load_resumed_sft_state(
     )
 
 
+def _default_sft_sinks(
+    run_dir: Path,
+    *,
+    config: Config,
+    wandb_project: str | None,
+    wandb_entity: str | None,
+) -> list[SinkFactory]:
+    """Default sink stack for an SFT run.
+
+    Same shape as the pretrain counterpart but with ``sft_train`` as
+    the structlog event name so the two paradigms are easy to
+    distinguish in aggregated logs.
+    """
+    factories: list[SinkFactory] = [
+        partial(StructlogSink, "sft_train"),
+        partial(JsonlSink, run_dir / "metrics.jsonl"),
+    ]
+    if wandb_project is not None:
+        factories.append(
+            partial(
+                WandbSink,
+                project=wandb_project,
+                entity=wandb_entity,
+                run_name=run_dir.name,
+                config=config.model_dump(mode="json"),
+            )
+        )
+    return factories
+
+
 def sft_finetune(
     config: Config,
     *,
     pretrain_checkpoint: Path | None = None,
     resume_from: Path | None = None,
+    wandb_project: str | None = None,
+    wandb_entity: str | None = None,
 ) -> Path:
     """Run an SFT fine-tuning job end-to-end.
 
@@ -279,16 +331,24 @@ def sft_finetune(
         nominal_tokens_per_step=config.sft.batch_size * config.model.max_seq_len,
         event_name="sft_train",
     )
-    run_training_loop(
-        state,
+    sink_factories = _default_sft_sinks(
+        run_dir,
         config=config,
-        run_dir=run_dir,
-        train_step=train_step,
-        lr_schedule=lr_schedule,
-        base_loader=base_loader,
-        settings=settings,
-        prepare_batch=_prepare_sft_batch,
+        wandb_project=wandb_project,
+        wandb_entity=wandb_entity,
     )
+    with Reporter(sink_factories) as reporter:
+        run_training_loop(
+            state,
+            config=config,
+            run_dir=run_dir,
+            train_step=train_step,
+            lr_schedule=lr_schedule,
+            base_loader=base_loader,
+            settings=settings,
+            prepare_batch=_prepare_sft_batch,
+            reporter=reporter,
+        )
 
     logger.info("sft_done", step=state.step, run_dir=str(run_dir))
     return run_dir

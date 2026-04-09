@@ -1,0 +1,85 @@
+# yaml-language-server: $schema=./config.schema.json
+
+# Medium config — targets ROM-18 (8xH100, ~4h, ~11B FineWeb-EDU tokens,
+# then SFT). ~303M params: 20L x 1024h x 16 heads x ffn_mult=4.
+#
+# Sizing rationale (see ROM-18 research notes):
+# - MDLM (Sahoo et al., 2024) ships a 110M / 12L-768h-12h baseline on
+#   OpenWebText and gets legible English — that's the documented floor.
+# - SEDD-medium (Lou et al., 2024) uses 24L-1024h-16h ≈ 320M and is
+#   the strongest sub-400M published masked-diffusion LM.
+# - Masked diffusion carries a ~constant-factor capacity penalty vs AR
+#   at matched compute in single-epoch settings (see "Autoregressive vs.
+#   Masked Diffusion: A Controlled Comparison" and "Scaling Behavior of
+#   Discrete Diffusion Language Models"), so the AR sweet spot at this
+#   budget (~200M for nanoGPT/nanochat) shifts up for MDLM.
+# - nanochat d20 (560M, 20L-1280h-10h) trains AR on 11B FineWeb-EDU in
+#   ~3h on 8xH100. Going to 560M for MDLM at the same wall-clock would
+#   leave us meaningfully undertrained — balanced 303M is the sweet
+#   spot for "decent, coherent, not SoTa".
+
+model:
+  num_layers: 20
+  hidden_dim: 1024
+  num_heads: 16
+  max_seq_len: 1024
+  dropout_rate: 0.0
+  ffn_mult: 4
+
+# Pretrain: ~11B tokens. Effective batch of 256 sequences (32 per device
+# x 8 devices when data-parallel is wired up) at seq_len=1024 gives
+# 262k tokens/step → ~42k steps for 11B tokens. This single-file config
+# assumes the runner fans out per-device — on a single card, drop
+# batch_size to 16 and halve max_steps accordingly.
+train:
+  seed: 42
+  batch_size: 32
+  learning_rate: 3e-4
+  weight_decay: 0.1
+  warmup_steps: 1000
+  max_steps: 42000
+  ema_decay: 0.9999
+  grad_clip: 1.0
+  log_every: 50
+  save_every: 2000
+  run_dir: runs/pretrain
+
+sft:
+  seed: 42
+  batch_size: 16
+  learning_rate: 1e-4
+  weight_decay: 0.0
+  warmup_steps: 100
+  max_steps: 3000
+  ema_decay: 0.999
+  grad_clip: 1.0
+  log_every: 20
+  save_every: 500
+  run_dir: runs/sft
+  datasets:
+    - name: smoltalk
+      epochs: 1
+    - name: gsm8k
+      epochs: 4
+    - name: identity
+      epochs: 2
+  tokenizer_batch_size: 128
+  tokenizer_threads: 4
+  prefetch_size: 4
+  max_empty_passes: 100
+
+sample:
+  steps: 64
+  temperature: 1.0
+  top_k: 0
+  top_p: 1.0
+  max_length: 256
+
+data:
+  dataset: fineweb-edu-10bt
+  data_dir: data
+  num_train_shards: 13
+  tokenizer_batch_size: 128
+  tokenizer_threads: 8
+  prefetch_size: 4
+  max_empty_passes: 100
