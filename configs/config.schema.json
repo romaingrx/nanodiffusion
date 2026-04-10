@@ -85,6 +85,20 @@
           "default": 4,
           "title": "Ffn Mult",
           "type": "integer"
+        },
+        "compute_dtype": {
+          "default": "float32",
+          "enum": [
+            "float32",
+            "bfloat16"
+          ],
+          "title": "Compute Dtype",
+          "type": "string"
+        },
+        "gradient_checkpointing": {
+          "default": false,
+          "title": "Gradient Checkpointing",
+          "type": "boolean"
         }
       },
       "title": "ModelConfig",
@@ -323,7 +337,9 @@
         "num_heads": 12,
         "max_seq_len": 1024,
         "dropout_rate": 0.0,
-        "ffn_mult": 4
+        "ffn_mult": 4,
+        "compute_dtype": "float32",
+        "gradient_checkpointing": false
       }
     },
     "train": {

@@ -1,7 +1,8 @@
 import math
 from pathlib import Path
-from typing import Protocol, runtime_checkable
+from typing import Literal, Protocol, runtime_checkable
 
+import jax.numpy as jnp
 import yaml
 from pydantic import BaseModel, Field, model_validator
 
@@ -35,6 +36,14 @@ class ModelConfig(BaseModel):
     max_seq_len: int = 1024
     dropout_rate: float = 0.0
     ffn_mult: int = 4
+    compute_dtype: Literal["float32", "bfloat16"] = "float32"
+    gradient_checkpointing: bool = False
+
+    @property
+    def jnp_dtype(self) -> type:
+        """Resolve :attr:`compute_dtype` to the JAX scalar type used at
+        trace time (``jnp.float32`` or ``jnp.bfloat16``)."""
+        return jnp.float32 if self.compute_dtype == "float32" else jnp.bfloat16
 
     @property
     def head_dim(self) -> int:

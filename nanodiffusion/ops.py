@@ -14,6 +14,7 @@ running on.
 
 import math
 
+import equinox as eqx
 import jax
 import jax.numpy as jnp
 from jaxtyping import Array, Float
@@ -24,6 +25,22 @@ try:
     )
 except ImportError:
     _tpu_flash_attention = None
+
+
+def cast_dtype[M: eqx.Module](model: M, dtype: type) -> M:
+    """Cast every inexact (float) leaf of ``model`` to ``dtype``.
+
+    Integer leaves, static fields, and non-array leaves are left
+    untouched. Intended for mixed-precision training: cast the
+    model to bf16 before the forward pass so matmuls run at
+    native TPU speed, while the caller keeps fp32 master weights
+    for stable optimizer updates.
+    """
+    return jax.tree.map(
+        lambda x: x.astype(dtype) if eqx.is_inexact_array(x) else x,
+        model,
+        is_leaf=eqx.is_inexact_array,
+    )
 
 
 def attention(
