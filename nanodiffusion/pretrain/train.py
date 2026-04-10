@@ -9,6 +9,7 @@ import jax
 import jax.numpy as jnp
 import optax
 import structlog
+from jax.sharding import Mesh
 
 from nanodiffusion.checkpoint import (
     load_checkpoint,
@@ -45,6 +46,7 @@ from nanodiffusion.reporter import (
     WandbSink,
 )
 from nanodiffusion.schedule import LogLinearSchedule, NoiseSchedule
+from nanodiffusion.sharding import replicate, setup_mesh, shard_batch
 from nanodiffusion.tokenizer import Tokenizer
 from nanodiffusion.types import PRNGKeyArray, Scalar, TokenBatch
 
@@ -125,14 +127,10 @@ def _init_source(config: Config) -> TextSource:
 
 def _prepare_batch(
     batch: BatchOutput,
+    mesh: Mesh,
 ) -> tuple[TokenBatch, PretrainCursor, StepStats]:
-    """Host → JAX conversion for pretrain batches.
-
-    Every pretrain token contributes to the unconditional diffusion
-    loss, so the stats payload stays at 0 and the loop omits the
-    derived ``supervised_tok_per_s`` log field.
-    """
-    return jnp.asarray(batch.tokens), batch.state, StepStats()
+    """Host → JAX conversion + device sharding for pretrain batches."""
+    return shard_batch(jnp.asarray(batch.tokens), mesh), batch.state, StepStats()
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -294,11 +292,12 @@ def pretrain(
         max_empty_passes=config.data.max_empty_passes,
     )
 
+    mesh = setup_mesh()
     state: LoopState[Transformer, PretrainCursor] = LoopState(
-        model=start.model,
-        ema_model=start.ema_model,
-        opt_state=start.opt_state,
-        key=key,
+        model=replicate(start.model, mesh),
+        ema_model=replicate(start.ema_model, mesh),
+        opt_state=replicate(start.opt_state, mesh),
+        key=replicate(key, mesh),
         step=start.step,
         cursor=start.cursor,
     )
@@ -325,7 +324,7 @@ def pretrain(
             lr_schedule=lr_schedule,
             base_loader=base_loader,
             settings=settings,
-            prepare_batch=_prepare_batch,
+            prepare_batch=partial(_prepare_batch, mesh=mesh),
             reporter=reporter,
         )
 

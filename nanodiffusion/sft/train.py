@@ -8,6 +8,7 @@ import equinox as eqx
 import jax
 import optax
 import structlog
+from jax.sharding import Mesh
 
 from nanodiffusion.checkpoint import (
     load_checkpoint,
@@ -40,6 +41,7 @@ from nanodiffusion.reporter import (
 )
 from nanodiffusion.schedule import LogLinearSchedule, NoiseSchedule
 from nanodiffusion.sft.loss import compute_sft_loss
+from nanodiffusion.sharding import replicate, setup_mesh, shard_batch
 from nanodiffusion.tokenizer import Tokenizer
 from nanodiffusion.types import PRNGKeyArray, Scalar
 
@@ -106,14 +108,12 @@ def make_sft_train_step[M: DiffusionModel](
 
 def _prepare_sft_batch(
     batch: SFTBatchOutput,
+    mesh: Mesh,
 ) -> tuple[SFTJaxBatch, SFTCursor, StepStats]:
-    """Host → JAX conversion for SFT batches.
-
-    ``supervised_tokens`` is counted on the numpy side *before*
-    :meth:`SFTBatchOutput.to_jax` to avoid a JAX→host sync each step.
-    """
+    """Host → JAX conversion + device sharding for SFT batches."""
     supervised = int(batch.loss_mask.sum())
-    return batch.to_jax(), batch.state, StepStats(supervised_tokens=supervised)
+    jax_batch = shard_batch(batch.to_jax(), mesh)
+    return jax_batch, batch.state, StepStats(supervised_tokens=supervised)
 
 
 def _build_task_mixture(config: Config) -> TaskMixture:
@@ -315,11 +315,12 @@ def sft_finetune(
         max_empty_passes=config.sft.max_empty_passes,
     )
 
+    mesh = setup_mesh()
     state: LoopState[Transformer, SFTCursor] = LoopState(
-        model=start.model,
-        ema_model=start.ema_model,
-        opt_state=start.opt_state,
-        key=jax.random.PRNGKey(config.sft.seed),
+        model=replicate(start.model, mesh),
+        ema_model=replicate(start.ema_model, mesh),
+        opt_state=replicate(start.opt_state, mesh),
+        key=replicate(jax.random.PRNGKey(config.sft.seed), mesh),
         step=start.step,
         cursor=start.cursor,
     )
@@ -346,7 +347,7 @@ def sft_finetune(
             lr_schedule=lr_schedule,
             base_loader=base_loader,
             settings=settings,
-            prepare_batch=_prepare_sft_batch,
+            prepare_batch=partial(_prepare_sft_batch, mesh=mesh),
             reporter=reporter,
         )
 

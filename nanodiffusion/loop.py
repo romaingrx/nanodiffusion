@@ -111,6 +111,34 @@ type TrainStepFn[M: DiffusionModel, JB] = Callable[
 type PrepareBatch[B, JB, C: LoaderCursor] = Callable[[B], tuple[JB, C, StepStats]]
 
 
+def _collect_host_metrics(
+    step_metrics: StepMetrics,
+    lr_schedule: optax.Schedule,
+    step: int,
+    tok_per_s: int,
+    supervised_tokens_in_window: int,
+    elapsed: float,
+) -> dict[str, float | int | str]:
+    """Merge device-side step metrics with host-side throughput + HBM."""
+    host: dict[str, float | int | str] = {k: float(v) for k, v in step_metrics.items()}
+    loss_value = host.get("loss")
+    if loss_value is None or not math.isfinite(float(loss_value)):
+        msg = f"training diverged at step {step}: loss={loss_value}"
+        raise RuntimeError(msg)
+    host["lr"] = jnp.asarray(lr_schedule(step)).item()
+    host["tok_per_s"] = tok_per_s
+    if supervised_tokens_in_window > 0:
+        host["supervised_tok_per_s"] = int(
+            supervised_tokens_in_window / max(elapsed, 1e-9)
+        )
+    mem = jax.devices()[0].memory_stats()
+    if mem is not None:
+        host["hbm_used_gb"] = round(mem["bytes_in_use"] / 1e9, 2)
+        host["hbm_peak_gb"] = round(mem["peak_bytes_in_use"] / 1e9, 2)
+    host["num_devices"] = jax.device_count()
+    return host
+
+
 def run_training_loop[M: DiffusionModel, B, JB, C: LoaderCursor](
     state: LoopState[M, C],
     *,
@@ -136,6 +164,12 @@ def run_training_loop[M: DiffusionModel, B, JB, C: LoaderCursor](
     Non-finite losses surface as a :class:`RuntimeError` at the next
     log boundary so a divergent run fails fast instead of burning
     budget on garbage updates.
+
+    Device placement (replicate / shard) is the caller's responsibility:
+    the ``state`` pytrees should already be placed on the target devices,
+    and ``prepare_batch`` should shard the batch before returning it.
+    This keeps the loop device-agnostic and avoids importing the
+    sharding module here.
     """
     initial_step = state.step
     last_log_step = state.step
@@ -184,19 +218,14 @@ def run_training_loop[M: DiffusionModel, B, JB, C: LoaderCursor](
                     * settings.nominal_tokens_per_step
                     / max(elapsed, 1e-9)
                 )
-                host_metrics: dict[str, float | int | str] = {
-                    k: float(v) for k, v in latest_metrics.items()
-                }
-                loss_value = host_metrics.get("loss")
-                if loss_value is None or not math.isfinite(float(loss_value)):
-                    msg = f"training diverged at step {state.step}: loss={loss_value}"
-                    raise RuntimeError(msg)
-                host_metrics["lr"] = jnp.asarray(lr_schedule(state.step)).item()
-                host_metrics["tok_per_s"] = tok_per_s
-                if supervised_tokens_in_window > 0:
-                    host_metrics["supervised_tok_per_s"] = int(
-                        supervised_tokens_in_window / max(elapsed, 1e-9)
-                    )
+                host_metrics = _collect_host_metrics(
+                    latest_metrics,
+                    lr_schedule,
+                    step=state.step,
+                    tok_per_s=tok_per_s,
+                    supervised_tokens_in_window=supervised_tokens_in_window,
+                    elapsed=elapsed,
+                )
                 reporter.log(step=state.step, metrics=host_metrics)
                 t_window_start = time.monotonic()
                 last_log_step = state.step
