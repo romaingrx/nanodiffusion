@@ -37,7 +37,9 @@ class ModelConfig(BaseModel):
     dropout_rate: float = 0.0
     ffn_mult: int = 4
     compute_dtype: Literal["float32", "bfloat16"] = "float32"
-    gradient_checkpointing: bool = False
+    remat_policy: Literal["none", "nothing", "dots_no_batch", "dots", "everything"] = (
+        "none"
+    )
 
     @property
     def jnp_dtype(self) -> type:

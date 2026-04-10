@@ -95,10 +95,17 @@
           "title": "Compute Dtype",
           "type": "string"
         },
-        "gradient_checkpointing": {
-          "default": false,
-          "title": "Gradient Checkpointing",
-          "type": "boolean"
+        "remat_policy": {
+          "default": "none",
+          "enum": [
+            "none",
+            "nothing",
+            "dots_no_batch",
+            "dots",
+            "everything"
+          ],
+          "title": "Remat Policy",
+          "type": "string"
         }
       },
       "title": "ModelConfig",
@@ -339,7 +346,7 @@
         "dropout_rate": 0.0,
         "ffn_mult": 4,
         "compute_dtype": "float32",
-        "gradient_checkpointing": false
+        "remat_policy": "none"
       }
     },
     "train": {

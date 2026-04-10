@@ -8,6 +8,13 @@ from nanodiffusion.model.embedding import TimeEmbedding, TokenEmbedding
 from nanodiffusion.ops import cast_dtype
 from nanodiffusion.types import Logits, PRNGKeyArray, Scalar, Tokens
 
+_REMAT_POLICIES = {
+    "nothing": jax.checkpoint_policies.nothing_saveable,
+    "dots_no_batch": jax.checkpoint_policies.dots_with_no_batch_dims_saveable,
+    "dots": jax.checkpoint_policies.dots_saveable,
+    "everything": jax.checkpoint_policies.everything_saveable,
+}
+
 
 class Transformer(DiffusionModel):
     embed: TokenEmbedding
@@ -16,7 +23,7 @@ class Transformer(DiffusionModel):
     final_norm: eqx.nn.RMSNorm
     lm_head: eqx.nn.Linear
     compute_dtype: type = eqx.field(static=True)
-    gradient_checkpointing: bool = eqx.field(static=True)
+    remat_policy: str = eqx.field(static=True)
 
     def __init__(self, config: ModelConfig, *, key: PRNGKeyArray) -> None:
         keys = jax.random.split(key, config.num_layers + 3)
@@ -34,16 +41,17 @@ class Transformer(DiffusionModel):
             config.hidden_dim, config.vocab_size, use_bias=False, key=keys[-1]
         )
         self.compute_dtype = config.jnp_dtype
-        self.gradient_checkpointing = config.gradient_checkpointing
+        self.remat_policy = config.remat_policy
 
     def __call__(self, tokens: Tokens, t: Scalar) -> Logits:
         model = cast_dtype(self, self.compute_dtype)
         x = model.embed(tokens)
         cond = model.time_embed(t)
 
+        policy = _REMAT_POLICIES.get(self.remat_policy)
         for block in model.blocks:
-            if self.gradient_checkpointing:
-                x = eqx.filter_checkpoint(block)(x, cond)
+            if policy is not None:
+                x = eqx.filter_checkpoint(block, policy=policy)(x, cond)
             else:
                 x = block(x, cond)
 
