@@ -59,21 +59,27 @@ def attention(
 
     Backend dispatch:
 
-    * **TPU**: :func:`jax.experimental.pallas.ops.tpu.flash_attention`.
-      A blocked-softmax kernel that never materialises the
-      ``[num_heads, seq, seq]`` score matrix, so attention memory is
-      O(seq) instead of O(seq^2) and the step is also faster than the
-      manual matmul+softmax+matmul triplet.
-    * **CPU / GPU**: :func:`jax.nn.dot_product_attention`. Portable
-      fallback; on GPU it further lowers to cuDNN Flash-SDPA when
-      available, on CPU it is a plain einsum. On TPU this path is
-      strictly worse than Pallas because XLA keeps the score matrix
-      alive, so we never take it there.
+    * **Single-device TPU**:
+      :func:`jax.experimental.pallas.ops.tpu.flash_attention`, a
+      blocked-softmax Pallas kernel with O(seq) memory. Used only on
+      single-chip runs because Mosaic kernels cannot be
+      auto-partitioned by GSPMD (multi-device raises
+      ``NotImplementedError``).
+    * **Multi-device TPU / CPU / GPU**:
+      :func:`jax.nn.dot_product_attention`. Materialises the
+      ``[heads, seq, seq]`` score matrix (O(seq^2) memory), but GSPMD
+      partitions it automatically so it works with any mesh topology.
+      On GPU it further lowers to cuDNN Flash-SDPA when available.
+      Google's Gemma uses this same approach for multi-device training.
     """
     _, _, head_dim = q.shape
     scale = 1.0 / math.sqrt(head_dim)
 
-    if _tpu_flash_attention is not None and jax.default_backend() == "tpu":
+    if (
+        _tpu_flash_attention is not None
+        and jax.default_backend() == "tpu"
+        and jax.device_count() == 1
+    ):
         return _tpu_flash_attention(
             q[jnp.newaxis],
             k[jnp.newaxis],
