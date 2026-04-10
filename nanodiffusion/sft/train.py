@@ -261,6 +261,7 @@ def sft_finetune(
     resume_from: Path | None = None,
     wandb_project: str | None = None,
     wandb_entity: str | None = None,
+    profile_steps: int = 0,
 ) -> Path:
     """Run an SFT fine-tuning job end-to-end.
 
@@ -331,6 +332,7 @@ def sft_finetune(
         prefetch_size=config.sft.prefetch_size,
         nominal_tokens_per_step=config.sft.batch_size * config.model.max_seq_len,
         event_name="sft_train",
+        profile_steps=profile_steps,
     )
     sink_factories = _default_sft_sinks(
         run_dir,

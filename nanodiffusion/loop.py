@@ -83,6 +83,7 @@ class LoopHyperparams:
     prefetch_size: int
     nominal_tokens_per_step: int
     event_name: str
+    profile_steps: int = 0
 
 
 @dataclasses.dataclass
@@ -209,6 +210,21 @@ def run_training_loop[M: DiffusionModel, B, JB, C: LoaderCursor](
                 t_window_start = time.monotonic()
                 last_log_step = state.step
                 supervised_tokens_in_window = 0
+                if settings.profile_steps > 0:
+                    profile_dir = str(run_dir / "profile")
+                    jax.profiler.start_trace(profile_dir)
+                    logger.info("profile_started", path=profile_dir)
+
+            if (
+                settings.profile_steps > 0
+                and state.step == initial_step + 1 + settings.profile_steps
+            ):
+                jax.profiler.stop_trace()
+                logger.info(
+                    "profile_stopped",
+                    path=str(run_dir / "profile"),
+                    steps=settings.profile_steps,
+                )
 
             if state.step % settings.log_every == 0 and state.step > last_log_step:
                 elapsed = time.monotonic() - t_window_start

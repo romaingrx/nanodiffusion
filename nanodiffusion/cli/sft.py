@@ -56,6 +56,16 @@ import click
     default=None,
     help="Optional wandb entity (team/user) scope for the run.",
 )
+@click.option(
+    "--profile-steps",
+    type=int,
+    default=0,
+    show_default=True,
+    help=(
+        "Profile this many steps after the first JIT compile and save "
+        "the trace to run_dir/profile/ (viewable in TensorBoard)."
+    ),
+)
 def sft_command(
     *,
     config_path: Path,
@@ -64,6 +74,7 @@ def sft_command(
     seed: int | None,
     wandb_project: str | None,
     wandb_entity: str | None,
+    profile_steps: int,
 ) -> None:
     """Run SFT from a pretrain checkpoint or resume an interrupted run."""
     from nanodiffusion.config import Config  # noqa: PLC0415
@@ -82,4 +93,5 @@ def sft_command(
         resume_from=resume_from,
         wandb_project=wandb_project,
         wandb_entity=wandb_entity,
+        profile_steps=profile_steps,
     )

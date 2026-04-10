@@ -242,6 +242,7 @@ def pretrain(
     resume_from: Path | None = None,
     wandb_project: str | None = None,
     wandb_entity: str | None = None,
+    profile_steps: int = 0,
 ) -> Path:
     """Run an MDLM pretraining job end-to-end.
 
@@ -308,6 +309,7 @@ def pretrain(
         prefetch_size=config.data.prefetch_size,
         nominal_tokens_per_step=config.train.batch_size * config.model.max_seq_len,
         event_name="train",
+        profile_steps=profile_steps,
     )
     sink_factories = _default_pretrain_sinks(
         run_dir,
