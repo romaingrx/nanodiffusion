@@ -76,11 +76,6 @@
           "title": "Max Seq Len",
           "type": "integer"
         },
-        "dropout_rate": {
-          "default": 0.0,
-          "title": "Dropout Rate",
-          "type": "number"
-        },
         "ffn_mult": {
           "default": 4,
           "title": "Ffn Mult",
@@ -343,7 +338,6 @@
         "hidden_dim": 768,
         "num_heads": 12,
         "max_seq_len": 1024,
-        "dropout_rate": 0.0,
         "ffn_mult": 4,
         "compute_dtype": "float32",
         "remat_policy": "none"

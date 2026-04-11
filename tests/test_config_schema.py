@@ -34,6 +34,14 @@ def test_checked_in_schema_matches_current_config_class() -> None:
     )
 
 
+def test_schema_and_configs_do_not_expose_dropout_rate() -> None:
+    schema = json.loads(_SCHEMA_PATH.read_text())
+    model_schema = schema["$defs"]["ModelConfig"]
+    assert "dropout_rate" not in model_schema["properties"]
+    for yaml_path in sorted(_CONFIGS_DIR.glob("*.yaml")):
+        assert "dropout_rate" not in yaml_path.read_text()
+
+
 @pytest.mark.parametrize(
     "yaml_path",
     sorted(p for p in _CONFIGS_DIR.glob("*.yaml")),

@@ -1,5 +1,6 @@
 import equinox as eqx
 import jax
+from jax.sharding import Mesh
 
 from nanodiffusion.config import ModelConfig
 from nanodiffusion.model._base import DiffusionModel
@@ -43,7 +44,13 @@ class Transformer(DiffusionModel):
         self.compute_dtype = config.jnp_dtype
         self.remat_policy = config.remat_policy
 
-    def __call__(self, tokens: Tokens, t: Scalar) -> Logits:
+    def __call__(
+        self,
+        tokens: Tokens,
+        t: Scalar,
+        *,
+        mesh: Mesh | None = None,
+    ) -> Logits:
         model = cast_dtype(self, self.compute_dtype)
         x = model.embed(tokens)
         cond = model.time_embed(t)
@@ -51,9 +58,9 @@ class Transformer(DiffusionModel):
         policy = _REMAT_POLICIES.get(self.remat_policy)
         for block in model.blocks:
             if policy is not None:
-                x = eqx.filter_checkpoint(block, policy=policy)(x, cond)
+                x = eqx.filter_checkpoint(block, policy=policy)(x, cond, mesh=mesh)
             else:
-                x = block(x, cond)
+                x = block(x, cond, mesh=mesh)
 
         x = jax.vmap(model.final_norm)(x)
         return jax.vmap(model.lm_head)(x)

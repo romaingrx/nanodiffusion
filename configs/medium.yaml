@@ -23,7 +23,6 @@ model:
   hidden_dim: 1024
   num_heads: 16
   max_seq_len: 1024
-  dropout_rate: 0.0
   ffn_mult: 4
   compute_dtype: bfloat16
   remat_policy: dots_no_batch

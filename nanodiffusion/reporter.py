@@ -177,7 +177,7 @@ class Reporter(AbstractContextManager["Reporter"]):
         self._queue: MPQueue[MetricEvent | None] | None = None
         self._proc: SpawnProcess | None = None
 
-    def __enter__(self) -> "Reporter":  # noqa: PYI034 (beartype can't handle PEP 673 Self)
+    def __enter__(self) -> "Reporter":
         self._queue = self._ctx.Queue(maxsize=self._max_queue)
         self._proc = self._ctx.Process(
             target=_worker_main,
@@ -234,7 +234,7 @@ class InlineReporter(AbstractContextManager["InlineReporter"]):
         self._factories = tuple(sink_factories)
         self._sinks: list[MetricSink] = []
 
-    def __enter__(self) -> "InlineReporter":  # noqa: PYI034 (beartype can't handle PEP 673 Self)
+    def __enter__(self) -> "InlineReporter":
         self._sinks = [f() for f in self._factories]
         return self
 

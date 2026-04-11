@@ -1,8 +1,8 @@
 """Shared training loop driving pretrain and SFT.
 
-Paradigm-specific differences (batch pytree shape, optional per-step
-metrics) are threaded through a :class:`PrepareBatch` callback and the
-``StepMetrics`` dict returned by :data:`TrainStepFn`, so
+Paradigm-specific differences (batch pytree shape and optional host-side
+extras) are threaded through a :class:`PrepareBatch` callback and the
+typed metrics returned by :data:`TrainStepFn`, so
 :func:`run_training_loop` owns the timing/saving/metric-forwarding
 logic once. The loop never imports wandb or any other metric backend;
 it calls into a :class:`~nanodiffusion.reporter.MetricReporter` which
@@ -17,7 +17,6 @@ from collections.abc import Callable, Iterator
 from pathlib import Path
 
 import jax
-import jax.numpy as jnp
 import optax
 import structlog
 from pydantic import BaseModel
@@ -25,20 +24,19 @@ from pydantic import BaseModel
 from nanodiffusion.checkpoint import save_checkpoint, write_config
 from nanodiffusion.data.cursors import LoaderCursor
 from nanodiffusion.data.loader import prefetch
+from nanodiffusion.metrics import (
+    CoreHostMetrics,
+    CoreStepMetrics,
+    NoHostExtras,
+    ReportMetrics,
+    SFTHostExtras,
+)
 from nanodiffusion.model import DiffusionModel
 from nanodiffusion.reporter import MetricReporter
-from nanodiffusion.types import PRNGKeyArray, Scalar
+from nanodiffusion.train_step import TrainStepFn
+from nanodiffusion.types import PRNGKeyArray
 
 logger = structlog.get_logger(__name__)
-
-
-type StepMetrics = dict[str, Scalar]
-"""Per-step metrics returned from a JIT'd train step.
-
-Keys are paradigm-specific (pretrain vs SFT decide what to expose), but
-the loop requires the ``"loss"`` key to be present so it can run the
-divergence (non-finite) guard at each log boundary.
-"""
 
 
 def make_run_id() -> str:
@@ -104,52 +102,46 @@ class LoopState[M: DiffusionModel, C: LoaderCursor]:
     last_saved_step: int | None = None
 
 
-type TrainStepFn[M: DiffusionModel, JB] = Callable[
-    [M, M, optax.OptState, JB, PRNGKeyArray],
-    tuple[M, M, optax.OptState, StepMetrics],
-]
-
 type PrepareBatch[B, JB, C: LoaderCursor] = Callable[[B], tuple[JB, C, StepStats]]
 
 
 def _collect_host_metrics(
-    step_metrics: StepMetrics,
+    step_metrics: CoreStepMetrics,
     lr_schedule: optax.Schedule,
     step: int,
     tok_per_s: int,
     supervised_tokens_in_window: int,
     elapsed: float,
-) -> dict[str, float | int | str]:
+) -> ReportMetrics:
     """Merge device-side step metrics with host-side throughput + HBM.
 
-    Non-finite losses no longer raise — the JIT'd train step now skips
-    the model update on non-finite gradients (see
+    Non-finite losses no longer raise. The JIT'd train step skips the
+    model update on non-finite gradients (see
     :func:`nanodiffusion.optimizer.apply_or_skip`), so training can
-    recover from transient spikes. We still surface a warning so the
-    operator sees them and can correlate with ``grad_finite=0`` in the
-    metrics stream.
+    recover from transient spikes while still surfacing a warning.
     """
-    host: dict[str, float | int | str] = {k: float(v) for k, v in step_metrics.items()}
-    loss_value = host.get("loss")
-    if loss_value is None or not math.isfinite(float(loss_value)):
+    core = CoreHostMetrics.from_step_metrics(
+        step_metrics,
+        lr_schedule=lr_schedule,
+        step=step,
+        tok_per_s=tok_per_s,
+    )
+    if not math.isfinite(core.loss):
         logger.warning(
             "non_finite_loss",
             step=step,
-            loss=loss_value,
-            grad_finite=host.get("grad_finite"),
+            loss=core.loss,
+            grad_finite=core.grad_finite,
         )
-    host["lr"] = jnp.asarray(lr_schedule(step)).item()
-    host["tok_per_s"] = tok_per_s
-    if supervised_tokens_in_window > 0:
-        host["supervised_tok_per_s"] = int(
-            supervised_tokens_in_window / max(elapsed, 1e-9)
+    extras = (
+        SFTHostExtras.from_window(
+            supervised_tokens_in_window=supervised_tokens_in_window,
+            elapsed=elapsed,
         )
-    mem = jax.devices()[0].memory_stats()
-    if mem is not None:
-        host["hbm_used_gb"] = round(mem["bytes_in_use"] / 1e9, 2)
-        host["hbm_peak_gb"] = round(mem["peak_bytes_in_use"] / 1e9, 2)
-    host["num_devices"] = jax.device_count()
-    return host
+        if supervised_tokens_in_window > 0
+        else NoHostExtras()
+    )
+    return ReportMetrics(core=core, extras=extras)
 
 
 def run_training_loop[M: DiffusionModel, B, JB, C: LoaderCursor](
@@ -174,10 +166,6 @@ def run_training_loop[M: DiffusionModel, B, JB, C: LoaderCursor](
     save is skipped when a periodic save already landed on the terminal
     step.
 
-    Non-finite losses surface as a :class:`RuntimeError` at the next
-    log boundary so a divergent run fails fast instead of burning
-    budget on garbage updates.
-
     Device placement (replicate / shard) is the caller's responsibility:
     the ``state`` pytrees should already be placed on the target devices,
     and ``prepare_batch`` should shard the batch before returning it.
@@ -187,7 +175,6 @@ def run_training_loop[M: DiffusionModel, B, JB, C: LoaderCursor](
     initial_step = state.step
     last_log_step = state.step
     supervised_tokens_in_window = 0
-    latest_metrics: StepMetrics = {}
 
     def _save() -> None:
         ckpt_dir = run_dir / f"step_{state.step}"
@@ -213,7 +200,7 @@ def run_training_loop[M: DiffusionModel, B, JB, C: LoaderCursor](
             state.cursor = cursor
             supervised_tokens_in_window += stats.supervised_tokens
             state.key, step_key = jax.random.split(state.key)
-            state.model, state.ema_model, state.opt_state, latest_metrics = train_step(
+            state.model, state.ema_model, state.opt_state, step_metrics = train_step(
                 state.model, state.ema_model, state.opt_state, jax_batch, step_key
             )
             state.step += 1
@@ -247,14 +234,14 @@ def run_training_loop[M: DiffusionModel, B, JB, C: LoaderCursor](
                     / max(elapsed, 1e-9)
                 )
                 host_metrics = _collect_host_metrics(
-                    latest_metrics,
+                    step_metrics,
                     lr_schedule,
                     step=state.step,
                     tok_per_s=tok_per_s,
                     supervised_tokens_in_window=supervised_tokens_in_window,
                     elapsed=elapsed,
                 )
-                reporter.log(step=state.step, metrics=host_metrics)
+                reporter.log(step=state.step, metrics=host_metrics.to_dict())
                 t_window_start = time.monotonic()
                 last_log_step = state.step
                 supervised_tokens_in_window = 0

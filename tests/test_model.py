@@ -1,6 +1,9 @@
 import equinox as eqx
 import jax
 import jax.numpy as jnp
+import numpy as np
+import pytest
+from jax.sharding import Mesh
 
 from nanodiffusion.config import ModelConfig
 from nanodiffusion.model.attention import SelfAttention
@@ -62,6 +65,37 @@ def test_self_attention_is_bidirectional(key: jax.Array) -> None:
     x_modified_last = x.at[-1].set(x[-1] + 10.0)
     out_modified_last = attn(x_modified_last)
     assert not jnp.allclose(out_orig[0], out_modified_last[0])
+
+
+def test_self_attention_uses_per_chip_helper_when_mesh_is_passed(
+    key: jax.Array, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    attn = SelfAttention(64, 4, key=key)
+    mesh = Mesh(np.asarray(jax.devices()).reshape(1, 1), ("X", "Y"))
+    x = jax.random.normal(key, (16, 64))
+    called = False
+
+    def fake_per_chip_attention(
+        q: jax.Array,
+        k: jax.Array,
+        v: jax.Array,
+        *,
+        mesh: Mesh,
+    ) -> jax.Array:
+        nonlocal called
+        called = True
+        del mesh
+        return jnp.zeros_like(q + k + v)
+
+    monkeypatch.setattr(
+        "nanodiffusion.model.attention.per_chip_attention",
+        fake_per_chip_attention,
+    )
+
+    out = attn(x, mesh=mesh)
+
+    assert called
+    assert out.shape == (16, 64)
 
 
 def test_feed_forward_shape(key: jax.Array, small_config: ModelConfig) -> None:

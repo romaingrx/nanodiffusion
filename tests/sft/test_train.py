@@ -56,6 +56,7 @@ def test_sft_train_step_decreases_loss_on_fixed_batch(
 
     train_step = make_sft_train_step(
         optimizer,
+        mesh=None,
         schedule=LogLinearSchedule(),
         mask_token_id=small_config.vocab_size - 1,
         ema_decay=sft_cfg.ema_decay,
@@ -69,7 +70,7 @@ def test_sft_train_step_decreases_loss_on_fixed_batch(
         model, ema_model, opt_state, metrics = train_step(
             model, ema_model, opt_state, batch, step_key
         )
-        losses.append(float(metrics["loss"]))
+        losses.append(float(metrics.loss))
 
     early = float(np.mean(losses[:5]))
     late = float(np.mean(losses[-5:]))
@@ -87,6 +88,7 @@ def test_sft_train_step_is_deterministic(
     opt_state = optimizer.init(eqx.filter(model, eqx.is_inexact_array))
     train_step = make_sft_train_step(
         optimizer,
+        mesh=None,
         schedule=LogLinearSchedule(),
         mask_token_id=small_config.vocab_size - 1,
         ema_decay=0.9,
@@ -102,7 +104,7 @@ def test_sft_train_step_is_deterministic(
         clone_state(model), clone_state(model), clone_state(opt_state), batch, step_key
     )
 
-    assert float(mx1["loss"]) == float(mx2["loss"])
+    assert float(mx1.loss) == float(mx2.loss)
     for a, b in zip(inexact_leaves(m1), inexact_leaves(m2), strict=True):
         np.testing.assert_array_equal(a, b)
     for a, b in zip(inexact_leaves(e1), inexact_leaves(e2), strict=True):
@@ -124,6 +126,7 @@ def test_sft_train_step_prompt_positions_have_zero_embedding_grad(
     opt_state = optimizer.init(eqx.filter(model, eqx.is_inexact_array))
     train_step = make_sft_train_step(
         optimizer,
+        mesh=None,
         schedule=LogLinearSchedule(),
         mask_token_id=small_config.vocab_size - 1,
         ema_decay=0.9,
@@ -143,7 +146,7 @@ def test_sft_train_step_prompt_positions_have_zero_embedding_grad(
     new_model, _new_ema, _opt, metrics = train_step(
         clone_state(model), clone_state(model), opt_state, batch, step_key
     )
-    assert float(metrics["loss"]) == 0.0
+    assert float(metrics.loss) == 0.0
     # With zero loss, the optimizer should have made no change to the model.
     for before, after in zip(
         inexact_leaves(model), inexact_leaves(new_model), strict=True
@@ -167,6 +170,7 @@ def test_make_sft_train_step_narrows_via_sfttrainstepfn_annotation(
 
     train_step: SFTTrainStepFn[Transformer] = make_sft_train_step(
         optimizer,
+        mesh=None,
         schedule=LogLinearSchedule(),
         mask_token_id=small_config.vocab_size - 1,
         ema_decay=0.9,
@@ -182,7 +186,7 @@ def test_make_sft_train_step_narrows_via_sfttrainstepfn_annotation(
     assert_type(new_ema, Transformer)
     assert type(new_model) is Transformer
     assert type(new_ema) is Transformer
-    assert jnp.isfinite(metrics["loss"])
+    assert jnp.isfinite(metrics.loss)
 
 
 def _make_sft_conv(i: int) -> Conversation:

@@ -94,6 +94,7 @@ def test_train_step_decreases_loss_on_fixed_batch(
     mask_id = small_config.vocab_size - 1
     train_step = make_train_step(
         optimizer,
+        mesh=None,
         schedule=LogLinearSchedule(),
         mask_token_id=mask_id,
         ema_decay=train_cfg.ema_decay,
@@ -111,7 +112,7 @@ def test_train_step_decreases_loss_on_fixed_batch(
         model, ema_model, opt_state, metrics = train_step(
             model, ema_model, opt_state, batch, step_key
         )
-        losses.append(float(metrics["loss"]))
+        losses.append(float(metrics.loss))
 
     early = float(np.mean(losses[:5]))
     late = float(np.mean(losses[-5:]))
@@ -137,6 +138,7 @@ def test_train_step_updates_model_and_ema(
 
     train_step = make_train_step(
         optimizer,
+        mesh=None,
         schedule=LogLinearSchedule(),
         mask_token_id=small_config.vocab_size - 1,
         ema_decay=train_cfg.ema_decay,
@@ -169,6 +171,7 @@ def test_train_step_jits_and_is_deterministic(
 
     train_step = make_train_step(
         optimizer,
+        mesh=None,
         schedule=LogLinearSchedule(),
         mask_token_id=small_config.vocab_size - 1,
         ema_decay=0.9,
@@ -184,7 +187,7 @@ def test_train_step_jits_and_is_deterministic(
         clone_state(model), clone_state(model), clone_state(opt_state), batch, step_key
     )
 
-    assert float(mx1["loss"]) == pytest.approx(float(mx2["loss"]), abs=0.0)
+    assert float(mx1.loss) == pytest.approx(float(mx2.loss), abs=0.0)
     for a, b in zip(inexact_leaves(m1), inexact_leaves(m2), strict=True):
         np.testing.assert_array_equal(a, b)
     for a, b in zip(inexact_leaves(e1), inexact_leaves(e2), strict=True):
@@ -203,6 +206,7 @@ def test_train_step_produces_finite_updates(
 
     train_step = make_train_step(
         optimizer,
+        mesh=None,
         schedule=LogLinearSchedule(),
         mask_token_id=small_config.vocab_size - 1,
         ema_decay=0.9,
@@ -216,9 +220,9 @@ def test_train_step_produces_finite_updates(
         model, clone_state(model), opt_state, batch, step_key
     )
 
-    assert jnp.isfinite(metrics["loss"])
-    assert jnp.isfinite(metrics["grad_norm"])
-    assert jnp.isfinite(metrics["param_norm"])
+    assert jnp.isfinite(metrics.loss)
+    assert jnp.isfinite(metrics.grad_norm)
+    assert jnp.isfinite(metrics.param_norm)
     for tree in (new_model, new_ema):
         for leaf in inexact_leaves(tree):
             assert jnp.all(jnp.isfinite(leaf))
@@ -242,6 +246,7 @@ def test_train_step_signature_accepts_optax_chain() -> None:
 
     step = make_train_step(
         optimizer,
+        mesh=None,
         schedule=LogLinearSchedule(),
         mask_token_id=cfg.vocab_size - 1,
         ema_decay=0.9,
@@ -250,7 +255,7 @@ def test_train_step_signature_accepts_optax_chain() -> None:
     _m, _e, _o, metrics = step(
         model, clone_state(model), opt_state, batch, jax.random.PRNGKey(1)
     )
-    assert jnp.isfinite(metrics["loss"])
+    assert jnp.isfinite(metrics.loss)
 
 
 def test_make_train_step_narrows_via_trainstepfn_annotation(
@@ -270,6 +275,7 @@ def test_make_train_step_narrows_via_trainstepfn_annotation(
 
     train_step: TrainStepFn[Transformer] = make_train_step(
         optimizer,
+        mesh=None,
         schedule=LogLinearSchedule(),
         mask_token_id=small_config.vocab_size - 1,
         ema_decay=0.9,
@@ -285,7 +291,7 @@ def test_make_train_step_narrows_via_trainstepfn_annotation(
     assert_type(new_ema, Transformer)
     assert type(new_model) is Transformer
     assert type(new_ema) is Transformer
-    assert jnp.isfinite(metrics["loss"])
+    assert jnp.isfinite(metrics.loss)
 
 
 def test_train_config_rejects_non_positive_save_every() -> None:

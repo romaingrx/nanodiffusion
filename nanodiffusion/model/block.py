@@ -1,6 +1,7 @@
 import equinox as eqx
 import jax
 import jax.numpy as jnp
+from jax.sharding import Mesh
 from jaxtyping import Array, Float
 
 from nanodiffusion.config import ModelConfig
@@ -80,7 +81,11 @@ class TransformerBlock(eqx.Module):
         self.adaln = AdaLNModulation(config.hidden_dim, key=mkey)
 
     def __call__(
-        self, x: Float[Array, "seq dim"], cond: Float[Array, " dim"]
+        self,
+        x: Float[Array, "seq dim"],
+        cond: Float[Array, " dim"],
+        *,
+        mesh: Mesh | None = None,
     ) -> Float[Array, "seq dim"]:
         shift_attn, scale_attn, gate_attn, shift_ffn, scale_ffn, gate_ffn = self.adaln(
             cond
@@ -88,7 +93,7 @@ class TransformerBlock(eqx.Module):
 
         h = jax.vmap(self.attn_norm)(x)
         h = (1 + scale_attn) * h + shift_attn
-        h = self.attn(h)
+        h = self.attn(h, mesh=mesh)
         x = x + gate_attn * h
 
         h = jax.vmap(self.ffn_norm)(x)

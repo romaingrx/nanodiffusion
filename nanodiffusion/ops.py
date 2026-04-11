@@ -17,6 +17,8 @@ import math
 import equinox as eqx
 import jax
 import jax.numpy as jnp
+from jax.sharding import Mesh
+from jax.sharding import PartitionSpec as P
 from jaxtyping import Array, Float
 
 try:
@@ -87,3 +89,28 @@ def attention(
     v_tnh = jnp.transpose(v, (1, 0, 2))
     out_tnh = jax.nn.dot_product_attention(q_tnh, k_tnh, v_tnh, scale=scale)
     return jnp.transpose(out_tnh, (1, 0, 2))
+
+
+def per_chip_attention(
+    q: Float[Array, "heads seq head_dim"],
+    k: Float[Array, "heads seq head_dim"],
+    v: Float[Array, "heads seq head_dim"],
+    *,
+    mesh: Mesh,
+) -> Float[Array, "heads seq head_dim"]:
+    """Run :func:`attention` inside a tiny manual per-chip region on TPU.
+
+    The Pallas TPU flash-attention kernel must execute on local per-chip
+    tensors; wrapping only the kernel call in :func:`jax.shard_map`
+    keeps the manual region narrow and leaves the rest of the model in
+    normal compiler-driven mode. ``check_vma=False`` is required for a
+    Pallas kernel in the shard-map body on current JAX.
+    """
+    sharded_attention = jax.shard_map(
+        attention,
+        mesh=mesh,
+        in_specs=(P(), P(), P()),
+        out_specs=P(),
+        check_vma=False,
+    )
+    return sharded_attention(q, k, v)

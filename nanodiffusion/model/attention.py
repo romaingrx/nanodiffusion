@@ -1,9 +1,10 @@
 import equinox as eqx
 import jax
 import jax.numpy as jnp
+from jax.sharding import Mesh
 from jaxtyping import Array, Float
 
-from nanodiffusion.ops import attention
+from nanodiffusion.ops import attention, per_chip_attention
 from nanodiffusion.types import PRNGKeyArray
 
 
@@ -34,7 +35,12 @@ class SelfAttention(eqx.Module):
         self.k_norm = eqx.nn.RMSNorm(self.head_dim, use_weight=False, use_bias=False)
         self.rope = eqx.nn.RotaryPositionalEmbedding(self.head_dim)
 
-    def __call__(self, x: Float[Array, "seq dim"]) -> Float[Array, "seq dim"]:
+    def __call__(
+        self,
+        x: Float[Array, "seq dim"],
+        *,
+        mesh: Mesh | None = None,
+    ) -> Float[Array, "seq dim"]:
         q = jax.vmap(self.q_proj)(x)
         k = jax.vmap(self.k_proj)(x)
         v = jax.vmap(self.v_proj)(x)
@@ -56,7 +62,11 @@ class SelfAttention(eqx.Module):
         q = jax.vmap(self.rope)(q)
         k = jax.vmap(self.rope)(k)
 
-        out = attention(q, k, v)
+        out = (
+            per_chip_attention(q, k, v, mesh=mesh)
+            if mesh is not None
+            else attention(q, k, v)
+        )
 
         out = jnp.transpose(out, (1, 0, 2))
         out = out.reshape(seq_len, self.num_heads * self.head_dim)

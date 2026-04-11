@@ -6,6 +6,7 @@ per-position NLL arithmetic stays shared with :mod:`nanodiffusion.sft`.
 
 import jax
 import jax.numpy as jnp
+from jax.sharding import Mesh
 
 from nanodiffusion.loss import TimeSampler, low_discrepancy_sampler, token_nll
 from nanodiffusion.model import DiffusionModel
@@ -55,6 +56,7 @@ def diffusion_loss(
     x0: Tokens,
     t: Scalar,
     *,
+    mesh: Mesh | None = None,
     schedule: NoiseSchedule,
     mask_token_id: int,
     key: PRNGKeyArray,
@@ -66,7 +68,7 @@ def diffusion_loss(
     xt, is_masked = forward_mask(
         x0, t, schedule=schedule, mask_token_id=mask_token_id, key=key
     )
-    logits = model(xt, t)
+    logits = model(xt, t, mesh=mesh)
     return masked_nll(logits, x0, is_masked, loss_weight(schedule, t))
 
 
@@ -74,6 +76,7 @@ def compute_loss(
     model: DiffusionModel,
     x0: TokenBatch,
     *,
+    mesh: Mesh | None = None,
     schedule: NoiseSchedule,
     mask_token_id: int,
     key: PRNGKeyArray,
@@ -87,7 +90,13 @@ def compute_loss(
 
     def _per_sample(xi: Tokens, ti: Scalar, ki: PRNGKeyArray) -> Scalar:
         return diffusion_loss(
-            model, xi, ti, schedule=schedule, mask_token_id=mask_token_id, key=ki
+            model,
+            xi,
+            ti,
+            mesh=mesh,
+            schedule=schedule,
+            mask_token_id=mask_token_id,
+            key=ki,
         )
 
     losses = jax.vmap(_per_sample)(x0, t_batch, keys)

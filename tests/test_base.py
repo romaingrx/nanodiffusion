@@ -1,5 +1,7 @@
 from pathlib import Path
 
+import pytest
+
 from nanodiffusion.config import Config, ModelConfig, SampleConfig, TrainConfig
 from nanodiffusion.types import Mask, MaskBatch, TokenBatch, Tokens
 
@@ -21,6 +23,11 @@ def test_default_config() -> None:
 def test_model_config_head_dim() -> None:
     cfg = ModelConfig(hidden_dim=768, num_heads=12)
     assert cfg.head_dim == 64
+
+
+def test_model_config_rejects_non_divisible_head_dim() -> None:
+    with pytest.raises(ValueError, match="hidden_dim"):
+        ModelConfig(hidden_dim=770, num_heads=12)
 
 
 def test_config_from_yaml(config_path: Path) -> None:

@@ -82,7 +82,7 @@ def apply_or_skip[M: eqx.Module](
 
     def _apply() -> tuple[M, M, optax.OptState]:
         updates, new_opt_state = optimizer.update(
-            grads,  # pyright: ignore[reportArgumentType]
+            eqx.filter(grads, eqx.is_inexact_array),  # pyright: ignore[reportArgumentType]
             opt_state,
             eqx.filter(model, eqx.is_inexact_array),
         )

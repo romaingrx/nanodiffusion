@@ -9,9 +9,7 @@ import jax
 import jax.numpy as jnp
 import optax
 import structlog
-from jax import shard_map
 from jax.sharding import Mesh
-from jax.sharding import PartitionSpec as P
 
 from nanodiffusion.checkpoint import (
     load_checkpoint,
@@ -27,14 +25,12 @@ from nanodiffusion.data.sft_loader import SFTBatchOutput, SFTJaxBatch, sft_loade
 from nanodiffusion.loop import (
     LoopHyperparams,
     LoopState,
-    StepMetrics,
     StepStats,
-    TrainStepFn,
     resolve_run_dir,
     run_training_loop,
 )
 from nanodiffusion.model import DiffusionModel, Transformer, transformer_skeleton
-from nanodiffusion.optimizer import apply_or_skip, make_optimizer, scale_ema_decay
+from nanodiffusion.optimizer import make_optimizer, scale_ema_decay
 from nanodiffusion.reporter import (
     JsonlSink,
     Reporter,
@@ -42,10 +38,17 @@ from nanodiffusion.reporter import (
     StructlogSink,
     WandbSink,
 )
+from nanodiffusion.runtime import configure_jax_runtime, place_training_state
 from nanodiffusion.schedule import LogLinearSchedule, NoiseSchedule
 from nanodiffusion.sft.loss import compute_sft_loss
-from nanodiffusion.sharding import DP_AXES, replicate, setup_mesh, shard_batch
+from nanodiffusion.sharding import setup_mesh, shard_batch
 from nanodiffusion.tokenizer import Tokenizer
+from nanodiffusion.train_step import (
+    TrainStepFn,
+)
+from nanodiffusion.train_step import (
+    make_train_step as make_shared_train_step,
+)
 from nanodiffusion.types import PRNGKeyArray, Scalar
 
 logger = structlog.get_logger(__name__)
@@ -57,92 +60,29 @@ type SFTTrainStepFn[M: DiffusionModel] = TrainStepFn[M, SFTJaxBatch]
 def make_sft_train_step[M: DiffusionModel](
     optimizer: optax.GradientTransformation,
     *,
+    mesh: Mesh | None,
     schedule: NoiseSchedule,
     mask_token_id: int,
     ema_decay: float,
-    mesh: Mesh | None = None,
 ) -> SFTTrainStepFn[M]:
-    """Build an ``eqx.filter_jit`` train step for SFT.
+    """Build an SFT train step by binding the SFT loss adapter."""
 
-    Unpacks the :class:`SFTJaxBatch` tokens + loss_mask pair that
-    :func:`compute_sft_loss` expects. Closures pin ``optimizer``,
-    ``schedule``, ``mask_token_id``, and ``ema_decay`` at trace time
-    so the JIT cache key stays stable.
-
-    ``mesh``: see :func:`nanodiffusion.pretrain.train.make_train_step`.
-
-    Returns a metrics dict with ``loss``, ``grad_norm``, ``param_norm``,
-    and ``grad_finite`` matching the pretrain step so the loop can
-    forward them to sinks uniformly. ``grad_finite`` is 0.0 whenever
-    the step was skipped because the gradient norm or loss was
-    non-finite.
-    """
-
-    def _compute_loss(m: M, batch: SFTJaxBatch, key: PRNGKeyArray) -> Scalar:
+    def loss_fn(m: M, batch: SFTJaxBatch, key: PRNGKeyArray) -> Scalar:
         return compute_sft_loss(
             m,
             batch.tokens,
             batch.loss_mask,
+            mesh=mesh,
             schedule=schedule,
             mask_token_id=mask_token_id,
             key=key,
         )
 
-    if mesh is not None:
-
-        def _sharded_loss(m: M, batch: SFTJaxBatch, key: PRNGKeyArray) -> Scalar:
-            def _per_shard(m: M, batch: SFTJaxBatch, key: PRNGKeyArray) -> Scalar:
-                local_key = key
-                for axis in DP_AXES:
-                    local_key = jax.random.fold_in(local_key, jax.lax.axis_index(axis))
-                loss = _compute_loss(m, batch, local_key)
-                return jax.lax.pmean(loss, axis_name=DP_AXES)
-
-            return shard_map(  # pyright: ignore[reportCallIssue]
-                _per_shard,
-                mesh=mesh,
-                in_specs=(P(), P(DP_AXES), P()),
-                out_specs=P(),
-                check_vma=False,
-            )(m, batch, key)
-
-        forward = _sharded_loss
-    else:
-        forward = _compute_loss
-
-    @eqx.filter_jit(donate="all")
-    def train_step(
-        model: M,
-        ema_model: M,
-        opt_state: optax.OptState,
-        batch: SFTJaxBatch,
-        key: PRNGKeyArray,
-    ) -> tuple[M, M, optax.OptState, StepMetrics]:
-        def loss_fn(m: M) -> Scalar:
-            return forward(m, batch, key)
-
-        loss, grads = eqx.filter_value_and_grad(loss_fn)(model)
-        grad_norm = optax.tree.norm(grads)
-        finite = jnp.isfinite(grad_norm) & jnp.isfinite(loss)
-        new_model, new_ema_model, new_opt_state = apply_or_skip(
-            finite,
-            optimizer=optimizer,
-            model=model,
-            ema_model=ema_model,
-            opt_state=opt_state,
-            grads=grads,
-            ema_decay=ema_decay,
-        )
-        param_norm = optax.tree.norm(eqx.filter(new_model, eqx.is_inexact_array))
-        metrics: StepMetrics = {
-            "loss": loss,
-            "grad_norm": grad_norm,
-            "param_norm": param_norm,
-            "grad_finite": finite.astype(jnp.float32),
-        }
-        return new_model, new_ema_model, new_opt_state, metrics
-
-    return train_step
+    return make_shared_train_step(
+        optimizer,
+        loss_fn=loss_fn,
+        ema_decay=ema_decay,
+    )
 
 
 def _prepare_sft_batch(
@@ -329,9 +269,7 @@ def sft_finetune(
 
     tok = Tokenizer(encode_threads=config.sft.tokenizer_threads)
     run_dir = resolve_run_dir(config.sft.run_dir, resume_from=resume_from)
-    jax.config.update("jax_compilation_cache_dir", str(run_dir / ".jax_cache"))
-    jax.config.update("jax_explain_cache_misses", True)  # noqa: FBT003
-    jax.config.update("jax_optimization_level", "O1")
+    configure_jax_runtime(run_dir)
     write_config(run_dir, config)
     logger.info(
         "sft_start",
@@ -348,10 +286,10 @@ def sft_finetune(
     ema_decay = scale_ema_decay(config.sft.ema_decay, jax.device_count())
     train_step = make_sft_train_step(
         optimizer,
+        mesh=mesh,
         schedule=LogLinearSchedule(),
         mask_token_id=tok.mask_token_id,
         ema_decay=ema_decay,
-        mesh=mesh,
     )
 
     source = _build_task_mixture(config)
@@ -365,11 +303,18 @@ def sft_finetune(
         max_empty_passes=config.sft.max_empty_passes,
     )
 
+    placed_model, placed_ema_model, placed_opt_state, placed_key = place_training_state(
+        start.model,
+        start.ema_model,
+        start.opt_state,
+        jax.random.PRNGKey(config.sft.seed),
+        mesh,
+    )
     state: LoopState[Transformer, SFTCursor] = LoopState(
-        model=replicate(start.model, mesh),
-        ema_model=replicate(start.ema_model, mesh),
-        opt_state=replicate(start.opt_state, mesh),
-        key=replicate(jax.random.PRNGKey(config.sft.seed), mesh),
+        model=placed_model,
+        ema_model=placed_ema_model,
+        opt_state=placed_opt_state,
+        key=placed_key,
         step=start.step,
         cursor=start.cursor,
     )

@@ -15,6 +15,7 @@ runs go through the same code path: a 1x1 mesh makes every
 
 import math
 
+import equinox as eqx
 import jax
 import numpy as np
 from jax.sharding import Mesh, NamedSharding
@@ -55,7 +56,12 @@ def setup_mesh() -> Mesh:
 
 def replicate[T](tree: T, mesh: Mesh) -> T:
     """Place every leaf of *tree* replicated on all mesh devices."""
-    return jax.device_put(tree, NamedSharding(mesh, P()))
+    sharding = NamedSharding(mesh, P())
+    return jax.tree.map(
+        lambda leaf: jax.device_put(leaf, sharding) if eqx.is_array(leaf) else leaf,
+        tree,
+        is_leaf=eqx.is_array,
+    )
 
 
 def shard_batch[T](batch: T, mesh: Mesh) -> T:
@@ -68,7 +74,12 @@ def shard_batch[T](batch: T, mesh: Mesh) -> T:
     split across both mesh axes so the batch dimension is distributed
     over all devices even on a rectangular topology.
     """
-    return jax.device_put(batch, NamedSharding(mesh, P(DP_AXES)))
+    sharding = NamedSharding(mesh, P(DP_AXES))
+    return jax.tree.map(
+        lambda leaf: jax.device_put(leaf, sharding) if eqx.is_array(leaf) else leaf,
+        batch,
+        is_leaf=eqx.is_array,
+    )
 
 
 def shard_keys(key: PRNGKeyArray, mesh: Mesh) -> jax.Array:
