@@ -13,17 +13,18 @@ from nanodiffusion.types import PRNGKeyArray
 def configure_jax_runtime(run_dir: Path) -> None:
     """Apply the per-run JAX settings shared by pretrain and SFT.
 
-    We deliberately *don't* override ``jax_optimization_level`` — the
-    JAX default is "O2" on TPU which enables full XLA optimization
-    passes (layout, fusion, scheduling). Overriding to "O1" was
-    measured to drop steady-state tok/s by ~30% on v6e-4 because O1
-    means "faster compile, less runtime optimization", not "latency
-    hiding collectives" as the name might suggest.
+    ``jax_optimization_level`` is set to "O3" for the maximum XLA
+    optimization level — layout, fusion, scheduling, plus extra
+    passes. O3 compiles a bit slower but produces faster steady-state
+    execution, which is the right tradeoff for long training runs
+    that amortize the compile cost. The previous "O1" override was
+    measured to drop tok/s by ~30% on v6e-4.
     """
     import jax  # noqa: PLC0415
 
     jax.config.update("jax_compilation_cache_dir", str(run_dir / ".jax_cache"))
     jax.config.update("jax_explain_cache_misses", True)  # noqa: FBT003
+    jax.config.update("jax_optimization_level", "O3")
 
 
 def place_training_state[M: eqx.Module](
