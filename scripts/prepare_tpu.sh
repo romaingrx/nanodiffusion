@@ -58,13 +58,16 @@ ok "uv $(uv --version)"
 # lets all-gathers overlap with compute, and async all-gather enables the
 # gradient all-reduce to run concurrently with the backward pass. Must be
 # set via env var because libtpu reads them before jax.config is available.
+#
+# JAX_ENABLE_PGLE is intentionally *not* set: it's a GPU/CUPTI feature
+# (see the "PGLE collected an empty trace" warning it emits on TPU) and
+# holds an active profiler session that conflicts with --profile-steps.
 if ! grep -q 'LIBTPU_INIT_ARGS' ~/.bashrc 2>/dev/null; then
     cat >> ~/.bashrc <<'LIBTPU_FLAGS'
 export LIBTPU_INIT_ARGS="--xla_tpu_enable_async_collective_fusion_fuse_all_gather=true --xla_tpu_overlap_compute_collective_tc=true --xla_enable_async_all_gather=true"
-export JAX_ENABLE_PGLE=true
 LIBTPU_FLAGS
 fi
-ok "LIBTPU_INIT_ARGS + JAX_ENABLE_PGLE exported in ~/.bashrc"
+ok "LIBTPU_INIT_ARGS exported in ~/.bashrc"
 
 if [ -d "$REPO_DIR/.git" ]; then
     info "Repo exists at $REPO_DIR, pulling latest..."

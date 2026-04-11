@@ -4,7 +4,7 @@ import jax.numpy as jnp
 from jax.sharding import Mesh
 from jaxtyping import Array, Float
 
-from nanodiffusion.ops import attention, per_chip_attention
+from nanodiffusion.ops import attention
 from nanodiffusion.types import PRNGKeyArray
 
 
@@ -39,7 +39,7 @@ class SelfAttention(eqx.Module):
         self,
         x: Float[Array, "seq dim"],
         *,
-        mesh: Mesh | None = None,
+        mesh: Mesh | None = None,  # noqa: ARG002  kept for API parity, unused
     ) -> Float[Array, "seq dim"]:
         q = jax.vmap(self.q_proj)(x)
         k = jax.vmap(self.k_proj)(x)
@@ -62,11 +62,11 @@ class SelfAttention(eqx.Module):
         q = jax.vmap(self.rope)(q)
         k = jax.vmap(self.rope)(k)
 
-        out = (
-            per_chip_attention(q, k, v, mesh=mesh)
-            if mesh is not None
-            else attention(q, k, v)
-        )
+        # GSPMD auto-partitions ``jax.nn.dot_product_attention`` natively
+        # on multi-device (what Gemma does); wrapping Pallas FA in
+        # ``shard_map`` with replicated specs caused all-gathers and
+        # collapsed FLOPS utilisation to 0.96% on v6e-4.
+        out = attention(q, k, v)
 
         out = jnp.transpose(out, (1, 0, 2))
         out = out.reshape(seq_len, self.num_heads * self.head_dim)

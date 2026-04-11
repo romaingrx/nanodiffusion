@@ -2,7 +2,6 @@ import equinox as eqx
 import jax
 import jax.numpy as jnp
 import numpy as np
-import pytest
 from jax.sharding import Mesh
 
 from nanodiffusion.config import ModelConfig
@@ -67,34 +66,19 @@ def test_self_attention_is_bidirectional(key: jax.Array) -> None:
     assert not jnp.allclose(out_orig[0], out_modified_last[0])
 
 
-def test_self_attention_uses_per_chip_helper_when_mesh_is_passed(
-    key: jax.Array, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_self_attention_preserves_shape_with_mesh_kwarg(key: jax.Array) -> None:
+    """Passing a mesh through the forward pass is a no-op for shape.
+
+    The mesh plumbing exists so paradigm code can experiment with
+    manual shard-map regions without changing the model signature. The
+    current implementation ignores the kwarg and relies on GSPMD auto-
+    partitioning of :func:`jax.nn.dot_product_attention` (the same
+    approach Gemma uses for multi-device transformer training).
+    """
     attn = SelfAttention(64, 4, key=key)
     mesh = Mesh(np.asarray(jax.devices()).reshape(1, 1), ("X", "Y"))
     x = jax.random.normal(key, (16, 64))
-    called = False
-
-    def fake_per_chip_attention(
-        q: jax.Array,
-        k: jax.Array,
-        v: jax.Array,
-        *,
-        mesh: Mesh,
-    ) -> jax.Array:
-        nonlocal called
-        called = True
-        del mesh
-        return jnp.zeros_like(q + k + v)
-
-    monkeypatch.setattr(
-        "nanodiffusion.model.attention.per_chip_attention",
-        fake_per_chip_attention,
-    )
-
     out = attn(x, mesh=mesh)
-
-    assert called
     assert out.shape == (16, 64)
 
 
