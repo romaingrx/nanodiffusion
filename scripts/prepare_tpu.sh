@@ -25,6 +25,13 @@ warn() { echo -e "\033[1;33m==>\033[0m $*"; }
 ok()   { echo -e "\033[1;32m==>\033[0m $*"; }
 
 info "Installing system packages..."
+if ! command -v gcsfuse &> /dev/null; then
+    GCSFUSE_REPO=gcsfuse-$(lsb_release -c -s)
+    echo "deb [signed-by=/usr/share/keyrings/cloud.google.asc] https://packages.cloud.google.com/apt $GCSFUSE_REPO main" | \
+        sudo tee /etc/apt/sources.list.d/gcsfuse.list > /dev/null
+    curl -fsSL https://packages.cloud.google.com/apt/doc/apt-key.gpg | \
+        sudo tee /usr/share/keyrings/cloud.google.asc > /dev/null
+fi
 sudo apt-get update -qq
 sudo apt-get install -y -qq tmux gcsfuse > /dev/null 2>&1
 ok "tmux $(tmux -V) + gcsfuse installed"
