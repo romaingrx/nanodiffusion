@@ -17,8 +17,6 @@ import math
 import equinox as eqx
 import jax
 import jax.numpy as jnp
-from jax.sharding import Mesh
-from jax.sharding import PartitionSpec as P
 from jaxtyping import Array, Float
 
 try:
@@ -61,22 +59,30 @@ def attention(
 
     Backend dispatch:
 
-    * **TPU**: :func:`jax.experimental.pallas.ops.tpu.flash_attention`,
-      a blocked-softmax Pallas kernel with O(seq) memory. On multi-chip
-      runs the caller is responsible for entering a
-      :func:`jax.experimental.shard_map.shard_map` manual region before
-      calling this function, because Mosaic kernels cannot be
-      auto-partitioned by GSPMD (a sharded call otherwise raises
-      ``NotImplementedError``). :class:`~nanodiffusion.model.SelfAttention`
-      does exactly that when a mesh is bound.
-    * **CPU / GPU**: :func:`jax.nn.dot_product_attention`. Materialises
-      the ``[heads, seq, seq]`` score matrix (O(seq^2) memory). On GPU
-      it further lowers to cuDNN Flash-SDPA when available.
+    * **Single-device TPU**:
+      :func:`jax.experimental.pallas.ops.tpu.flash_attention`, a
+      blocked-softmax Pallas kernel with O(seq) memory. Gated on
+      ``jax.device_count() == 1`` because Mosaic kernels cannot be
+      auto-partitioned by GSPMD (a multi-device call raises
+      ``NotImplementedError``). Wrapping Pallas FA in
+      ``shard_map`` with replicated specs was tried and measured to
+      collapse FLOPS utilisation to 0.96% on v6e-4 due to unnecessary
+      all-gather/scatter collectives, so multi-device runs go through
+      ``jax.nn.dot_product_attention`` instead.
+    * **Multi-device TPU / CPU / GPU**:
+      :func:`jax.nn.dot_product_attention`. Materialises the
+      ``[heads, seq, seq]`` score matrix (O(seq^2) memory) but GSPMD
+      auto-partitions it natively (this is what Gemma uses for
+      multi-device transformer training).
     """
     _, _, head_dim = q.shape
     scale = 1.0 / math.sqrt(head_dim)
 
-    if _tpu_flash_attention is not None and jax.default_backend() == "tpu":
+    if (
+        _tpu_flash_attention is not None
+        and jax.default_backend() == "tpu"
+        and jax.device_count() == 1
+    ):
         return _tpu_flash_attention(
             q[jnp.newaxis],
             k[jnp.newaxis],
@@ -89,28 +95,3 @@ def attention(
     v_tnh = jnp.transpose(v, (1, 0, 2))
     out_tnh = jax.nn.dot_product_attention(q_tnh, k_tnh, v_tnh, scale=scale)
     return jnp.transpose(out_tnh, (1, 0, 2))
-
-
-def per_chip_attention(
-    q: Float[Array, "heads seq head_dim"],
-    k: Float[Array, "heads seq head_dim"],
-    v: Float[Array, "heads seq head_dim"],
-    *,
-    mesh: Mesh,
-) -> Float[Array, "heads seq head_dim"]:
-    """Run :func:`attention` inside a tiny manual per-chip region on TPU.
-
-    The Pallas TPU flash-attention kernel must execute on local per-chip
-    tensors; wrapping only the kernel call in :func:`jax.shard_map`
-    keeps the manual region narrow and leaves the rest of the model in
-    normal compiler-driven mode. ``check_vma=False`` is required for a
-    Pallas kernel in the shard-map body on current JAX.
-    """
-    sharded_attention = jax.shard_map(
-        attention,
-        mesh=mesh,
-        in_specs=(P(), P(), P()),
-        out_specs=P(),
-        check_vma=False,
-    )
-    return sharded_attention(q, k, v)
