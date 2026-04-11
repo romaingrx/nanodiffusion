@@ -13,7 +13,7 @@ from nanodiffusion.model import Transformer
 from nanodiffusion.optimizer import ema_update, make_optimizer
 from nanodiffusion.pretrain.train import TrainStepFn, make_train_step
 from nanodiffusion.schedule import LogLinearSchedule
-from tests._helpers import inexact_leaves
+from tests._helpers import clone_state, inexact_leaves
 
 
 def test_make_optimizer_warmup_peak_and_decay() -> None:
@@ -78,7 +78,7 @@ def test_train_step_decreases_loss_on_fixed_batch(
     """
     key, model_key = jax.random.split(key)
     model = Transformer(small_config, key=model_key)
-    ema_model = model
+    ema_model = clone_state(model)
 
     train_cfg = TrainConfig(
         learning_rate=3e-3,
@@ -124,7 +124,7 @@ def test_train_step_updates_model_and_ema(
     """One step should move the model *and* produce an EMA distinct from it."""
     key, model_key = jax.random.split(key)
     model = Transformer(small_config, key=model_key)
-    ema_model = model
+    ema_model = clone_state(model)
 
     train_cfg = TrainConfig(
         learning_rate=1e-2,
@@ -144,8 +144,10 @@ def test_train_step_updates_model_and_ema(
 
     batch = jnp.zeros((2, small_config.max_seq_len), dtype=jnp.int32)
     key, step_key = jax.random.split(key)
+    # Donate clones so the original ``model`` stays live for the
+    # post-step comparisons below.
     new_model, new_ema, _new_opt_state, _metrics = train_step(
-        model, ema_model, opt_state, batch, step_key
+        clone_state(model), ema_model, opt_state, batch, step_key
     )
 
     assert _count_inexact_leaves_that_changed(model, new_model) > 0
@@ -175,8 +177,12 @@ def test_train_step_jits_and_is_deterministic(
     batch = jnp.zeros((2, small_config.max_seq_len), dtype=jnp.int32)
     step_key = jax.random.PRNGKey(123)
 
-    m1, e1, _o1, mx1 = train_step(model, model, opt_state, batch, step_key)
-    m2, e2, _o2, mx2 = train_step(model, model, opt_state, batch, step_key)
+    m1, e1, _o1, mx1 = train_step(
+        clone_state(model), clone_state(model), clone_state(opt_state), batch, step_key
+    )
+    m2, e2, _o2, mx2 = train_step(
+        clone_state(model), clone_state(model), clone_state(opt_state), batch, step_key
+    )
 
     assert float(mx1["loss"]) == pytest.approx(float(mx2["loss"]), abs=0.0)
     for a, b in zip(inexact_leaves(m1), inexact_leaves(m2), strict=True):
@@ -207,7 +213,7 @@ def test_train_step_produces_finite_updates(
     )
     key, step_key = jax.random.split(key)
     new_model, new_ema, _new_opt_state, metrics = train_step(
-        model, model, opt_state, batch, step_key
+        model, clone_state(model), opt_state, batch, step_key
     )
 
     assert jnp.isfinite(metrics["loss"])
@@ -241,7 +247,9 @@ def test_train_step_signature_accepts_optax_chain() -> None:
         ema_decay=0.9,
     )
     batch = jnp.zeros((2, cfg.max_seq_len), dtype=jnp.int32)
-    _m, _e, _o, metrics = step(model, model, opt_state, batch, jax.random.PRNGKey(1))
+    _m, _e, _o, metrics = step(
+        model, clone_state(model), opt_state, batch, jax.random.PRNGKey(1)
+    )
     assert jnp.isfinite(metrics["loss"])
 
 
@@ -270,7 +278,7 @@ def test_make_train_step_narrows_via_trainstepfn_annotation(
     batch = jnp.zeros((2, small_config.max_seq_len), dtype=jnp.int32)
     key, step_key = jax.random.split(key)
     new_model, new_ema, _new_opt_state, metrics = train_step(
-        model, model, opt_state, batch, step_key
+        model, clone_state(model), opt_state, batch, step_key
     )
 
     assert_type(new_model, Transformer)

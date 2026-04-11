@@ -120,12 +120,24 @@ def _collect_host_metrics(
     supervised_tokens_in_window: int,
     elapsed: float,
 ) -> dict[str, float | int | str]:
-    """Merge device-side step metrics with host-side throughput + HBM."""
+    """Merge device-side step metrics with host-side throughput + HBM.
+
+    Non-finite losses no longer raise — the JIT'd train step now skips
+    the model update on non-finite gradients (see
+    :func:`nanodiffusion.optimizer.apply_or_skip`), so training can
+    recover from transient spikes. We still surface a warning so the
+    operator sees them and can correlate with ``grad_finite=0`` in the
+    metrics stream.
+    """
     host: dict[str, float | int | str] = {k: float(v) for k, v in step_metrics.items()}
     loss_value = host.get("loss")
     if loss_value is None or not math.isfinite(float(loss_value)):
-        msg = f"training diverged at step {step}: loss={loss_value}"
-        raise RuntimeError(msg)
+        logger.warning(
+            "non_finite_loss",
+            step=step,
+            loss=loss_value,
+            grad_finite=host.get("grad_finite"),
+        )
     host["lr"] = jnp.asarray(lr_schedule(step)).item()
     host["tok_per_s"] = tok_per_s
     if supervised_tokens_in_window > 0:

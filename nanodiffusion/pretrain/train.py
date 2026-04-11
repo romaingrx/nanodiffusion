@@ -9,7 +9,9 @@ import jax
 import jax.numpy as jnp
 import optax
 import structlog
+from jax import shard_map
 from jax.sharding import Mesh
+from jax.sharding import PartitionSpec as P
 
 from nanodiffusion.checkpoint import (
     load_checkpoint,
@@ -36,7 +38,7 @@ from nanodiffusion.model import (
     Transformer,
     transformer_skeleton,
 )
-from nanodiffusion.optimizer import ema_update, make_optimizer
+from nanodiffusion.optimizer import apply_or_skip, make_optimizer, scale_ema_decay
 from nanodiffusion.pretrain.loss import compute_loss
 from nanodiffusion.reporter import (
     JsonlSink,
@@ -46,7 +48,7 @@ from nanodiffusion.reporter import (
     WandbSink,
 )
 from nanodiffusion.schedule import LogLinearSchedule, NoiseSchedule
-from nanodiffusion.sharding import replicate, setup_mesh, shard_batch
+from nanodiffusion.sharding import DP_AXES, replicate, setup_mesh, shard_batch
 from nanodiffusion.tokenizer import Tokenizer
 from nanodiffusion.types import PRNGKeyArray, Scalar, TokenBatch
 
@@ -59,6 +61,7 @@ def make_train_step[M: DiffusionModel](
     schedule: NoiseSchedule,
     mask_token_id: int,
     ema_decay: float,
+    mesh: Mesh | None = None,
     sampler: TimeSampler = low_discrepancy_sampler,
 ) -> TrainStepFn[M, TokenBatch]:
     """Build an ``eqx.filter_jit`` train step for MDLM diffusion.
@@ -69,18 +72,63 @@ def make_train_step[M: DiffusionModel](
     model subclass flows through to the returned tuple without a
     downcast.
 
+    ``mesh`` is the data-parallel mesh; when set, the loss computation
+    is wrapped in a :func:`jax.shard_map.shard_map` manual region so
+    the Pallas flash-attention kernel inside
+    :func:`nanodiffusion.ops.attention` runs on per-device local
+    tensors without GSPMD trying (and failing) to partition it.
+    Single-device runs can leave it ``None`` — the Pallas call then
+    runs in the usual JIT region.
+
     ``sampler`` defaults to the stratified low-discrepancy sampler used
     by real pretrain runs; examples that need a bounded or biased time
     sampler (e.g. the tiny-model overfit script) can pass their own.
 
     The returned step emits a metrics dict with ``loss``, ``grad_norm``,
-    and ``param_norm``. ``grad_norm`` is the pre-clip global norm (so
-    the logged value reflects what the optimizer actually saw before
-    clipping kicked in), and ``param_norm`` tracks post-update weight
-    magnitude as a coarse divergence signal.
+    ``param_norm``, and ``grad_finite``. ``grad_norm`` is the pre-clip
+    global norm (so the logged value reflects what the optimizer
+    actually saw before clipping kicked in), ``param_norm`` tracks
+    post-update weight magnitude as a coarse divergence signal, and
+    ``grad_finite`` is 0.0 whenever the step was skipped because the
+    gradient norm or loss was non-finite.
     """
 
-    @eqx.filter_jit
+    def _compute_loss(m: M, batch: TokenBatch, key: PRNGKeyArray) -> Scalar:
+        return compute_loss(
+            m,
+            batch,
+            schedule=schedule,
+            mask_token_id=mask_token_id,
+            key=key,
+            sampler=sampler,
+        )
+
+    if mesh is not None:
+
+        def _sharded_loss(m: M, batch: TokenBatch, key: PRNGKeyArray) -> Scalar:
+            def _per_shard(m: M, batch: TokenBatch, key: PRNGKeyArray) -> Scalar:
+                # Fold the axis indices into the key so every device
+                # draws independent diffusion noise; a replicated key
+                # would collapse DP back to a single-device run.
+                local_key = key
+                for axis in DP_AXES:
+                    local_key = jax.random.fold_in(local_key, jax.lax.axis_index(axis))
+                loss = _compute_loss(m, batch, local_key)
+                return jax.lax.pmean(loss, axis_name=DP_AXES)
+
+            return shard_map(  # pyright: ignore[reportCallIssue]
+                _per_shard,
+                mesh=mesh,
+                in_specs=(P(), P(DP_AXES), P()),
+                out_specs=P(),
+                check_vma=False,
+            )(m, batch, key)
+
+        forward = _sharded_loss
+    else:
+        forward = _compute_loss
+
+    @eqx.filter_jit(donate="all")
     def train_step(
         model: M,
         ema_model: M,
@@ -89,27 +137,26 @@ def make_train_step[M: DiffusionModel](
         key: PRNGKeyArray,
     ) -> tuple[M, M, optax.OptState, StepMetrics]:
         def loss_fn(m: M) -> Scalar:
-            return compute_loss(
-                m,
-                batch,
-                schedule=schedule,
-                mask_token_id=mask_token_id,
-                key=key,
-                sampler=sampler,
-            )
+            return forward(m, batch, key)
 
         loss, grads = eqx.filter_value_and_grad(loss_fn)(model)
         grad_norm = optax.tree.norm(grads)
-        updates, new_opt_state = optimizer.update(
-            grads, opt_state, eqx.filter(model, eqx.is_inexact_array)
+        finite = jnp.isfinite(grad_norm) & jnp.isfinite(loss)
+        new_model, new_ema_model, new_opt_state = apply_or_skip(
+            finite,
+            optimizer=optimizer,
+            model=model,
+            ema_model=ema_model,
+            opt_state=opt_state,
+            grads=grads,
+            ema_decay=ema_decay,
         )
-        new_model = eqx.apply_updates(model, updates)
-        new_ema_model = ema_update(ema_model, new_model, ema_decay)
         param_norm = optax.tree.norm(eqx.filter(new_model, eqx.is_inexact_array))
         metrics: StepMetrics = {
             "loss": loss,
             "grad_norm": grad_norm,
             "param_norm": param_norm,
+            "grad_finite": finite.astype(jnp.float32),
         }
         return new_model, new_ema_model, new_opt_state, metrics
 
@@ -164,9 +211,14 @@ def _load_fresh_pretrain_state(
 ) -> _PretrainInitialState:
     model = Transformer(config.model, key=model_key)
     opt_state = optimizer.init(eqx.filter(model, eqx.is_inexact_array))
+    # Deep-copy the model buffers so the EMA starts as an independent
+    # replica. Without this, ``model`` and ``ema_model`` alias the same
+    # JAX buffers and the ``donate="all"`` train step errors out on the
+    # first call ("donate the same buffer twice").
+    ema_model = jax.tree.map(lambda x: jnp.copy(x) if eqx.is_array(x) else x, model)
     return _PretrainInitialState(
         model=model,
-        ema_model=model,
+        ema_model=ema_model,
         opt_state=opt_state,
         step=0,
         cursor=None,
@@ -263,6 +315,9 @@ def pretrain(
     tok = Tokenizer(encode_threads=config.data.tokenizer_threads)
     source = _init_source(config)
     run_dir = resolve_run_dir(config.train.run_dir, resume_from=resume_from)
+    jax.config.update("jax_compilation_cache_dir", str(run_dir / ".jax_cache"))
+    jax.config.update("jax_explain_cache_misses", True)  # noqa: FBT003
+    jax.config.update("jax_optimization_level", "O1")
     write_config(run_dir, config)
     logger.info(
         "pretrain_start",
@@ -276,11 +331,14 @@ def pretrain(
         wandb=wandb_project,
     )
 
+    mesh = setup_mesh()
+    ema_decay = scale_ema_decay(config.train.ema_decay, jax.device_count())
     train_step = make_train_step(
         optimizer,
         schedule=LogLinearSchedule(),
         mask_token_id=tok.mask_token_id,
-        ema_decay=config.train.ema_decay,
+        ema_decay=ema_decay,
+        mesh=mesh,
     )
     base_loader = pretrain_loader(
         source,
@@ -293,7 +351,6 @@ def pretrain(
         max_empty_passes=config.data.max_empty_passes,
     )
 
-    mesh = setup_mesh()
     state: LoopState[Transformer, PretrainCursor] = LoopState(
         model=replicate(start.model, mesh),
         ema_model=replicate(start.ema_model, mesh),

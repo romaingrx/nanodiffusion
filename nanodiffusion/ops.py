@@ -59,27 +59,22 @@ def attention(
 
     Backend dispatch:
 
-    * **Single-device TPU**:
-      :func:`jax.experimental.pallas.ops.tpu.flash_attention`, a
-      blocked-softmax Pallas kernel with O(seq) memory. Used only on
-      single-chip runs because Mosaic kernels cannot be
-      auto-partitioned by GSPMD (multi-device raises
-      ``NotImplementedError``).
-    * **Multi-device TPU / CPU / GPU**:
-      :func:`jax.nn.dot_product_attention`. Materialises the
-      ``[heads, seq, seq]`` score matrix (O(seq^2) memory), but GSPMD
-      partitions it automatically so it works with any mesh topology.
-      On GPU it further lowers to cuDNN Flash-SDPA when available.
-      Google's Gemma uses this same approach for multi-device training.
+    * **TPU**: :func:`jax.experimental.pallas.ops.tpu.flash_attention`,
+      a blocked-softmax Pallas kernel with O(seq) memory. On multi-chip
+      runs the caller is responsible for entering a
+      :func:`jax.experimental.shard_map.shard_map` manual region before
+      calling this function, because Mosaic kernels cannot be
+      auto-partitioned by GSPMD (a sharded call otherwise raises
+      ``NotImplementedError``). :class:`~nanodiffusion.model.SelfAttention`
+      does exactly that when a mesh is bound.
+    * **CPU / GPU**: :func:`jax.nn.dot_product_attention`. Materialises
+      the ``[heads, seq, seq]`` score matrix (O(seq^2) memory). On GPU
+      it further lowers to cuDNN Flash-SDPA when available.
     """
     _, _, head_dim = q.shape
     scale = 1.0 / math.sqrt(head_dim)
 
-    if (
-        _tpu_flash_attention is not None
-        and jax.default_backend() == "tpu"
-        and jax.device_count() == 1
-    ):
+    if _tpu_flash_attention is not None and jax.default_backend() == "tpu":
         return _tpu_flash_attention(
             q[jnp.newaxis],
             k[jnp.newaxis],

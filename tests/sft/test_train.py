@@ -19,7 +19,7 @@ from nanodiffusion.model import Transformer
 from nanodiffusion.optimizer import make_optimizer
 from nanodiffusion.schedule import LogLinearSchedule
 from nanodiffusion.sft import SFTTrainStepFn, make_sft_train_step, sft_finetune
-from tests._helpers import inexact_leaves
+from tests._helpers import clone_state, inexact_leaves
 
 
 def _make_supervised_batch(seq_len: int, batch: int = 4) -> SFTJaxBatch:
@@ -41,7 +41,7 @@ def test_sft_train_step_decreases_loss_on_fixed_batch(
     """A few aggressive-LR SFT steps on the same batch must lower the loss."""
     key, model_key = jax.random.split(key)
     model = Transformer(small_config, key=model_key)
-    ema_model = model
+    ema_model = clone_state(model)
 
     sft_cfg = SFTConfig(
         learning_rate=3e-3,
@@ -95,8 +95,12 @@ def test_sft_train_step_is_deterministic(
     batch = _make_supervised_batch(small_config.max_seq_len, batch=2)
     step_key = jax.random.PRNGKey(123)
 
-    m1, e1, _o1, mx1 = train_step(model, model, opt_state, batch, step_key)
-    m2, e2, _o2, mx2 = train_step(model, model, opt_state, batch, step_key)
+    m1, e1, _o1, mx1 = train_step(
+        clone_state(model), clone_state(model), clone_state(opt_state), batch, step_key
+    )
+    m2, e2, _o2, mx2 = train_step(
+        clone_state(model), clone_state(model), clone_state(opt_state), batch, step_key
+    )
 
     assert float(mx1["loss"]) == float(mx2["loss"])
     for a, b in zip(inexact_leaves(m1), inexact_leaves(m2), strict=True):
@@ -134,8 +138,10 @@ def test_sft_train_step_prompt_positions_have_zero_embedding_grad(
     batch = SFTJaxBatch(tokens=tokens, loss_mask=loss_mask)
     step_key = jax.random.PRNGKey(5)
 
+    # Clone the donated inputs so the original ``model`` stays live
+    # for the post-step comparisons below.
     new_model, _new_ema, _opt, metrics = train_step(
-        model, model, opt_state, batch, step_key
+        clone_state(model), clone_state(model), opt_state, batch, step_key
     )
     assert float(metrics["loss"]) == 0.0
     # With zero loss, the optimizer should have made no change to the model.
@@ -169,7 +175,7 @@ def test_make_sft_train_step_narrows_via_sfttrainstepfn_annotation(
     batch = _make_supervised_batch(small_config.max_seq_len, batch=2)
     key, step_key = jax.random.split(key)
     new_model, new_ema, _new_opt_state, metrics = train_step(
-        model, model, opt_state, batch, step_key
+        model, clone_state(model), opt_state, batch, step_key
     )
 
     assert_type(new_model, Transformer)

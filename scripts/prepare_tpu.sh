@@ -47,6 +47,18 @@ grep -q 'HOME/.local/bin' ~/.bashrc 2>/dev/null || \
     echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc
 ok "uv $(uv --version)"
 
+# XLA/TPU scheduler flags from the scaling book: async collective fusion
+# lets all-gathers overlap with compute, and async all-gather enables the
+# gradient all-reduce to run concurrently with the backward pass. Must be
+# set via env var because libtpu reads them before jax.config is available.
+if ! grep -q 'LIBTPU_INIT_ARGS' ~/.bashrc 2>/dev/null; then
+    cat >> ~/.bashrc <<'LIBTPU_FLAGS'
+export LIBTPU_INIT_ARGS="--xla_tpu_enable_async_collective_fusion_fuse_all_gather=true --xla_tpu_overlap_compute_collective_tc=true --xla_enable_async_all_gather=true"
+export JAX_ENABLE_PGLE=true
+LIBTPU_FLAGS
+fi
+ok "LIBTPU_INIT_ARGS + JAX_ENABLE_PGLE exported in ~/.bashrc"
+
 if [ -d "$REPO_DIR/.git" ]; then
     info "Repo exists at $REPO_DIR, pulling latest..."
     cd "$REPO_DIR"
