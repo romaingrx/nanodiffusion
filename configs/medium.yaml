@@ -25,7 +25,7 @@ model:
   max_seq_len: 1024
   ffn_mult: 4
   compute_dtype: bfloat16
-  remat_policy: dots_no_batch
+  remat_policy: none
 
 # Pretrain: ~11B tokens. Effective batch of 256 sequences (32 per device
 # x 8 devices when data-parallel is wired up) at seq_len=1024 gives
