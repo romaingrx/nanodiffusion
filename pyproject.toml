@@ -31,7 +31,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["basedpyright", "ruff", "pytest", "beartype>=0.18.0", "pre-commit"]
+dev = ["basedpyright", "ruff", "pytest", "beartype>=0.22.9", "pre-commit"]
 
 [project.scripts]
 nanodiffusion = "nanodiffusion.cli:main"
