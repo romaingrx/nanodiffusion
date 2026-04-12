@@ -86,6 +86,7 @@ def make_train_step[M: DiffusionModel](
         loss_fn=loss_fn,
         ema_decay=ema_decay,
         grad_accum_steps=grad_accum_steps,
+        mesh=mesh,
     )
 
 
