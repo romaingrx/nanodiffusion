@@ -10,7 +10,7 @@ license-files = ["LICENSE"]
 
 dependencies = [
     # ML core
-    "jax>=0.4.35",
+    "jax>=0.9.2",
     "equinox>=0.11.10",
     "optax>=0.2.4",
     "jaxtyping>=0.2.34",
