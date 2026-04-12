@@ -1,3 +1,5 @@
+from collections.abc import Callable
+
 import equinox as eqx
 import jax
 import jax.numpy as jnp
@@ -6,6 +8,9 @@ from jaxtyping import Array, Float
 
 from nanodiffusion.ops import attention
 from nanodiffusion.types import PRNGKeyArray
+
+type _QKV = Float[Array, "heads seq head_dim"]
+type AttnFn = Callable[[_QKV, _QKV, _QKV], _QKV]
 
 
 class SelfAttention(eqx.Module):
@@ -18,12 +23,14 @@ class SelfAttention(eqx.Module):
     rope: eqx.nn.RotaryPositionalEmbedding
     num_heads: int = eqx.field(static=True)
     head_dim: int = eqx.field(static=True)
+    attn_fn: AttnFn = eqx.field(static=True)
 
     def __init__(self, hidden_dim: int, num_heads: int, *, key: PRNGKeyArray) -> None:
         qkey, kkey, vkey, okey = jax.random.split(key, 4)
 
         self.num_heads = num_heads
         self.head_dim = hidden_dim // num_heads
+        self.attn_fn = attention
 
         self.q_proj = eqx.nn.Linear(hidden_dim, hidden_dim, use_bias=False, key=qkey)
         self.k_proj = eqx.nn.Linear(hidden_dim, hidden_dim, use_bias=False, key=kkey)
@@ -62,11 +69,7 @@ class SelfAttention(eqx.Module):
         q = jax.vmap(self.rope)(q)
         k = jax.vmap(self.rope)(k)
 
-        # GSPMD auto-partitions ``jax.nn.dot_product_attention`` natively
-        # on multi-device (what Gemma does); wrapping Pallas FA in
-        # ``shard_map`` with replicated specs caused all-gathers and
-        # collapsed FLOPS utilisation to 0.96% on v6e-4.
-        out = attention(q, k, v)
+        out = self.attn_fn(q, k, v)
 
         out = jnp.transpose(out, (1, 0, 2))
         out = out.reshape(seq_len, self.num_heads * self.head_dim)

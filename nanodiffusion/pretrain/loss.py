@@ -4,13 +4,21 @@ Built on top of :mod:`nanodiffusion.loss`'s per-token primitives so the
 per-position NLL arithmetic stays shared with :mod:`nanodiffusion.sft`.
 """
 
+from functools import partial
+
+import equinox as eqx
 import jax
 import jax.numpy as jnp
+from jax import shard_map
 from jax.sharding import Mesh
+from jax.sharding import PartitionSpec as P
 
 from nanodiffusion.loss import TimeSampler, low_discrepancy_sampler, token_nll
 from nanodiffusion.model import DiffusionModel
+from nanodiffusion.model.attention import SelfAttention
+from nanodiffusion.ops import splash_attention
 from nanodiffusion.schedule import NoiseSchedule, loss_weight, mask_chance
+from nanodiffusion.sharding import DP_AXES
 from nanodiffusion.types import (
     Logits,
     Mask,
@@ -72,6 +80,17 @@ def diffusion_loss(
     return masked_nll(logits, x0, is_masked, loss_weight(schedule, t))
 
 
+def _with_splash_attention[M: DiffusionModel](model: M) -> M:
+    """Swap every :class:`SelfAttention` leaf's ``attn_fn`` to
+    :func:`splash_attention` so the model uses SplashAttention kernels
+    when called inside ``shard_map``."""
+    def _replace(leaf: object) -> object:
+        if isinstance(leaf, SelfAttention):
+            return eqx.tree_at(lambda sa: sa.attn_fn, leaf, splash_attention)
+        return leaf
+    return jax.tree.map(_replace, model, is_leaf=lambda x: isinstance(x, SelfAttention))
+
+
 def compute_loss(
     model: DiffusionModel,
     x0: TokenBatch,
@@ -88,6 +107,12 @@ def compute_loss(
 
     keys = jax.random.split(key, batch_size)
 
+    if mesh is not None and len(mesh.devices.flat) > 1:
+        return _compute_loss_sharded(
+            model, x0, t_batch, keys,
+            mesh=mesh, schedule=schedule, mask_token_id=mask_token_id,
+        )
+
     def _per_sample(xi: Tokens, ti: Scalar, ki: PRNGKeyArray) -> Scalar:
         return diffusion_loss(
             model,
@@ -101,3 +126,51 @@ def compute_loss(
 
     losses = jax.vmap(_per_sample)(x0, t_batch, keys)
     return losses.mean()
+
+
+def _compute_loss_sharded(
+    model: DiffusionModel,
+    x0: TokenBatch,
+    t_batch: jax.Array,
+    keys: jax.Array,
+    *,
+    mesh: Mesh,
+    schedule: NoiseSchedule,
+    mask_token_id: int,
+) -> Scalar:
+    """Multi-device path: ``shard_map`` with SplashAttention.
+
+    The model is captured in the closure (replicated across devices).
+    Only the batch arrays (``x0``, ``t_batch``, ``keys``) are explicit
+    ``shard_map`` arguments so they get proper partition specs. Each
+    device independently computes losses on its local shard and the
+    result is reduced with ``pmean``.
+    """
+    splash_model = _with_splash_attention(model)
+
+    @partial(  # pyright: ignore[reportUntypedFunctionDecorator]
+        shard_map,
+        mesh=mesh,
+        in_specs=(P(DP_AXES, None), P(DP_AXES), P(DP_AXES, None)),
+        out_specs=P(),
+        check_rep=False,
+    )
+    def _sharded_loss(
+        x0_shard: TokenBatch,
+        t_shard: jax.Array,
+        keys_shard: jax.Array,
+    ) -> Scalar:
+        def _per_sample(xi: Tokens, ti: Scalar, ki: PRNGKeyArray) -> Scalar:
+            return diffusion_loss(
+                splash_model,
+                xi,
+                ti,
+                mesh=None,
+                schedule=schedule,
+                mask_token_id=mask_token_id,
+                key=ki,
+            )
+        losses = jax.vmap(_per_sample)(x0_shard, t_shard, keys_shard)
+        return jax.lax.pmean(losses.mean(), DP_AXES)
+
+    return _sharded_loss(x0, t_batch, keys)

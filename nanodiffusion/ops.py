@@ -12,7 +12,9 @@ Adding a new backend-specialised op should stay in this file so
 running on.
 """
 
+import functools
 import math
+from collections.abc import Callable
 
 import equinox as eqx
 import jax
@@ -25,6 +27,17 @@ try:
     )
 except ImportError:
     _tpu_flash_attention = None
+
+try:
+    from jax.experimental.pallas.ops.tpu.splash_attention import (
+        FullMask,
+        MultiHeadMask,
+        make_splash_mha_single_device,
+    )
+except ImportError:
+    make_splash_mha_single_device = None
+    FullMask = None
+    MultiHeadMask = None
 
 
 def cast_dtype[M: eqx.Module](model: M, dtype: type) -> M:
@@ -64,16 +77,13 @@ def attention(
       blocked-softmax Pallas kernel with O(seq) memory. Gated on
       ``jax.device_count() == 1`` because Mosaic kernels cannot be
       auto-partitioned by GSPMD (a multi-device call raises
-      ``NotImplementedError``). Wrapping Pallas FA in
-      ``shard_map`` with replicated specs was tried and measured to
-      collapse FLOPS utilisation to 0.96% on v6e-4 due to unnecessary
-      all-gather/scatter collectives, so multi-device runs go through
-      ``jax.nn.dot_product_attention`` instead.
+      ``NotImplementedError``).
     * **Multi-device TPU / CPU / GPU**:
       :func:`jax.nn.dot_product_attention`. Materialises the
       ``[heads, seq, seq]`` score matrix (O(seq^2) memory) but GSPMD
-      auto-partitions it natively (this is what Gemma uses for
-      multi-device transformer training).
+      auto-partitions it natively. On multi-device TPU the shard_map
+      path in ``compute_loss`` bypasses this and calls
+      :func:`splash_attention` instead.
     """
     _, _, head_dim = q.shape
     scale = 1.0 / math.sqrt(head_dim)
@@ -95,3 +105,52 @@ def attention(
     v_tnh = jnp.transpose(v, (1, 0, 2))
     out_tnh = jax.nn.dot_product_attention(q_tnh, k_tnh, v_tnh, scale=scale)
     return jnp.transpose(out_tnh, (1, 0, 2))
+
+
+type _HeadsTensor = Float[Array, "heads seq head_dim"]
+type _SplashKernelFn = Callable[
+    [_HeadsTensor, _HeadsTensor, _HeadsTensor],
+    _HeadsTensor,
+]
+
+
+@functools.lru_cache(maxsize=8)
+def _splash_kernel(num_heads: int, seq_len: int) -> _SplashKernelFn:
+    """Build and cache a SplashAttention kernel for the given geometry.
+
+    Kernel construction allocates host-side block structures that cannot
+    be created inside ``jax.jit``. Caching by ``(num_heads, seq_len)``
+    ensures at most one kernel per distinct shape seen during training.
+    """
+    if (
+        make_splash_mha_single_device is None
+        or FullMask is None
+        or MultiHeadMask is None
+    ):
+        msg = "SplashAttention requires jax[tpu] with Pallas Mosaic support"
+        raise ImportError(msg)
+    mask = MultiHeadMask(masks=[FullMask((seq_len, seq_len)) for _ in range(num_heads)])
+    return make_splash_mha_single_device(mask, head_shards=1, q_seq_shards=1)  # pyright: ignore[reportReturnType]
+
+
+def splash_attention(
+    q: Float[Array, "heads seq head_dim"],
+    k: Float[Array, "heads seq head_dim"],
+    v: Float[Array, "heads seq head_dim"],
+) -> Float[Array, "heads seq head_dim"]:
+    """SplashAttention for use inside ``shard_map`` on multi-device TPU.
+
+    Each device invokes a single-device Pallas Mosaic kernel with O(seq)
+    memory via :func:`make_splash_mha_single_device` and a
+    :class:`FullMask` (non-causal, bidirectional). The kernel object is
+    cached at the module level because it cannot be constructed inside
+    ``jax.jit``.
+
+    Input layout is ``(num_heads, seq_len, head_dim)`` -- the same as
+    :func:`attention` -- so the two are drop-in replacements for each
+    other.
+    """
+    num_heads, seq_len, head_dim = q.shape
+    scale = 1.0 / math.sqrt(head_dim)
+    kernel = _splash_kernel(num_heads, seq_len)
+    return kernel(q * scale, k, v)
