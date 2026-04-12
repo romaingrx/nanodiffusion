@@ -68,6 +68,7 @@ class ModelConfig(BaseModel):
 class TrainConfig(BaseModel):
     seed: int = 42
     batch_size: int = Field(default=32, gt=0)
+    grad_accum_steps: int = Field(default=1, ge=1)
     learning_rate: float = Field(default=3e-4, gt=0.0)
     weight_decay: float = Field(default=0.0, ge=0.0)
     warmup_steps: int = Field(default=2500, ge=0)
@@ -85,6 +86,12 @@ class TrainConfig(BaseModel):
                 f"max_steps ({self.max_steps}) must exceed warmup_steps "
                 f"({self.warmup_steps}); otherwise the cosine schedule has "
                 "no decay phase."
+            )
+            raise ValueError(msg)
+        if self.batch_size % self.grad_accum_steps != 0:
+            msg = (
+                f"batch_size ({self.batch_size}) must be divisible by "
+                f"grad_accum_steps ({self.grad_accum_steps})"
             )
             raise ValueError(msg)
         return self
