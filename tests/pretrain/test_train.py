@@ -295,6 +295,53 @@ def test_make_train_step_narrows_via_trainstepfn_annotation(
     assert jnp.isfinite(metrics.loss)
 
 
+def test_train_step_returns_updated_key(
+    key: jax.Array, small_config: ModelConfig
+) -> None:
+    """train_step must return a new key different from the input."""
+    model = Transformer(small_config, key=key)
+    optimizer, _ = make_optimizer(
+        TrainConfig(warmup_steps=2, max_steps=10, ema_decay=0.9)
+    )
+    opt_state = optimizer.init(eqx.filter(model, eqx.is_inexact_array))
+    train_step = make_train_step(
+        optimizer,
+        mesh=None,
+        schedule=LogLinearSchedule(),
+        mask_token_id=small_config.vocab_size - 1,
+        ema_decay=0.9,
+    )
+    batch = jnp.zeros((2, small_config.max_seq_len), dtype=jnp.int32)
+    input_key = jax.random.PRNGKey(42)
+    expected_next = jax.random.split(input_key)[0]
+    _, _, _, _, output_key = train_step(
+        model, clone_state(model), opt_state, batch, input_key
+    )
+    # Key must have advanced (split happened inside JIT)
+    assert jnp.array_equal(output_key, expected_next)
+
+
+def test_prepare_batch_uses_async_device_put(small_config: ModelConfig) -> None:
+    """_prepare_batch must return a sharded JAX array, not a numpy array."""
+    import numpy as np  # noqa: PLC0415
+
+    from nanodiffusion.data.cursors import PretrainCursor  # noqa: PLC0415
+    from nanodiffusion.data.loader import BatchOutput  # noqa: PLC0415
+    from nanodiffusion.pretrain.train import _prepare_batch  # noqa: PLC0415
+    from nanodiffusion.sharding import setup_mesh  # noqa: PLC0415
+
+    mesh = setup_mesh()
+    batch = BatchOutput(
+        tokens=np.zeros((4, small_config.max_seq_len), dtype=np.int32),
+        segments=np.zeros((4, small_config.max_seq_len), dtype=np.int32),
+        state=PretrainCursor(epoch=1, shard_idx=0, row_group_idx=0),
+    )
+    tokens, cursor, stats = _prepare_batch(batch, mesh)
+    assert isinstance(tokens, jax.Array)
+    assert tokens.shape == (4, small_config.max_seq_len)
+    assert cursor == batch.state
+
+
 def test_train_config_rejects_non_positive_save_every() -> None:
     """``save_every == 0`` would ZeroDivisionError in the loop; reject up front."""
     with pytest.raises(ValidationError, match="save_every"):
