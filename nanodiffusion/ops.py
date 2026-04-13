@@ -84,6 +84,9 @@ def attention(
     _, _, head_dim = q.shape
     scale = 1.0 / math.sqrt(head_dim)
 
+    if make_splash_mha_single_device is not None and jax.default_backend() == "tpu":
+        return splash_attention(q, k, v)
+
     if _tpu_flash_attention is not None and jax.default_backend() == "tpu":
         return _tpu_flash_attention(
             q[jnp.newaxis],
