@@ -109,7 +109,7 @@ def test_train_step_decreases_loss_on_fixed_batch(
     losses: list[float] = []
     for _ in range(50):
         key, step_key = jax.random.split(key)
-        model, ema_model, opt_state, metrics = train_step(
+        model, ema_model, opt_state, metrics, _ = train_step(
             model, ema_model, opt_state, batch, step_key
         )
         losses.append(float(metrics.loss))
@@ -148,7 +148,7 @@ def test_train_step_updates_model_and_ema(
     key, step_key = jax.random.split(key)
     # Donate clones so the original ``model`` stays live for the
     # post-step comparisons below.
-    new_model, new_ema, _new_opt_state, _metrics = train_step(
+    new_model, new_ema, _new_opt_state, _metrics, _ = train_step(
         clone_state(model), ema_model, opt_state, batch, step_key
     )
 
@@ -178,13 +178,14 @@ def test_train_step_jits_and_is_deterministic(
     )
 
     batch = jnp.zeros((2, small_config.max_seq_len), dtype=jnp.int32)
-    step_key = jax.random.PRNGKey(123)
 
-    m1, e1, _o1, mx1 = train_step(
-        clone_state(model), clone_state(model), clone_state(opt_state), batch, step_key
+    m1, e1, _o1, mx1, _ = train_step(
+        clone_state(model), clone_state(model), clone_state(opt_state),
+        batch, jax.random.PRNGKey(123),
     )
-    m2, e2, _o2, mx2 = train_step(
-        clone_state(model), clone_state(model), clone_state(opt_state), batch, step_key
+    m2, e2, _o2, mx2, _ = train_step(
+        clone_state(model), clone_state(model), clone_state(opt_state),
+        batch, jax.random.PRNGKey(123),
     )
 
     assert float(mx1.loss) == pytest.approx(float(mx2.loss), abs=0.0)
@@ -216,7 +217,7 @@ def test_train_step_produces_finite_updates(
         key, (2, small_config.max_seq_len), 0, small_config.vocab_size - 1
     )
     key, step_key = jax.random.split(key)
-    new_model, new_ema, _new_opt_state, metrics = train_step(
+    new_model, new_ema, _new_opt_state, metrics, _ = train_step(
         model, clone_state(model), opt_state, batch, step_key
     )
 
@@ -252,7 +253,7 @@ def test_train_step_signature_accepts_optax_chain() -> None:
         ema_decay=0.9,
     )
     batch = jnp.zeros((2, cfg.max_seq_len), dtype=jnp.int32)
-    _m, _e, _o, metrics = step(
+    _m, _e, _o, metrics, _ = step(
         model, clone_state(model), opt_state, batch, jax.random.PRNGKey(1)
     )
     assert jnp.isfinite(metrics.loss)
@@ -283,7 +284,7 @@ def test_make_train_step_narrows_via_trainstepfn_annotation(
 
     batch = jnp.zeros((2, small_config.max_seq_len), dtype=jnp.int32)
     key, step_key = jax.random.split(key)
-    new_model, new_ema, _new_opt_state, metrics = train_step(
+    new_model, new_ema, _new_opt_state, metrics, _ = train_step(
         model, clone_state(model), opt_state, batch, step_key
     )
 

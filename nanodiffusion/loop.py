@@ -23,7 +23,7 @@ from pydantic import BaseModel
 
 from nanodiffusion.checkpoint import save_checkpoint, write_config
 from nanodiffusion.data.cursors import LoaderCursor
-from nanodiffusion.data.loader import prefetch
+from nanodiffusion.data.loader import DevicePrefetchIterator
 from nanodiffusion.metrics import (
     CoreHostMetrics,
     CoreStepMetrics,
@@ -192,16 +192,21 @@ def run_training_loop[M: DiffusionModel, B, JB, C: LoaderCursor](
         logger.info("checkpoint_saved", path=str(ckpt_dir), step=state.step)
 
     t_window_start = time.monotonic()
-    with prefetch(base_loader, size=settings.prefetch_size) as loader:
-        for raw_batch in loader:
+    with DevicePrefetchIterator(
+        base_loader,
+        prepare_batch,
+        cpu_prefetch=settings.prefetch_size,
+        device_prefetch=2,
+    ) as loader:
+        for jax_batch, cursor, stats in loader:
             if state.step >= settings.max_steps:
                 break
-            jax_batch, cursor, stats = prepare_batch(raw_batch)
             state.cursor = cursor
             supervised_tokens_in_window += stats.supervised_tokens
-            state.key, step_key = jax.random.split(state.key)
-            state.model, state.ema_model, state.opt_state, step_metrics = train_step(
-                state.model, state.ema_model, state.opt_state, jax_batch, step_key
+            state.model, state.ema_model, state.opt_state, step_metrics, state.key = (
+                train_step(
+                    state.model, state.ema_model, state.opt_state, jax_batch, state.key
+                )
             )
             state.step += 1
 

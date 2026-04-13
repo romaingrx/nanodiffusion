@@ -3,6 +3,7 @@
 from collections.abc import Callable
 
 import equinox as eqx
+import jax
 import jax.numpy as jnp
 import optax
 
@@ -15,7 +16,7 @@ type LossFn[M: DiffusionModel, B] = Callable[[M, B, PRNGKeyArray], Scalar]
 
 type TrainStepFn[M: DiffusionModel, B] = Callable[
     [M, M, optax.OptState, B, PRNGKeyArray],
-    tuple[M, M, optax.OptState, CoreStepMetrics],
+    tuple[M, M, optax.OptState, CoreStepMetrics, PRNGKeyArray],
 ]
 
 
@@ -34,8 +35,9 @@ def make_train_step[M: DiffusionModel, B](
         opt_state: optax.OptState,
         batch: B,
         key: PRNGKeyArray,
-    ) -> tuple[M, M, optax.OptState, CoreStepMetrics]:
-        loss, grads = eqx.filter_value_and_grad(loss_fn)(model, batch, key)
+    ) -> tuple[M, M, optax.OptState, CoreStepMetrics, PRNGKeyArray]:
+        key, step_key = jax.random.split(key)
+        loss, grads = eqx.filter_value_and_grad(loss_fn)(model, batch, step_key)
         grad_norm = optax.tree.norm(grads)
         finite = jnp.isfinite(grad_norm) & jnp.isfinite(loss)
         new_model, new_ema_model, new_opt_state = apply_or_skip(
@@ -54,6 +56,6 @@ def make_train_step[M: DiffusionModel, B](
             param_norm=param_norm,
             grad_finite=finite.astype(jnp.float32),
         )
-        return new_model, new_ema_model, new_opt_state, metrics
+        return new_model, new_ema_model, new_opt_state, metrics, key
 
     return train_step

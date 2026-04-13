@@ -9,7 +9,8 @@ import jax
 import jax.numpy as jnp
 import optax
 import structlog
-from jax.sharding import Mesh
+from jax.sharding import Mesh, NamedSharding
+from jax.sharding import PartitionSpec as P
 
 from nanodiffusion.checkpoint import (
     load_checkpoint,
@@ -100,8 +101,17 @@ def _prepare_batch(
     batch: BatchOutput,
     mesh: Mesh,
 ) -> tuple[TokenBatch, PretrainCursor, StepStats]:
-    """Host → JAX conversion + device sharding for pretrain batches."""
-    return shard_batch(jnp.asarray(batch.tokens), mesh), batch.state, StepStats()
+    """Host → device transfer with async sharding.
+
+    Uses ``jax.device_put(numpy, NamedSharding)`` directly instead of
+    ``jnp.asarray`` + ``shard_batch``. ``device_put`` is always async
+    so the transfer can overlap with the previous step's tail compute.
+    """
+    from nanodiffusion.sharding import DP_AXES  # noqa: PLC0415
+
+    sharding = NamedSharding(mesh, P(DP_AXES, None))
+    tokens = jax.device_put(batch.tokens, sharding)
+    return tokens, batch.state, StepStats()
 
 
 @dataclasses.dataclass(frozen=True, slots=True)

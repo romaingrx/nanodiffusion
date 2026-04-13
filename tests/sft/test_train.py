@@ -67,7 +67,7 @@ def test_sft_train_step_decreases_loss_on_fixed_batch(
     losses: list[float] = []
     for _ in range(50):
         key, step_key = jax.random.split(key)
-        model, ema_model, opt_state, metrics = train_step(
+        model, ema_model, opt_state, metrics, _ = train_step(
             model, ema_model, opt_state, batch, step_key
         )
         losses.append(float(metrics.loss))
@@ -97,11 +97,13 @@ def test_sft_train_step_is_deterministic(
     batch = _make_supervised_batch(small_config.max_seq_len, batch=2)
     step_key = jax.random.PRNGKey(123)
 
-    m1, e1, _o1, mx1 = train_step(
-        clone_state(model), clone_state(model), clone_state(opt_state), batch, step_key
+    m1, e1, _o1, mx1, _ = train_step(
+        clone_state(model), clone_state(model), clone_state(opt_state),
+        batch, jax.random.PRNGKey(123),
     )
-    m2, e2, _o2, mx2 = train_step(
-        clone_state(model), clone_state(model), clone_state(opt_state), batch, step_key
+    m2, e2, _o2, mx2, _ = train_step(
+        clone_state(model), clone_state(model), clone_state(opt_state),
+        batch, jax.random.PRNGKey(123),
     )
 
     assert float(mx1.loss) == float(mx2.loss)
@@ -143,7 +145,7 @@ def test_sft_train_step_prompt_positions_have_zero_embedding_grad(
 
     # Clone the donated inputs so the original ``model`` stays live
     # for the post-step comparisons below.
-    new_model, _new_ema, _opt, metrics = train_step(
+    new_model, _new_ema, _opt, metrics, _ = train_step(
         clone_state(model), clone_state(model), opt_state, batch, step_key
     )
     assert float(metrics.loss) == 0.0
@@ -178,7 +180,7 @@ def test_make_sft_train_step_narrows_via_sfttrainstepfn_annotation(
 
     batch = _make_supervised_batch(small_config.max_seq_len, batch=2)
     key, step_key = jax.random.split(key)
-    new_model, new_ema, _new_opt_state, metrics = train_step(
+    new_model, new_ema, _new_opt_state, metrics, _ = train_step(
         model, clone_state(model), opt_state, batch, step_key
     )
 
