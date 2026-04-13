@@ -72,27 +72,19 @@ def attention(
 
     Backend dispatch:
 
-    * **Single-device TPU**:
+    * **TPU** (single- or multi-device):
       :func:`jax.experimental.pallas.ops.tpu.flash_attention`, a
-      blocked-softmax Pallas kernel with O(seq) memory. Gated on
-      ``jax.device_count() == 1`` because Mosaic kernels cannot be
-      auto-partitioned by GSPMD (a multi-device call raises
-      ``NotImplementedError``).
-    * **Multi-device TPU / CPU / GPU**:
+      blocked-softmax Pallas kernel with O(seq) memory. On multi-device
+      TPU, ``compute_loss`` wraps the model call in ``shard_map`` so
+      GSPMD never tries to auto-partition the Pallas custom call.
+    * **CPU / GPU**:
       :func:`jax.nn.dot_product_attention`. Materialises the
-      ``[heads, seq, seq]`` score matrix (O(seq^2) memory) but GSPMD
-      auto-partitions it natively. On multi-device TPU the shard_map
-      path in ``compute_loss`` bypasses this and calls
-      :func:`splash_attention` instead.
+      ``[heads, seq, seq]`` score matrix (O(seq^2) memory).
     """
     _, _, head_dim = q.shape
     scale = 1.0 / math.sqrt(head_dim)
 
-    if (
-        _tpu_flash_attention is not None
-        and jax.default_backend() == "tpu"
-        and jax.device_count() == 1
-    ):
+    if _tpu_flash_attention is not None and jax.default_backend() == "tpu":
         return _tpu_flash_attention(
             q[jnp.newaxis],
             k[jnp.newaxis],

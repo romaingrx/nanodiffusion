@@ -6,7 +6,6 @@ per-position NLL arithmetic stays shared with :mod:`nanodiffusion.sft`.
 
 from functools import partial
 
-import equinox as eqx
 import jax
 import jax.numpy as jnp
 from jax import shard_map
@@ -15,8 +14,6 @@ from jax.sharding import PartitionSpec as P
 
 from nanodiffusion.loss import TimeSampler, low_discrepancy_sampler, token_nll
 from nanodiffusion.model import DiffusionModel
-from nanodiffusion.model.attention import SelfAttention
-from nanodiffusion.ops import splash_attention
 from nanodiffusion.schedule import NoiseSchedule, loss_weight, mask_chance
 from nanodiffusion.sharding import DP_AXES
 from nanodiffusion.types import (
@@ -80,17 +77,6 @@ def diffusion_loss(
     return masked_nll(logits, x0, is_masked, loss_weight(schedule, t))
 
 
-def _with_splash_attention[M: DiffusionModel](model: M) -> M:
-    """Swap every :class:`SelfAttention` leaf's ``attn_fn`` to
-    :func:`splash_attention` so the model uses SplashAttention kernels
-    when called inside ``shard_map``."""
-    def _replace(leaf: object) -> object:
-        if isinstance(leaf, SelfAttention):
-            return eqx.tree_at(lambda sa: sa.attn_fn, leaf, splash_attention)
-        return leaf
-    return jax.tree.map(_replace, model, is_leaf=lambda x: isinstance(x, SelfAttention))
-
-
 def compute_loss(
     model: DiffusionModel,
     x0: TokenBatch,
@@ -104,7 +90,6 @@ def compute_loss(
     batch_size = x0.shape[0]
     key, t_key = jax.random.split(key)
     t_batch = sampler(batch_size, key=t_key)
-
     keys = jax.random.split(key, batch_size)
 
     if mesh is not None and len(mesh.devices.flat) > 1:
@@ -115,13 +100,8 @@ def compute_loss(
 
     def _per_sample(xi: Tokens, ti: Scalar, ki: PRNGKeyArray) -> Scalar:
         return diffusion_loss(
-            model,
-            xi,
-            ti,
-            mesh=mesh,
-            schedule=schedule,
-            mask_token_id=mask_token_id,
-            key=ki,
+            model, xi, ti,
+            mesh=mesh, schedule=schedule, mask_token_id=mask_token_id, key=ki,
         )
 
     losses = jax.vmap(_per_sample)(x0, t_batch, keys)
@@ -138,17 +118,17 @@ def _compute_loss_sharded(
     schedule: NoiseSchedule,
     mask_token_id: int,
 ) -> Scalar:
-    """Multi-device path: ``shard_map`` with SplashAttention.
+    """Multi-device path: ``shard_map`` with Pallas Flash Attention.
 
     The model is captured in the closure (replicated across devices).
-    Only the batch arrays (``x0``, ``t_batch``, ``keys``) are explicit
-    ``shard_map`` arguments so they get proper partition specs. Each
-    device independently computes losses on its local shard and the
-    result is reduced with ``pmean``.
+    Inside shard_map, ``ops.attention()`` uses Pallas FA directly
+    because GSPMD does not partition inside manual regions. Only the
+    batch arrays are explicit ``shard_map`` arguments with DP specs.
+    Each device computes losses on its local shard and the result is
+    reduced with ``pmean``.
     """
-    splash_model = _with_splash_attention(model)
 
-    @partial(  # pyright: ignore[reportUntypedFunctionDecorator]
+    @partial(
         shard_map,
         mesh=mesh,
         in_specs=(P(DP_AXES, None), P(DP_AXES), P(DP_AXES, None)),
@@ -162,13 +142,8 @@ def _compute_loss_sharded(
     ) -> Scalar:
         def _per_sample(xi: Tokens, ti: Scalar, ki: PRNGKeyArray) -> Scalar:
             return diffusion_loss(
-                splash_model,
-                xi,
-                ti,
-                mesh=None,
-                schedule=schedule,
-                mask_token_id=mask_token_id,
-                key=ki,
+                model, xi, ti,
+                mesh=None, schedule=schedule, mask_token_id=mask_token_id, key=ki,
             )
         losses = jax.vmap(_per_sample)(x0_shard, t_shard, keys_shard)
         return jax.lax.pmean(losses.mean(), DP_AXES)
