@@ -128,12 +128,15 @@ def _compute_loss_sharded(
     reduced with ``pmean``.
     """
 
+    # check_rep was renamed to check_vma in JAX 0.9.x
+    _shard_kw = {"check_vma": False} if "check_vma" in shard_map.__code__.co_varnames else {"check_rep": False}
+
     @partial(
         shard_map,
         mesh=mesh,
         in_specs=(P(DP_AXES, None), P(DP_AXES), P(DP_AXES, None)),
         out_specs=P(),
-        check_rep=False,
+        **_shard_kw,
     )
     def _sharded_loss(
         x0_shard: TokenBatch,
