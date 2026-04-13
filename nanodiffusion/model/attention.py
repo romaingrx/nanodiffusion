@@ -62,6 +62,10 @@ class SelfAttention(eqx.Module):
         q = jax.vmap(self.rope)(q)
         k = jax.vmap(self.rope)(k)
 
+        # GSPMD auto-partitions ``jax.nn.dot_product_attention`` natively
+        # on multi-device (what Gemma does); wrapping Pallas FA in
+        # ``shard_map`` with replicated specs caused all-gathers and
+        # collapsed FLOPS utilisation to 0.96% on v6e-4.
         out = attention(q, k, v)
 
         out = jnp.transpose(out, (1, 0, 2))

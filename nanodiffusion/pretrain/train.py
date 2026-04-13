@@ -65,7 +65,6 @@ def make_train_step[M: DiffusionModel](
     schedule: NoiseSchedule,
     mask_token_id: int,
     ema_decay: float,
-    grad_accum_steps: int = 1,
     sampler: TimeSampler = low_discrepancy_sampler,
 ) -> TrainStepFn[M, TokenBatch]:
     """Build an MDLM diffusion train step by binding the pretrain loss."""
@@ -85,8 +84,6 @@ def make_train_step[M: DiffusionModel](
         optimizer,
         loss_fn=loss_fn,
         ema_decay=ema_decay,
-        grad_accum_steps=grad_accum_steps,
-        mesh=mesh,
     )
 
 
@@ -264,7 +261,6 @@ def pretrain(
         schedule=LogLinearSchedule(),
         mask_token_id=tok.mask_token_id,
         ema_decay=ema_decay,
-        grad_accum_steps=config.train.grad_accum_steps,
     )
     base_loader = pretrain_loader(
         source,

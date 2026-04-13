@@ -269,12 +269,6 @@
           "title": "Batch Size",
           "type": "integer"
         },
-        "grad_accum_steps": {
-          "default": 1,
-          "minimum": 1,
-          "title": "Grad Accum Steps",
-          "type": "integer"
-        },
         "learning_rate": {
           "default": 0.0003,
           "exclusiveMinimum": 0.0,
@@ -354,7 +348,6 @@
       "default": {
         "seed": 42,
         "batch_size": 32,
-        "grad_accum_steps": 1,
         "learning_rate": 0.0003,
         "weight_decay": 0.0,
         "warmup_steps": 2500,
