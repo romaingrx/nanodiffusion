@@ -84,10 +84,21 @@ def attention(
     _, _, head_dim = q.shape
     scale = 1.0 / math.sqrt(head_dim)
 
-    if make_splash_mha_single_device is not None and jax.default_backend() == "tpu":
+    # Pallas FA gated on single-device: on multi-device, shard_map in
+    # compute_loss ensures each device runs independently, but we use dpa
+    # for now to isolate shard_map overhead from kernel speed.
+    if (
+        make_splash_mha_single_device is not None
+        and jax.default_backend() == "tpu"
+        and jax.device_count() == 1
+    ):
         return splash_attention(q, k, v)
 
-    if _tpu_flash_attention is not None and jax.default_backend() == "tpu":
+    if (
+        _tpu_flash_attention is not None
+        and jax.default_backend() == "tpu"
+        and jax.device_count() == 1
+    ):
         return _tpu_flash_attention(
             q[jnp.newaxis],
             k[jnp.newaxis],
