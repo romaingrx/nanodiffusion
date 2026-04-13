@@ -4,18 +4,13 @@ Built on top of :mod:`nanodiffusion.loss`'s per-token primitives so the
 per-position NLL arithmetic stays shared with :mod:`nanodiffusion.sft`.
 """
 
-from functools import partial
-
 import jax
 import jax.numpy as jnp
-from jax import shard_map
 from jax.sharding import Mesh
-from jax.sharding import PartitionSpec as P
 
 from nanodiffusion.loss import TimeSampler, low_discrepancy_sampler, token_nll
 from nanodiffusion.model import DiffusionModel
 from nanodiffusion.schedule import NoiseSchedule, loss_weight, mask_chance
-from nanodiffusion.sharding import DP_AXES
 from nanodiffusion.types import (
     Logits,
     Mask,
@@ -90,65 +85,19 @@ def compute_loss(
     batch_size = x0.shape[0]
     key, t_key = jax.random.split(key)
     t_batch = sampler(batch_size, key=t_key)
-    keys = jax.random.split(key, batch_size)
 
-    if mesh is not None and len(mesh.devices.flat) > 1:
-        return _compute_loss_sharded(
-            model, x0, t_batch, keys,
-            mesh=mesh, schedule=schedule, mask_token_id=mask_token_id,
-        )
+    keys = jax.random.split(key, batch_size)
 
     def _per_sample(xi: Tokens, ti: Scalar, ki: PRNGKeyArray) -> Scalar:
         return diffusion_loss(
-            model, xi, ti,
-            mesh=mesh, schedule=schedule, mask_token_id=mask_token_id, key=ki,
+            model,
+            xi,
+            ti,
+            mesh=mesh,
+            schedule=schedule,
+            mask_token_id=mask_token_id,
+            key=ki,
         )
 
     losses = jax.vmap(_per_sample)(x0, t_batch, keys)
     return losses.mean()
-
-
-def _compute_loss_sharded(
-    model: DiffusionModel,
-    x0: TokenBatch,
-    t_batch: jax.Array,
-    keys: jax.Array,
-    *,
-    mesh: Mesh,
-    schedule: NoiseSchedule,
-    mask_token_id: int,
-) -> Scalar:
-    """Multi-device path: ``shard_map`` with Pallas Flash Attention.
-
-    The model is captured in the closure (replicated across devices).
-    Inside shard_map, ``ops.attention()`` uses Pallas FA directly
-    because GSPMD does not partition inside manual regions. Only the
-    batch arrays are explicit ``shard_map`` arguments with DP specs.
-    Each device computes losses on its local shard and the result is
-    reduced with ``pmean``.
-    """
-
-    # check_rep was renamed to check_vma in JAX 0.9.x
-    _shard_kw = {"check_vma": False} if "check_vma" in shard_map.__code__.co_varnames else {"check_rep": False}
-
-    @partial(
-        shard_map,
-        mesh=mesh,
-        in_specs=(P(DP_AXES, None), P(DP_AXES), P(DP_AXES, None)),
-        out_specs=P(),
-        **_shard_kw,
-    )
-    def _sharded_loss(
-        x0_shard: TokenBatch,
-        t_shard: jax.Array,
-        keys_shard: jax.Array,
-    ) -> Scalar:
-        def _per_sample(xi: Tokens, ti: Scalar, ki: PRNGKeyArray) -> Scalar:
-            return diffusion_loss(
-                model, xi, ti,
-                mesh=None, schedule=schedule, mask_token_id=mask_token_id, key=ki,
-            )
-        losses = jax.vmap(_per_sample)(x0_shard, t_shard, keys_shard)
-        return jax.lax.pmean(losses.mean(), DP_AXES)
-
-    return _sharded_loss(x0, t_batch, keys)
