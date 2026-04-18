@@ -183,6 +183,7 @@ def run_training_loop[M: DiffusionModel, B, JB, C: LoaderCursor](
             model=state.model,
             ema_model=state.ema_model,
             opt_state=state.opt_state,
+            key=state.key,
             step=state.step,
             cursor=state.cursor,
             update_latest=True,

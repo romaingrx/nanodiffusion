@@ -257,6 +257,7 @@ def test_sft_finetune_end_to_end_smoke(
         model=model,
         ema_model=model,
         opt_state=opt_state,
+        key=jax.random.PRNGKey(0),
         step=0,
         cursor=None,
     )
@@ -340,6 +341,7 @@ def test_sft_finetune_resumes_from_saved_sft_checkpoint(
         model=model,
         ema_model=model,
         opt_state=pretrain_opt_state,
+        key=jax.random.PRNGKey(0),
         step=0,
         cursor=None,
     )

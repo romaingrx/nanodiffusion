@@ -112,11 +112,17 @@ def _build_task_mixture(config: Config) -> TaskMixture:
 
 @dataclasses.dataclass(frozen=True, slots=True)
 class _SFTInitialState:
-    """Everything :func:`sft_finetune`'s loop needs at step 0."""
+    """Everything :func:`sft_finetune`'s loop needs at step 0.
+
+    ``key`` is the loop's RNG: fresh SFT runs (from a pretrain weight
+    snapshot) seed it from ``config.sft.seed``; resumed runs restore it
+    from the checkpoint so the masking chain continues unbroken.
+    """
 
     model: Transformer
     ema_model: Transformer
     opt_state: optax.OptState
+    key: PRNGKeyArray
     step: int
     cursor: SFTCursor | None
 
@@ -171,6 +177,7 @@ def _load_fresh_sft_state(
         model=model,
         ema_model=ema_model,
         opt_state=opt_state,
+        key=jax.random.PRNGKey(config.sft.seed),
         step=0,
         cursor=None,
     )
@@ -191,7 +198,7 @@ def _load_resumed_sft_state(
     def build_opt_state(m: Transformer) -> optax.OptState:
         return optimizer.init(eqx.filter(m, eqx.is_inexact_array))
 
-    model, ema_model, opt_state, meta = load_checkpoint(
+    model, ema_model, opt_state, key, meta = load_checkpoint(
         checkpoint,
         model_skeleton=skeleton,
         opt_state_builder=build_opt_state,
@@ -202,6 +209,7 @@ def _load_resumed_sft_state(
         model=model,
         ema_model=ema_model,
         opt_state=opt_state,
+        key=key,
         step=meta.step,
         cursor=cursor,
     )
@@ -307,7 +315,7 @@ def sft_finetune(
         start.model,
         start.ema_model,
         start.opt_state,
-        jax.random.PRNGKey(config.sft.seed),
+        start.key,
         mesh,
     )
     state: LoopState[Transformer, SFTCursor] = LoopState(

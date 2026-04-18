@@ -21,8 +21,6 @@ import numpy as np
 from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
 
-from nanodiffusion.types import PRNGKeyArray
-
 DP_AXES: tuple[str, str] = ("X", "Y")
 """2D data-parallel mesh axis names. Batches shard over ``P(DP_AXES)``
 so the first dim is split across both ICI dimensions concurrently."""
@@ -73,6 +71,13 @@ def shard_batch[T](batch: T, mesh: Mesh) -> T:
     that should be split the same way. ``P(("X", "Y"))`` flattens the
     split across both mesh axes so the batch dimension is distributed
     over all devices even on a rectangular topology.
+
+    Note on PRNG: the master RNG key stays replicated across devices.
+    Per-sample uniqueness comes from ``jax.random.split(key, batch)``
+    inside the loss, consumed by a ``vmap`` over the (sharded) batch
+    axis — each device processes a distinct slice of both tokens and
+    per-sample sub-keys, so DP correctness doesn't require sharding
+    the master key itself.
     """
     sharding = NamedSharding(mesh, P(DP_AXES))
     return jax.tree.map(
@@ -80,17 +85,3 @@ def shard_batch[T](batch: T, mesh: Mesh) -> T:
         batch,
         is_leaf=eqx.is_array,
     )
-
-
-def shard_keys(key: PRNGKeyArray, mesh: Mesh) -> jax.Array:
-    """Split *key* into one sub-key per device and shard across
-    ``P(("X", "Y"))``.
-
-    Each device receives a unique PRNG key so per-element noise in
-    :func:`jax.vmap`'d loss functions is independent across the batch
-    shards. Without this, every device would sample identical diffusion
-    noise and DP would collapse to a replicated single-device run.
-    """
-    num_devices = len(mesh.devices.flat)
-    keys = jax.random.split(key, num_devices)
-    return jax.device_put(keys, NamedSharding(mesh, P(DP_AXES)))

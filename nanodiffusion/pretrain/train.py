@@ -46,7 +46,7 @@ from nanodiffusion.reporter import (
 )
 from nanodiffusion.runtime import configure_jax_runtime, place_training_state
 from nanodiffusion.schedule import LogLinearSchedule, NoiseSchedule
-from nanodiffusion.sharding import setup_mesh, shard_batch
+from nanodiffusion.sharding import setup_mesh
 from nanodiffusion.tokenizer import Tokenizer
 from nanodiffusion.train_step import (
     TrainStepFn,
@@ -116,11 +116,18 @@ def _prepare_batch(
 
 @dataclasses.dataclass(frozen=True, slots=True)
 class _PretrainInitialState:
-    """Everything :func:`pretrain`'s loop needs at step 0."""
+    """Everything :func:`pretrain`'s loop needs at step 0.
+
+    ``key`` is the loop's RNG: on a fresh run it's the post-init split
+    of the seed key; on resume it's restored from the checkpoint so the
+    diffusion masking / timestep sampling chain continues from where it
+    left off rather than rewinding to step 0.
+    """
 
     model: Transformer
     ema_model: Transformer
     opt_state: optax.OptState
+    key: PRNGKeyArray
     step: int
     cursor: PretrainCursor | None
 
@@ -131,17 +138,19 @@ def _load_pretrain_initial_state(
     *,
     resume_from: Path | None,
     model_key: PRNGKeyArray,
+    loop_key: PRNGKeyArray,
 ) -> _PretrainInitialState:
     """Build the step-0 state for a fresh run or resume from a checkpoint."""
     if resume_from is not None:
         return _load_resumed_pretrain_state(config, optimizer, resume_from)
-    return _load_fresh_pretrain_state(config, optimizer, model_key)
+    return _load_fresh_pretrain_state(config, optimizer, model_key, loop_key)
 
 
 def _load_fresh_pretrain_state(
     config: Config,
     optimizer: optax.GradientTransformation,
     model_key: PRNGKeyArray,
+    loop_key: PRNGKeyArray,
 ) -> _PretrainInitialState:
     model = Transformer(config.model, key=model_key)
     opt_state = optimizer.init(eqx.filter(model, eqx.is_inexact_array))
@@ -154,6 +163,7 @@ def _load_fresh_pretrain_state(
         model=model,
         ema_model=ema_model,
         opt_state=opt_state,
+        key=loop_key,
         step=0,
         cursor=None,
     )
@@ -174,7 +184,7 @@ def _load_resumed_pretrain_state(
     def build_opt_state(m: Transformer) -> optax.OptState:
         return optimizer.init(eqx.filter(m, eqx.is_inexact_array))
 
-    model, ema_model, opt_state, meta = load_checkpoint(
+    model, ema_model, opt_state, key, meta = load_checkpoint(
         checkpoint,
         model_skeleton=skeleton,
         opt_state_builder=build_opt_state,
@@ -185,6 +195,7 @@ def _load_resumed_pretrain_state(
         model=model,
         ema_model=ema_model,
         opt_state=opt_state,
+        key=key,
         step=meta.step,
         cursor=cursor,
     )
@@ -235,8 +246,8 @@ def pretrain(
     Returns the run directory so callers (tests, notebooks) can inspect
     the produced artifacts without re-deriving the auto-generated path.
     """
-    key = jax.random.PRNGKey(config.train.seed)
-    key, model_key = jax.random.split(key)
+    seed_key = jax.random.PRNGKey(config.train.seed)
+    model_key, loop_key = jax.random.split(seed_key)
 
     optimizer, lr_schedule = make_optimizer(config.train)
     start = _load_pretrain_initial_state(
@@ -244,6 +255,7 @@ def pretrain(
         optimizer,
         resume_from=resume_from,
         model_key=model_key,
+        loop_key=loop_key,
     )
 
     tok = Tokenizer(encode_threads=config.data.tokenizer_threads)
@@ -287,7 +299,7 @@ def pretrain(
         start.model,
         start.ema_model,
         start.opt_state,
-        key,
+        start.key,
         mesh,
     )
     state: LoopState[Transformer, PretrainCursor] = LoopState(

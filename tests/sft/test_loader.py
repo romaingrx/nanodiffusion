@@ -215,10 +215,11 @@ def test_cursor_roundtrip_through_checkpoint(
         model=model,
         ema_model=model,
         opt_state=opt_state,
+        key=jax.random.PRNGKey(0),
         step=1,
         cursor=cursor,
     )
-    _m, _e, _o, meta = load_checkpoint(
+    _m, _e, _o, _k, meta = load_checkpoint(
         ckpt_dir,
         model_skeleton=model,
         opt_state_builder=lambda m: optimizer.init(eqx.filter(m, eqx.is_inexact_array)),
