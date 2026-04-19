@@ -56,7 +56,6 @@ def test_sft_train_step_decreases_loss_on_fixed_batch(
 
     train_step = make_sft_train_step(
         optimizer,
-        mesh=None,
         schedule=LogLinearSchedule(),
         mask_token_id=small_config.vocab_size - 1,
         ema_decay=sft_cfg.ema_decay,
@@ -88,22 +87,29 @@ def test_sft_train_step_is_deterministic(
     opt_state = optimizer.init(eqx.filter(model, eqx.is_inexact_array))
     train_step = make_sft_train_step(
         optimizer,
-        mesh=None,
         schedule=LogLinearSchedule(),
         mask_token_id=small_config.vocab_size - 1,
         ema_decay=0.9,
     )
 
     batch = _make_supervised_batch(small_config.max_seq_len, batch=2)
-    step_key = jax.random.PRNGKey(123)
 
+    # Fresh PRNGKey per call — ``donate="all"`` on the JIT'd train step
+    # consumes the key buffer, so sharing one across two calls would
+    # hit "buffer has been deleted or donated".
     m1, e1, _o1, mx1, _ = train_step(
-        clone_state(model), clone_state(model), clone_state(opt_state),
-        batch, jax.random.PRNGKey(123),
+        clone_state(model),
+        clone_state(model),
+        clone_state(opt_state),
+        batch,
+        jax.random.PRNGKey(123),
     )
     m2, e2, _o2, mx2, _ = train_step(
-        clone_state(model), clone_state(model), clone_state(opt_state),
-        batch, jax.random.PRNGKey(123),
+        clone_state(model),
+        clone_state(model),
+        clone_state(opt_state),
+        batch,
+        jax.random.PRNGKey(123),
     )
 
     assert float(mx1.loss) == float(mx2.loss)
@@ -128,7 +134,6 @@ def test_sft_train_step_prompt_positions_have_zero_embedding_grad(
     opt_state = optimizer.init(eqx.filter(model, eqx.is_inexact_array))
     train_step = make_sft_train_step(
         optimizer,
-        mesh=None,
         schedule=LogLinearSchedule(),
         mask_token_id=small_config.vocab_size - 1,
         ema_decay=0.9,
@@ -172,7 +177,6 @@ def test_make_sft_train_step_narrows_via_sfttrainstepfn_annotation(
 
     train_step: SFTTrainStepFn[Transformer] = make_sft_train_step(
         optimizer,
-        mesh=None,
         schedule=LogLinearSchedule(),
         mask_token_id=small_config.vocab_size - 1,
         ema_decay=0.9,

@@ -1,8 +1,6 @@
 import equinox as eqx
 import jax
 import jax.numpy as jnp
-import numpy as np
-from jax.sharding import Mesh
 
 from nanodiffusion.config import ModelConfig
 from nanodiffusion.model.attention import SelfAttention
@@ -64,22 +62,6 @@ def test_self_attention_is_bidirectional(key: jax.Array) -> None:
     x_modified_last = x.at[-1].set(x[-1] + 10.0)
     out_modified_last = attn(x_modified_last)
     assert not jnp.allclose(out_orig[0], out_modified_last[0])
-
-
-def test_self_attention_preserves_shape_with_mesh_kwarg(key: jax.Array) -> None:
-    """Passing a mesh through the forward pass is a no-op for shape.
-
-    The mesh plumbing exists so paradigm code can experiment with
-    manual shard-map regions without changing the model signature. The
-    current implementation ignores the kwarg and relies on GSPMD auto-
-    partitioning of :func:`jax.nn.dot_product_attention` (the same
-    approach Gemma uses for multi-device transformer training).
-    """
-    attn = SelfAttention(64, 4, key=key)
-    mesh = Mesh(np.asarray(jax.devices()).reshape(1, 1), ("X", "Y"))
-    x = jax.random.normal(key, (16, 64))
-    out = attn(x, mesh=mesh)
-    assert out.shape == (16, 64)
 
 
 def test_feed_forward_shape(key: jax.Array, small_config: ModelConfig) -> None:

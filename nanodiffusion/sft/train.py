@@ -31,24 +31,14 @@ from nanodiffusion.loop import (
 )
 from nanodiffusion.model import DiffusionModel, Transformer, transformer_skeleton
 from nanodiffusion.optimizer import make_optimizer, scale_ema_decay
-from nanodiffusion.reporter import (
-    JsonlSink,
-    Reporter,
-    SinkFactory,
-    StructlogSink,
-    WandbSink,
-)
+from nanodiffusion.reporter import Reporter, default_sinks
 from nanodiffusion.runtime import configure_jax_runtime, place_training_state
 from nanodiffusion.schedule import LogLinearSchedule, NoiseSchedule
 from nanodiffusion.sft.loss import compute_sft_loss
 from nanodiffusion.sharding import setup_mesh, shard_batch
 from nanodiffusion.tokenizer import Tokenizer
-from nanodiffusion.train_step import (
-    TrainStepFn,
-)
-from nanodiffusion.train_step import (
-    make_train_step as make_shared_train_step,
-)
+from nanodiffusion.train_step import TrainStepFn
+from nanodiffusion.train_step import make_train_step as make_shared_train_step
 from nanodiffusion.types import PRNGKeyArray, Scalar
 
 logger = structlog.get_logger(__name__)
@@ -60,7 +50,6 @@ type SFTTrainStepFn[M: DiffusionModel] = TrainStepFn[M, SFTJaxBatch]
 def make_sft_train_step[M: DiffusionModel](
     optimizer: optax.GradientTransformation,
     *,
-    mesh: Mesh | None,
     schedule: NoiseSchedule,
     mask_token_id: int,
     ema_decay: float,
@@ -72,7 +61,6 @@ def make_sft_train_step[M: DiffusionModel](
             m,
             batch.tokens,
             batch.loss_mask,
-            mesh=mesh,
             schedule=schedule,
             mask_token_id=mask_token_id,
             key=key,
@@ -215,36 +203,6 @@ def _load_resumed_sft_state(
     )
 
 
-def _default_sft_sinks(
-    run_dir: Path,
-    *,
-    config: Config,
-    wandb_project: str | None,
-    wandb_entity: str | None,
-) -> list[SinkFactory]:
-    """Default sink stack for an SFT run.
-
-    Same shape as the pretrain counterpart but with ``sft_train`` as
-    the structlog event name so the two paradigms are easy to
-    distinguish in aggregated logs.
-    """
-    factories: list[SinkFactory] = [
-        partial(StructlogSink, "sft_train"),
-        partial(JsonlSink, run_dir / "metrics.jsonl"),
-    ]
-    if wandb_project is not None:
-        factories.append(
-            partial(
-                WandbSink,
-                project=wandb_project,
-                entity=wandb_entity,
-                run_name=run_dir.name,
-                config=config.model_dump(mode="json"),
-            )
-        )
-    return factories
-
-
 def sft_finetune(
     config: Config,
     *,
@@ -294,7 +252,6 @@ def sft_finetune(
     ema_decay = scale_ema_decay(config.sft.ema_decay, jax.device_count())
     train_step = make_sft_train_step(
         optimizer,
-        mesh=mesh,
         schedule=LogLinearSchedule(),
         mask_token_id=tok.mask_token_id,
         ema_decay=ema_decay,
@@ -335,11 +292,12 @@ def sft_finetune(
         event_name="sft_train",
         profile_steps=profile_steps,
     )
-    sink_factories = _default_sft_sinks(
-        run_dir,
-        config=config,
+    sink_factories = default_sinks(
+        event_name="sft_train",
+        run_dir=run_dir,
         wandb_project=wandb_project,
         wandb_entity=wandb_entity,
+        wandb_config=config.model_dump(mode="json"),
     )
     with Reporter(sink_factories) as reporter:
         run_training_loop(

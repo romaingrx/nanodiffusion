@@ -37,23 +37,13 @@ from nanodiffusion.model import (
 )
 from nanodiffusion.optimizer import make_optimizer, scale_ema_decay
 from nanodiffusion.pretrain.loss import compute_loss
-from nanodiffusion.reporter import (
-    JsonlSink,
-    Reporter,
-    SinkFactory,
-    StructlogSink,
-    WandbSink,
-)
+from nanodiffusion.reporter import Reporter, default_sinks
 from nanodiffusion.runtime import configure_jax_runtime, place_training_state
 from nanodiffusion.schedule import LogLinearSchedule, NoiseSchedule
 from nanodiffusion.sharding import setup_mesh
 from nanodiffusion.tokenizer import Tokenizer
-from nanodiffusion.train_step import (
-    TrainStepFn,
-)
-from nanodiffusion.train_step import (
-    make_train_step as make_shared_train_step,
-)
+from nanodiffusion.train_step import TrainStepFn
+from nanodiffusion.train_step import make_train_step as make_shared_train_step
 from nanodiffusion.types import PRNGKeyArray, Scalar, TokenBatch
 
 logger = structlog.get_logger(__name__)
@@ -62,7 +52,6 @@ logger = structlog.get_logger(__name__)
 def make_train_step[M: DiffusionModel](
     optimizer: optax.GradientTransformation,
     *,
-    mesh: Mesh | None,
     schedule: NoiseSchedule,
     mask_token_id: int,
     ema_decay: float,
@@ -74,7 +63,6 @@ def make_train_step[M: DiffusionModel](
         return compute_loss(
             m,
             batch,
-            mesh=mesh,
             schedule=schedule,
             mask_token_id=mask_token_id,
             key=key,
@@ -201,38 +189,6 @@ def _load_resumed_pretrain_state(
     )
 
 
-def _default_pretrain_sinks(
-    run_dir: Path,
-    *,
-    config: Config,
-    wandb_project: str | None,
-    wandb_entity: str | None,
-) -> list[SinkFactory]:
-    """Assemble the default sink stack for a pretrain run.
-
-    Always emits structlog (so console output stays identical to the
-    pre-reporter world) plus a per-run JSONL file under ``run_dir`` for
-    offline analysis. Wandb is optional and only enabled when a
-    project is supplied; when enabled it runs in the reporter's worker
-    process and never imports inside the training process.
-    """
-    factories: list[SinkFactory] = [
-        partial(StructlogSink, "train"),
-        partial(JsonlSink, run_dir / "metrics.jsonl"),
-    ]
-    if wandb_project is not None:
-        factories.append(
-            partial(
-                WandbSink,
-                project=wandb_project,
-                entity=wandb_entity,
-                run_name=run_dir.name,
-                config=config.model_dump(mode="json"),
-            )
-        )
-    return factories
-
-
 def pretrain(
     config: Config,
     *,
@@ -279,7 +235,6 @@ def pretrain(
     ema_decay = scale_ema_decay(config.train.ema_decay, jax.device_count())
     train_step = make_train_step(
         optimizer,
-        mesh=mesh,
         schedule=LogLinearSchedule(),
         mask_token_id=tok.mask_token_id,
         ema_decay=ema_decay,
@@ -319,11 +274,12 @@ def pretrain(
         event_name="train",
         profile_steps=profile_steps,
     )
-    sink_factories = _default_pretrain_sinks(
-        run_dir,
-        config=config,
+    sink_factories = default_sinks(
+        event_name="train",
+        run_dir=run_dir,
         wandb_project=wandb_project,
         wandb_entity=wandb_entity,
+        wandb_config=config.model_dump(mode="json"),
     )
     with Reporter(sink_factories) as reporter:
         run_training_loop(

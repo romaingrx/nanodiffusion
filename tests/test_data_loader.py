@@ -309,7 +309,9 @@ def test_device_prefetch_yields_all_items() -> None:
         prepared.append(x)
         return x * 10
 
-    with DevicePrefetchIterator(iter(items), prepare, cpu_prefetch=3, device_prefetch=2) as it:
+    with DevicePrefetchIterator(
+        iter(items), prepare, cpu_prefetch=3, device_prefetch=2
+    ) as it:
         result = list(it)
 
     assert result == [x * 10 for x in items]
@@ -336,7 +338,9 @@ def test_device_prefetch_eagerly_fills_buffer() -> None:
 
 def test_device_prefetch_handles_empty_source() -> None:
     """Empty source must not raise, just produce no items."""
-    with DevicePrefetchIterator(iter([]), lambda x: x, cpu_prefetch=2, device_prefetch=2) as it:
+    with DevicePrefetchIterator(
+        iter([]), lambda x: x, cpu_prefetch=2, device_prefetch=2
+    ) as it:
         assert list(it) == []
 
 
@@ -350,7 +354,9 @@ def test_device_prefetch_handles_short_source() -> None:
 
 def test_device_prefetch_context_manager_cleanup() -> None:
     """After __exit__, iterating must raise StopIteration."""
-    it = DevicePrefetchIterator(iter(range(5)), lambda x: x, cpu_prefetch=2, device_prefetch=2)
+    it = DevicePrefetchIterator(
+        iter(range(5)), lambda x: x, cpu_prefetch=2, device_prefetch=2
+    )
     _ = next(it)
     it.close()
     assert list(it) == []

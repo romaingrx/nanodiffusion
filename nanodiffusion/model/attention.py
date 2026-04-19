@@ -1,7 +1,6 @@
 import equinox as eqx
 import jax
 import jax.numpy as jnp
-from jax.sharding import Mesh
 from jaxtyping import Array, Float
 
 from nanodiffusion.ops import attention
@@ -35,12 +34,7 @@ class SelfAttention(eqx.Module):
         self.k_norm = eqx.nn.RMSNorm(self.head_dim, use_weight=False, use_bias=False)
         self.rope = eqx.nn.RotaryPositionalEmbedding(self.head_dim)
 
-    def __call__(
-        self,
-        x: Float[Array, "seq dim"],
-        *,
-        mesh: Mesh | None = None,  # noqa: ARG002  kept for API parity, unused
-    ) -> Float[Array, "seq dim"]:
+    def __call__(self, x: Float[Array, "seq dim"]) -> Float[Array, "seq dim"]:
         q = jax.vmap(self.q_proj)(x)
         k = jax.vmap(self.k_proj)(x)
         v = jax.vmap(self.v_proj)(x)
@@ -62,10 +56,6 @@ class SelfAttention(eqx.Module):
         q = jax.vmap(self.rope)(q)
         k = jax.vmap(self.rope)(k)
 
-        # GSPMD auto-partitions ``jax.nn.dot_product_attention`` natively
-        # on multi-device (what Gemma does); wrapping Pallas FA in
-        # ``shard_map`` with replicated specs caused all-gathers and
-        # collapsed FLOPS utilisation to 0.96% on v6e-4.
         out = attention(q, k, v)
 
         out = jnp.transpose(out, (1, 0, 2))

@@ -94,7 +94,6 @@ def test_train_step_decreases_loss_on_fixed_batch(
     mask_id = small_config.vocab_size - 1
     train_step = make_train_step(
         optimizer,
-        mesh=None,
         schedule=LogLinearSchedule(),
         mask_token_id=mask_id,
         ema_decay=train_cfg.ema_decay,
@@ -138,7 +137,6 @@ def test_train_step_updates_model_and_ema(
 
     train_step = make_train_step(
         optimizer,
-        mesh=None,
         schedule=LogLinearSchedule(),
         mask_token_id=small_config.vocab_size - 1,
         ema_decay=train_cfg.ema_decay,
@@ -171,7 +169,6 @@ def test_train_step_jits_and_is_deterministic(
 
     train_step = make_train_step(
         optimizer,
-        mesh=None,
         schedule=LogLinearSchedule(),
         mask_token_id=small_config.vocab_size - 1,
         ema_decay=0.9,
@@ -180,12 +177,18 @@ def test_train_step_jits_and_is_deterministic(
     batch = jnp.zeros((2, small_config.max_seq_len), dtype=jnp.int32)
 
     m1, e1, _o1, mx1, _ = train_step(
-        clone_state(model), clone_state(model), clone_state(opt_state),
-        batch, jax.random.PRNGKey(123),
+        clone_state(model),
+        clone_state(model),
+        clone_state(opt_state),
+        batch,
+        jax.random.PRNGKey(123),
     )
     m2, e2, _o2, mx2, _ = train_step(
-        clone_state(model), clone_state(model), clone_state(opt_state),
-        batch, jax.random.PRNGKey(123),
+        clone_state(model),
+        clone_state(model),
+        clone_state(opt_state),
+        batch,
+        jax.random.PRNGKey(123),
     )
 
     assert float(mx1.loss) == pytest.approx(float(mx2.loss), abs=0.0)
@@ -207,7 +210,6 @@ def test_train_step_produces_finite_updates(
 
     train_step = make_train_step(
         optimizer,
-        mesh=None,
         schedule=LogLinearSchedule(),
         mask_token_id=small_config.vocab_size - 1,
         ema_decay=0.9,
@@ -247,7 +249,6 @@ def test_train_step_signature_accepts_optax_chain() -> None:
 
     step = make_train_step(
         optimizer,
-        mesh=None,
         schedule=LogLinearSchedule(),
         mask_token_id=cfg.vocab_size - 1,
         ema_decay=0.9,
@@ -276,7 +277,6 @@ def test_make_train_step_narrows_via_trainstepfn_annotation(
 
     train_step: TrainStepFn[Transformer] = make_train_step(
         optimizer,
-        mesh=None,
         schedule=LogLinearSchedule(),
         mask_token_id=small_config.vocab_size - 1,
         ema_decay=0.9,
@@ -306,7 +306,6 @@ def test_train_step_returns_updated_key(
     opt_state = optimizer.init(eqx.filter(model, eqx.is_inexact_array))
     train_step = make_train_step(
         optimizer,
-        mesh=None,
         schedule=LogLinearSchedule(),
         mask_token_id=small_config.vocab_size - 1,
         ema_decay=0.9,
@@ -336,7 +335,7 @@ def test_prepare_batch_uses_async_device_put(small_config: ModelConfig) -> None:
         segments=np.zeros((4, small_config.max_seq_len), dtype=np.int32),
         state=PretrainCursor(epoch=1, shard_idx=0, row_group_idx=0),
     )
-    tokens, cursor, stats = _prepare_batch(batch, mesh)
+    tokens, cursor, _stats = _prepare_batch(batch, mesh)
     assert isinstance(tokens, jax.Array)
     assert tokens.shape == (4, small_config.max_seq_len)
     assert cursor == batch.state

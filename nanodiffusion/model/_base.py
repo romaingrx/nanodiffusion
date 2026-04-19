@@ -5,7 +5,6 @@ without triggering a circular import via ``nanodiffusion.model.__init__``.
 """
 
 import equinox as eqx
-from jax.sharding import Mesh
 
 from nanodiffusion.types import Logits, Scalar, Tokens
 
@@ -21,12 +20,6 @@ class DiffusionModel(eqx.Module):
     signatures.
     """
 
-    def __call__(
-        self,
-        tokens: Tokens,
-        t: Scalar,
-        *,
-        mesh: Mesh | None = None,
-    ) -> Logits:
+    def __call__(self, tokens: Tokens, t: Scalar) -> Logits:
         msg = f"{type(self).__name__} must override __call__"
         raise NotImplementedError(msg)

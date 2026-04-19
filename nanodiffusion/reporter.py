@@ -149,6 +149,45 @@ class WandbSink:
         self._run.finish()
 
 
+def default_sinks(
+    *,
+    event_name: str,
+    run_dir: Path,
+    wandb_project: str | None,
+    wandb_entity: str | None,
+    wandb_config: Mapping[str, Any],
+) -> list[SinkFactory]:
+    """The stack every training driver wires up: structlog + JSONL (+ wandb).
+
+    Structlog keeps the console output identical to the pre-reporter
+    world; the JSONL file under ``run_dir`` is for offline analysis.
+    Wandb is optional and only enabled when ``wandb_project`` is set;
+    when enabled it runs in the reporter's worker process and never
+    imports inside the training process.
+
+    Factories are picklable (``functools.partial`` closures over
+    module-level callables) because the async :class:`Reporter` passes
+    them to a spawned worker.
+    """
+    from functools import partial  # noqa: PLC0415
+
+    factories: list[SinkFactory] = [
+        partial(StructlogSink, event_name),
+        partial(JsonlSink, run_dir / "metrics.jsonl"),
+    ]
+    if wandb_project is not None:
+        factories.append(
+            partial(
+                WandbSink,
+                project=wandb_project,
+                entity=wandb_entity,
+                run_name=run_dir.name,
+                config=dict(wandb_config),
+            )
+        )
+    return factories
+
+
 class Reporter(AbstractContextManager["Reporter"]):
     """Fan-out metrics emitter backed by a worker process.
 
@@ -177,7 +216,7 @@ class Reporter(AbstractContextManager["Reporter"]):
         self._queue: MPQueue[MetricEvent | None] | None = None
         self._proc: SpawnProcess | None = None
 
-    def __enter__(self) -> "Reporter":  # noqa: PYI034  beartype can't handle PEP 673 Self
+    def __enter__(self) -> "Reporter":
         self._queue = self._ctx.Queue(maxsize=self._max_queue)
         self._proc = self._ctx.Process(
             target=_worker_main,
@@ -234,7 +273,7 @@ class InlineReporter(AbstractContextManager["InlineReporter"]):
         self._factories = tuple(sink_factories)
         self._sinks: list[MetricSink] = []
 
-    def __enter__(self) -> "InlineReporter":  # noqa: PYI034  beartype can't handle PEP 673 Self
+    def __enter__(self) -> "InlineReporter":
         self._sinks = [f() for f in self._factories]
         return self
 

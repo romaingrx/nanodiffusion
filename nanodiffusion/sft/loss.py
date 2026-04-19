@@ -9,7 +9,6 @@ the per-token primitive :func:`nanodiffusion.loss.token_nll`.
 
 import jax
 import jax.numpy as jnp
-from jax.sharding import Mesh
 
 from nanodiffusion.loss import TimeSampler, low_discrepancy_sampler, token_nll
 from nanodiffusion.model import DiffusionModel
@@ -53,7 +52,6 @@ def compute_sft_loss(
     x0: TokenBatch,
     loss_mask: MaskBatch,
     *,
-    mesh: Mesh | None = None,
     schedule: NoiseSchedule,
     mask_token_id: int,
     key: PRNGKeyArray,
@@ -85,7 +83,7 @@ def compute_sft_loss(
         xt, is_masked = sft_forward_mask(
             xi, li, ti, schedule=schedule, mask_token_id=mask_token_id, key=ki
         )
-        logits = model(xt, ti, mesh=mesh)
+        logits = model(xt, ti)
         weighted = loss_weight(schedule, ti) * (token_nll(logits, xi) * is_masked).sum()
         return weighted, is_masked.sum().astype(weighted.dtype)
 
