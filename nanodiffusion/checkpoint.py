@@ -1,9 +1,11 @@
 """On-disk checkpoints for a training run.
 
 A checkpoint directory holds four equinox-serialised binary files
-(``model.eqx`` / ``ema.eqx`` / ``opt_state.eqx`` / ``meta.json``) plus
-a ``config.yaml`` sidecar written by :func:`write_config` and read on
-resume by :func:`resolve_model_config_from_checkpoint`.
+(``model.eqx`` / ``ema.eqx`` / ``opt_state.eqx`` / ``rng.eqx``) plus a
+``meta.json`` sidecar for the step / data-loader cursor and a
+``config.yaml`` written by :func:`write_config`. The RNG key lives in
+its own binary artifact so resume continues the same stochastic chain
+(masking / timestep sampling) rather than rewinding to the seed.
 
 Binary save/load is generic over the concrete diffusion-model class:
 pass a ``Transformer`` skeleton in, get a ``Transformer`` back, no
@@ -17,9 +19,11 @@ from pathlib import Path
 from typing import Literal, cast
 
 import equinox as eqx
+import jax
 import optax
 import structlog
 import yaml
+from jax.experimental import multihost_utils
 from pydantic import BaseModel, ConfigDict, Field
 
 from nanodiffusion.config import Config, ModelConfig
@@ -30,9 +34,11 @@ from nanodiffusion.constants import (
     META_FILENAME,
     MODEL_FILENAME,
     OPT_STATE_FILENAME,
+    RNG_FILENAME,
 )
 from nanodiffusion.data.cursors import LoaderCursor
 from nanodiffusion.model import DiffusionModel
+from nanodiffusion.types import PRNGKeyArray
 
 logger = structlog.get_logger(__name__)
 
@@ -75,22 +81,56 @@ def save_checkpoint[M: DiffusionModel](
     model: M,
     ema_model: M,
     opt_state: optax.OptState,
+    key: PRNGKeyArray,
     step: int,
     cursor: LoaderCursor | None,
     update_latest: bool = False,
 ) -> None:
-    """Write ``(model, ema, opt_state, meta)`` atomically to ``path``.
+    """Write ``(model, ema, opt_state, rng, meta)`` atomically to ``path``.
+
+    Multi-host safe: only the rank-0 process writes; all hosts then
+    barrier on :func:`multihost_utils.sync_global_devices` so no reader
+    races ahead of the on-disk artifact. Safe to call unconditionally
+    from every host — the gate lives inside rather than at call sites.
 
     Leaves land in a sibling ``<path>.tmp`` dir first, then a single
-    :func:`os.replace` renames into place (atomic on POSIX). A crash
-    mid-write leaves only the ``.tmp`` sibling, never a partial
-    ``path``. Raises :class:`FileExistsError` if ``path`` already
-    exists — we refuse to silently overwrite a prior checkpoint.
+    :func:`os.replace` renames into place (atomic on POSIX; on
+    gcsfuse-backed paths the rename maps to a GCS copy+delete which is
+    not strictly atomic, so partial ``.tmp`` dirs are possible after a
+    hard preemption and get cleaned up on the next save). Raises
+    :class:`FileExistsError` if ``path`` already exists — we refuse to
+    silently overwrite a prior checkpoint.
 
     When ``update_latest=True``, point ``path.parent/latest`` at
     ``path.name`` via a temp-link swap; platforms that reject symlinks
     (unprivileged Windows) log and skip rather than failing the save.
     """
+    if jax.process_index() == 0:
+        _write_checkpoint(
+            path,
+            model=model,
+            ema_model=ema_model,
+            opt_state=opt_state,
+            key=key,
+            step=step,
+            cursor=cursor,
+            update_latest=update_latest,
+        )
+    if jax.process_count() > 1:
+        multihost_utils.sync_global_devices(f"save_checkpoint:{path.name}")
+
+
+def _write_checkpoint[M: DiffusionModel](
+    path: Path,
+    *,
+    model: M,
+    ema_model: M,
+    opt_state: optax.OptState,
+    key: PRNGKeyArray,
+    step: int,
+    cursor: LoaderCursor | None,
+    update_latest: bool,
+) -> None:
     if path.exists():
         msg = f"refusing to overwrite existing checkpoint at {path}"
         raise FileExistsError(msg)
@@ -103,6 +143,7 @@ def save_checkpoint[M: DiffusionModel](
     eqx.tree_serialise_leaves(tmp_path / MODEL_FILENAME, model)
     eqx.tree_serialise_leaves(tmp_path / EMA_FILENAME, ema_model)
     eqx.tree_serialise_leaves(tmp_path / OPT_STATE_FILENAME, opt_state)
+    eqx.tree_serialise_leaves(tmp_path / RNG_FILENAME, key)
     meta = CheckpointMeta(step=step, cursor=cursor)
     (tmp_path / META_FILENAME).write_text(meta.model_dump_json(indent=2))
 
@@ -141,7 +182,7 @@ def load_checkpoint[M: DiffusionModel](
     *,
     model_skeleton: M,
     opt_state_builder: Callable[[M], optax.OptState],
-) -> tuple[M, M, optax.OptState, CheckpointMeta]:
+) -> tuple[M, M, optax.OptState, PRNGKeyArray, CheckpointMeta]:
     """Inverse of :func:`save_checkpoint`.
 
     ``model_skeleton`` may be either a real :class:`DiffusionModel` or
@@ -168,8 +209,13 @@ def load_checkpoint[M: DiffusionModel](
         "optax.OptState",
         eqx.tree_deserialise_leaves(path / OPT_STATE_FILENAME, opt_state_skeleton),
     )
+    key_skeleton = jax.random.PRNGKey(0)
+    key = cast(
+        "PRNGKeyArray",
+        eqx.tree_deserialise_leaves(path / RNG_FILENAME, key_skeleton),
+    )
     meta = CheckpointMeta.model_validate_json((path / META_FILENAME).read_text())
-    return model, ema_model, opt_state, meta
+    return model, ema_model, opt_state, key, meta
 
 
 def load_model[M: DiffusionModel](

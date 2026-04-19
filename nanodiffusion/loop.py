@@ -1,27 +1,40 @@
 """Shared training loop driving pretrain and SFT.
 
-Paradigm-specific differences (batch pytree shape, optional per-step
-metrics) are threaded through a :class:`PrepareBatch` callback so
-:func:`run_training_loop` owns the timing/saving logic once.
+Paradigm-specific differences (batch pytree shape and optional host-side
+extras) are threaded through a :class:`PrepareBatch` callback and the
+typed metrics returned by :data:`TrainStepFn`, so
+:func:`run_training_loop` owns the timing/saving/metric-forwarding
+logic once. The loop never imports wandb or any other metric backend;
+it calls into a :class:`~nanodiffusion.reporter.MetricReporter` which
+fans out to whatever sinks the caller configured.
 """
 
 import dataclasses
 import datetime
+import math
 import time
 from collections.abc import Callable, Iterator
 from pathlib import Path
 
 import jax
-import jax.numpy as jnp
 import optax
 import structlog
 from pydantic import BaseModel
 
 from nanodiffusion.checkpoint import save_checkpoint, write_config
 from nanodiffusion.data.cursors import LoaderCursor
-from nanodiffusion.data.loader import prefetch
+from nanodiffusion.data.loader import DevicePrefetchIterator
+from nanodiffusion.metrics import (
+    CoreHostMetrics,
+    CoreStepMetrics,
+    NoHostExtras,
+    ReportMetrics,
+    SFTHostExtras,
+)
 from nanodiffusion.model import DiffusionModel
-from nanodiffusion.types import PRNGKeyArray, Scalar
+from nanodiffusion.reporter import MetricReporter
+from nanodiffusion.train_step import TrainStepFn
+from nanodiffusion.types import PRNGKeyArray
 
 logger = structlog.get_logger(__name__)
 
@@ -68,6 +81,7 @@ class LoopHyperparams:
     prefetch_size: int
     nominal_tokens_per_step: int
     event_name: str
+    profile_steps: int = 0
 
 
 @dataclasses.dataclass
@@ -88,12 +102,46 @@ class LoopState[M: DiffusionModel, C: LoaderCursor]:
     last_saved_step: int | None = None
 
 
-type TrainStepFn[M: DiffusionModel, JB] = Callable[
-    [M, M, optax.OptState, JB, PRNGKeyArray],
-    tuple[M, M, optax.OptState, Scalar],
-]
-
 type PrepareBatch[B, JB, C: LoaderCursor] = Callable[[B], tuple[JB, C, StepStats]]
+
+
+def _collect_host_metrics(
+    step_metrics: CoreStepMetrics,
+    lr_schedule: optax.Schedule,
+    step: int,
+    tok_per_s: int,
+    supervised_tokens_in_window: int,
+    elapsed: float,
+) -> ReportMetrics:
+    """Merge device-side step metrics with host-side throughput + HBM.
+
+    Non-finite losses no longer raise. The JIT'd train step skips the
+    model update on non-finite gradients (see
+    :func:`nanodiffusion.optimizer.apply_or_skip`), so training can
+    recover from transient spikes while still surfacing a warning.
+    """
+    core = CoreHostMetrics.from_step_metrics(
+        step_metrics,
+        lr_schedule=lr_schedule,
+        step=step,
+        tok_per_s=tok_per_s,
+    )
+    if not math.isfinite(core.loss):
+        logger.warning(
+            "non_finite_loss",
+            step=step,
+            loss=core.loss,
+            grad_finite=core.grad_finite,
+        )
+    extras = (
+        SFTHostExtras.from_window(
+            supervised_tokens_in_window=supervised_tokens_in_window,
+            elapsed=elapsed,
+        )
+        if supervised_tokens_in_window > 0
+        else NoHostExtras()
+    )
+    return ReportMetrics(core=core, extras=extras)
 
 
 def run_training_loop[M: DiffusionModel, B, JB, C: LoaderCursor](
@@ -106,6 +154,7 @@ def run_training_loop[M: DiffusionModel, B, JB, C: LoaderCursor](
     base_loader: Iterator[B],
     settings: LoopHyperparams,
     prepare_batch: PrepareBatch[B, JB, C],
+    reporter: MetricReporter,
 ) -> None:
     """Drive the training loop in place.
 
@@ -116,6 +165,12 @@ def run_training_loop[M: DiffusionModel, B, JB, C: LoaderCursor](
     is excluded from the first ``tok_per_s`` report; the end-of-training
     save is skipped when a periodic save already landed on the terminal
     step.
+
+    Device placement (replicate / shard) is the caller's responsibility:
+    the ``state`` pytrees should already be placed on the target devices,
+    and ``prepare_batch`` should shard the batch before returning it.
+    This keeps the loop device-agnostic and avoids importing the
+    sharding module here.
     """
     initial_step = state.step
     last_log_step = state.step
@@ -128,6 +183,7 @@ def run_training_loop[M: DiffusionModel, B, JB, C: LoaderCursor](
             model=state.model,
             ema_model=state.ema_model,
             opt_state=state.opt_state,
+            key=state.key,
             step=state.step,
             cursor=state.cursor,
             update_latest=True,
@@ -137,16 +193,21 @@ def run_training_loop[M: DiffusionModel, B, JB, C: LoaderCursor](
         logger.info("checkpoint_saved", path=str(ckpt_dir), step=state.step)
 
     t_window_start = time.monotonic()
-    with prefetch(base_loader, size=settings.prefetch_size) as loader:
-        for raw_batch in loader:
+    with DevicePrefetchIterator(
+        base_loader,
+        prepare_batch,
+        cpu_prefetch=settings.prefetch_size,
+        device_prefetch=2,
+    ) as loader:
+        for jax_batch, cursor, stats in loader:
             if state.step >= settings.max_steps:
                 break
-            jax_batch, cursor, stats = prepare_batch(raw_batch)
             state.cursor = cursor
             supervised_tokens_in_window += stats.supervised_tokens
-            state.key, step_key = jax.random.split(state.key)
-            state.model, state.ema_model, state.opt_state, loss = train_step(
-                state.model, state.ema_model, state.opt_state, jax_batch, step_key
+            state.model, state.ema_model, state.opt_state, step_metrics, state.key = (
+                train_step(
+                    state.model, state.ema_model, state.opt_state, jax_batch, state.key
+                )
             )
             state.step += 1
 
@@ -154,6 +215,21 @@ def run_training_loop[M: DiffusionModel, B, JB, C: LoaderCursor](
                 t_window_start = time.monotonic()
                 last_log_step = state.step
                 supervised_tokens_in_window = 0
+                if settings.profile_steps > 0:
+                    profile_dir = str(run_dir / "profile")
+                    jax.profiler.start_trace(profile_dir)
+                    logger.info("profile_started", path=profile_dir)
+
+            if (
+                settings.profile_steps > 0
+                and state.step == initial_step + 1 + settings.profile_steps
+            ):
+                jax.profiler.stop_trace()
+                logger.info(
+                    "profile_stopped",
+                    path=str(run_dir / "profile"),
+                    steps=settings.profile_steps,
+                )
 
             if state.step % settings.log_every == 0 and state.step > last_log_step:
                 elapsed = time.monotonic() - t_window_start
@@ -163,19 +239,15 @@ def run_training_loop[M: DiffusionModel, B, JB, C: LoaderCursor](
                     * settings.nominal_tokens_per_step
                     / max(elapsed, 1e-9)
                 )
-                extras: dict[str, int] = {}
-                if supervised_tokens_in_window > 0:
-                    extras["supervised_tok_per_s"] = int(
-                        supervised_tokens_in_window / max(elapsed, 1e-9)
-                    )
-                logger.info(
-                    settings.event_name,
+                host_metrics = _collect_host_metrics(
+                    step_metrics,
+                    lr_schedule,
                     step=state.step,
-                    loss=float(loss),
-                    lr=jnp.asarray(lr_schedule(state.step)).item(),
                     tok_per_s=tok_per_s,
-                    **extras,
+                    supervised_tokens_in_window=supervised_tokens_in_window,
+                    elapsed=elapsed,
                 )
+                reporter.log(step=state.step, metrics=host_metrics.to_dict())
                 t_window_start = time.monotonic()
                 last_log_step = state.step
                 supervised_tokens_in_window = 0

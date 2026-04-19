@@ -36,6 +36,6 @@ def token_nll(logits: Logits, x0: Tokens) -> Float[jax.Array, " seq"]:
     this single per-token score, so the underlying arithmetic is shared
     without threading a ``reduction=`` flag through the public API.
     """
-    log_probs = jax.nn.log_softmax(logits, axis=-1)
+    log_probs = jax.nn.log_softmax(logits.astype(jnp.float32), axis=-1)
     log_p_x0 = jnp.take_along_axis(log_probs, x0[..., None], axis=-1).squeeze(-1)
     return -log_p_x0

@@ -1,6 +1,5 @@
 """MDLM pretraining loss and training loop."""
 
-from nanodiffusion.loop import TrainStepFn
 from nanodiffusion.pretrain.loss import (
     compute_loss,
     diffusion_loss,
@@ -8,6 +7,7 @@ from nanodiffusion.pretrain.loss import (
     masked_nll,
 )
 from nanodiffusion.pretrain.train import make_train_step, pretrain
+from nanodiffusion.train_step import TrainStepFn
 
 __all__ = [
     "TrainStepFn",

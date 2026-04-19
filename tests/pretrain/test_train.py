@@ -13,7 +13,7 @@ from nanodiffusion.model import Transformer
 from nanodiffusion.optimizer import ema_update, make_optimizer
 from nanodiffusion.pretrain.train import TrainStepFn, make_train_step
 from nanodiffusion.schedule import LogLinearSchedule
-from tests._helpers import inexact_leaves
+from tests._helpers import clone_state, inexact_leaves
 
 
 def test_make_optimizer_warmup_peak_and_decay() -> None:
@@ -78,7 +78,7 @@ def test_train_step_decreases_loss_on_fixed_batch(
     """
     key, model_key = jax.random.split(key)
     model = Transformer(small_config, key=model_key)
-    ema_model = model
+    ema_model = clone_state(model)
 
     train_cfg = TrainConfig(
         learning_rate=3e-3,
@@ -108,10 +108,10 @@ def test_train_step_decreases_loss_on_fixed_batch(
     losses: list[float] = []
     for _ in range(50):
         key, step_key = jax.random.split(key)
-        model, ema_model, opt_state, loss = train_step(
+        model, ema_model, opt_state, metrics, _ = train_step(
             model, ema_model, opt_state, batch, step_key
         )
-        losses.append(float(loss))
+        losses.append(float(metrics.loss))
 
     early = float(np.mean(losses[:5]))
     late = float(np.mean(losses[-5:]))
@@ -124,7 +124,7 @@ def test_train_step_updates_model_and_ema(
     """One step should move the model *and* produce an EMA distinct from it."""
     key, model_key = jax.random.split(key)
     model = Transformer(small_config, key=model_key)
-    ema_model = model
+    ema_model = clone_state(model)
 
     train_cfg = TrainConfig(
         learning_rate=1e-2,
@@ -144,8 +144,10 @@ def test_train_step_updates_model_and_ema(
 
     batch = jnp.zeros((2, small_config.max_seq_len), dtype=jnp.int32)
     key, step_key = jax.random.split(key)
-    new_model, new_ema, _new_opt_state, _loss = train_step(
-        model, ema_model, opt_state, batch, step_key
+    # Donate clones so the original ``model`` stays live for the
+    # post-step comparisons below.
+    new_model, new_ema, _new_opt_state, _metrics, _ = train_step(
+        clone_state(model), ema_model, opt_state, batch, step_key
     )
 
     assert _count_inexact_leaves_that_changed(model, new_model) > 0
@@ -173,12 +175,23 @@ def test_train_step_jits_and_is_deterministic(
     )
 
     batch = jnp.zeros((2, small_config.max_seq_len), dtype=jnp.int32)
-    step_key = jax.random.PRNGKey(123)
 
-    m1, e1, _o1, l1 = train_step(model, model, opt_state, batch, step_key)
-    m2, e2, _o2, l2 = train_step(model, model, opt_state, batch, step_key)
+    m1, e1, _o1, mx1, _ = train_step(
+        clone_state(model),
+        clone_state(model),
+        clone_state(opt_state),
+        batch,
+        jax.random.PRNGKey(123),
+    )
+    m2, e2, _o2, mx2, _ = train_step(
+        clone_state(model),
+        clone_state(model),
+        clone_state(opt_state),
+        batch,
+        jax.random.PRNGKey(123),
+    )
 
-    assert float(l1) == pytest.approx(float(l2), abs=0.0)
+    assert float(mx1.loss) == pytest.approx(float(mx2.loss), abs=0.0)
     for a, b in zip(inexact_leaves(m1), inexact_leaves(m2), strict=True):
         np.testing.assert_array_equal(a, b)
     for a, b in zip(inexact_leaves(e1), inexact_leaves(e2), strict=True):
@@ -206,11 +219,13 @@ def test_train_step_produces_finite_updates(
         key, (2, small_config.max_seq_len), 0, small_config.vocab_size - 1
     )
     key, step_key = jax.random.split(key)
-    new_model, new_ema, _new_opt_state, loss = train_step(
-        model, model, opt_state, batch, step_key
+    new_model, new_ema, _new_opt_state, metrics, _ = train_step(
+        model, clone_state(model), opt_state, batch, step_key
     )
 
-    assert jnp.isfinite(loss)
+    assert jnp.isfinite(metrics.loss)
+    assert jnp.isfinite(metrics.grad_norm)
+    assert jnp.isfinite(metrics.param_norm)
     for tree in (new_model, new_ema):
         for leaf in inexact_leaves(tree):
             assert jnp.all(jnp.isfinite(leaf))
@@ -239,8 +254,10 @@ def test_train_step_signature_accepts_optax_chain() -> None:
         ema_decay=0.9,
     )
     batch = jnp.zeros((2, cfg.max_seq_len), dtype=jnp.int32)
-    _m, _e, _o, loss = step(model, model, opt_state, batch, jax.random.PRNGKey(1))
-    assert jnp.isfinite(loss)
+    _m, _e, _o, metrics, _ = step(
+        model, clone_state(model), opt_state, batch, jax.random.PRNGKey(1)
+    )
+    assert jnp.isfinite(metrics.loss)
 
 
 def test_make_train_step_narrows_via_trainstepfn_annotation(
@@ -267,15 +284,61 @@ def test_make_train_step_narrows_via_trainstepfn_annotation(
 
     batch = jnp.zeros((2, small_config.max_seq_len), dtype=jnp.int32)
     key, step_key = jax.random.split(key)
-    new_model, new_ema, _new_opt_state, loss = train_step(
-        model, model, opt_state, batch, step_key
+    new_model, new_ema, _new_opt_state, metrics, _ = train_step(
+        model, clone_state(model), opt_state, batch, step_key
     )
 
     assert_type(new_model, Transformer)
     assert_type(new_ema, Transformer)
     assert type(new_model) is Transformer
     assert type(new_ema) is Transformer
-    assert jnp.isfinite(loss)
+    assert jnp.isfinite(metrics.loss)
+
+
+def test_train_step_returns_updated_key(
+    key: jax.Array, small_config: ModelConfig
+) -> None:
+    """train_step must return a new key different from the input."""
+    model = Transformer(small_config, key=key)
+    optimizer, _ = make_optimizer(
+        TrainConfig(warmup_steps=2, max_steps=10, ema_decay=0.9)
+    )
+    opt_state = optimizer.init(eqx.filter(model, eqx.is_inexact_array))
+    train_step = make_train_step(
+        optimizer,
+        schedule=LogLinearSchedule(),
+        mask_token_id=small_config.vocab_size - 1,
+        ema_decay=0.9,
+    )
+    batch = jnp.zeros((2, small_config.max_seq_len), dtype=jnp.int32)
+    input_key = jax.random.PRNGKey(42)
+    expected_next = jax.random.split(input_key)[0]
+    _, _, _, _, output_key = train_step(
+        model, clone_state(model), opt_state, batch, input_key
+    )
+    # Key must have advanced (split happened inside JIT)
+    assert jnp.array_equal(output_key, expected_next)
+
+
+def test_prepare_batch_uses_async_device_put(small_config: ModelConfig) -> None:
+    """_prepare_batch must return a sharded JAX array, not a numpy array."""
+    import numpy as np  # noqa: PLC0415
+
+    from nanodiffusion.data.cursors import PretrainCursor  # noqa: PLC0415
+    from nanodiffusion.data.loader import BatchOutput  # noqa: PLC0415
+    from nanodiffusion.pretrain.train import _prepare_batch  # noqa: PLC0415
+    from nanodiffusion.sharding import setup_mesh  # noqa: PLC0415
+
+    mesh = setup_mesh()
+    batch = BatchOutput(
+        tokens=np.zeros((4, small_config.max_seq_len), dtype=np.int32),
+        segments=np.zeros((4, small_config.max_seq_len), dtype=np.int32),
+        state=PretrainCursor(epoch=1, shard_idx=0, row_group_idx=0),
+    )
+    tokens, cursor, _stats = _prepare_batch(batch, mesh)
+    assert isinstance(tokens, jax.Array)
+    assert tokens.shape == (4, small_config.max_seq_len)
+    assert cursor == batch.state
 
 
 def test_train_config_rejects_non_positive_save_every() -> None:

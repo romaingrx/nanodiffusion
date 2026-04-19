@@ -87,7 +87,12 @@ def compute_loss(
 
     def _per_sample(xi: Tokens, ti: Scalar, ki: PRNGKeyArray) -> Scalar:
         return diffusion_loss(
-            model, xi, ti, schedule=schedule, mask_token_id=mask_token_id, key=ki
+            model,
+            xi,
+            ti,
+            schedule=schedule,
+            mask_token_id=mask_token_id,
+            key=ki,
         )
 
     losses = jax.vmap(_per_sample)(x0, t_batch, keys)

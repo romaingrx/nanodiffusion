@@ -1,6 +1,7 @@
 from itertools import islice
 from pathlib import Path
 
+import equinox as eqx
 import jax.numpy as jnp
 import numpy as np
 import pytest
@@ -205,8 +206,6 @@ def test_cursor_roundtrip_through_checkpoint(
 
     model_key = jax.random.PRNGKey(0)
     model = Transformer(small_config, key=model_key)
-    import equinox as eqx  # noqa: PLC0415
-
     optimizer, _ = make_optimizer(SFTConfig(warmup_steps=1, max_steps=10))
     opt_state = optimizer.init(eqx.filter(model, eqx.is_inexact_array))
 
@@ -216,10 +215,11 @@ def test_cursor_roundtrip_through_checkpoint(
         model=model,
         ema_model=model,
         opt_state=opt_state,
+        key=jax.random.PRNGKey(0),
         step=1,
         cursor=cursor,
     )
-    _m, _e, _o, meta = load_checkpoint(
+    _m, _e, _o, _k, meta = load_checkpoint(
         ckpt_dir,
         model_skeleton=model,
         opt_state_builder=lambda m: optimizer.init(eqx.filter(m, eqx.is_inexact_array)),

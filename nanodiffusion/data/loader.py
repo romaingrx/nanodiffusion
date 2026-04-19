@@ -6,7 +6,7 @@ attention masking pass can drop in without changing the loader interface.
 """
 
 from collections import deque
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 
@@ -250,3 +250,62 @@ class PrefetchIterator[T]:
 
 def prefetch[T](it: Iterator[T], size: int = 4) -> PrefetchIterator[T]:
     return PrefetchIterator(it, size)
+
+
+class DevicePrefetchIterator[B, JB]:
+    """Two-stage prefetch: CPU batches → async device_put → ready on device.
+
+    Stage 1 (:class:`PrefetchIterator`) prepares numpy batches on a
+    background thread. Stage 2 calls ``prepare_fn`` on each batch
+    (which should use ``jax.device_put`` for async H2D transfer) and
+    keeps ``size`` prepared batches in a deque. When the consumer pops
+    a batch, the transfer has already completed or is finishing, so the
+    train step never waits on H2D.
+    """
+
+    def __init__(
+        self,
+        source: Iterator[B],
+        prepare_fn: Callable[[B], JB],
+        *,
+        cpu_prefetch: int = 4,
+        device_prefetch: int = 2,
+    ) -> None:
+        self._cpu_iter: PrefetchIterator[B] | None = PrefetchIterator(
+            source, cpu_prefetch
+        )
+        self._prepare = prepare_fn
+        self._buf: deque[JB] = deque()
+        self._device_prefetch = device_prefetch
+        self._exhausted = False
+        self._fill()
+
+    def _fill(self) -> None:
+        while len(self._buf) < self._device_prefetch and not self._exhausted:
+            try:
+                raw = next(self._cpu_iter)  # type: ignore[arg-type]
+                self._buf.append(self._prepare(raw))
+            except StopIteration:
+                self._exhausted = True
+
+    def __iter__(self) -> "DevicePrefetchIterator[B, JB]":
+        return self
+
+    def __next__(self) -> JB:
+        if not self._buf:
+            raise StopIteration
+        item = self._buf.popleft()
+        self._fill()
+        return item
+
+    def close(self) -> None:
+        if self._cpu_iter is not None:
+            self._cpu_iter.close()
+            self._cpu_iter = None
+        self._buf.clear()
+
+    def __enter__(self) -> "DevicePrefetchIterator[B, JB]":
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self.close()

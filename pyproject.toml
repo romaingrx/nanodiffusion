@@ -32,6 +32,12 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["basedpyright", "ruff", "pytest", "beartype>=0.18.0", "pre-commit"]
+obs = ["wandb>=0.18.0"]
+profile = ["tensorboard>=2.18.0", "tensorboard-plugin-profile>=2.18.0", "xprof>=0.12.0", "setuptools<78"]
+# TPU backend. libtpu is Linux-only, so the platform marker keeps this
+# a no-op on macOS local dev; on a GCP TPU VM, run ``uv sync --extra
+# tpu`` to pull the libtpu-bundled jax wheel.
+tpu = ["jax[tpu]>=0.4.35; sys_platform == 'linux'"]
 
 [project.scripts]
 nanodiffusion = "nanodiffusion.cli:main"

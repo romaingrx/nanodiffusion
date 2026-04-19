@@ -19,7 +19,7 @@ from nanodiffusion.model import Transformer
 from nanodiffusion.optimizer import make_optimizer
 from nanodiffusion.schedule import LogLinearSchedule
 from nanodiffusion.sft import SFTTrainStepFn, make_sft_train_step, sft_finetune
-from tests._helpers import inexact_leaves
+from tests._helpers import clone_state, inexact_leaves
 
 
 def _make_supervised_batch(seq_len: int, batch: int = 4) -> SFTJaxBatch:
@@ -41,7 +41,7 @@ def test_sft_train_step_decreases_loss_on_fixed_batch(
     """A few aggressive-LR SFT steps on the same batch must lower the loss."""
     key, model_key = jax.random.split(key)
     model = Transformer(small_config, key=model_key)
-    ema_model = model
+    ema_model = clone_state(model)
 
     sft_cfg = SFTConfig(
         learning_rate=3e-3,
@@ -66,10 +66,10 @@ def test_sft_train_step_decreases_loss_on_fixed_batch(
     losses: list[float] = []
     for _ in range(50):
         key, step_key = jax.random.split(key)
-        model, ema_model, opt_state, loss = train_step(
+        model, ema_model, opt_state, metrics, _ = train_step(
             model, ema_model, opt_state, batch, step_key
         )
-        losses.append(float(loss))
+        losses.append(float(metrics.loss))
 
     early = float(np.mean(losses[:5]))
     late = float(np.mean(losses[-5:]))
@@ -93,12 +93,26 @@ def test_sft_train_step_is_deterministic(
     )
 
     batch = _make_supervised_batch(small_config.max_seq_len, batch=2)
-    step_key = jax.random.PRNGKey(123)
 
-    m1, e1, _o1, l1 = train_step(model, model, opt_state, batch, step_key)
-    m2, e2, _o2, l2 = train_step(model, model, opt_state, batch, step_key)
+    # Fresh PRNGKey per call — ``donate="all"`` on the JIT'd train step
+    # consumes the key buffer, so sharing one across two calls would
+    # hit "buffer has been deleted or donated".
+    m1, e1, _o1, mx1, _ = train_step(
+        clone_state(model),
+        clone_state(model),
+        clone_state(opt_state),
+        batch,
+        jax.random.PRNGKey(123),
+    )
+    m2, e2, _o2, mx2, _ = train_step(
+        clone_state(model),
+        clone_state(model),
+        clone_state(opt_state),
+        batch,
+        jax.random.PRNGKey(123),
+    )
 
-    assert float(l1) == float(l2)
+    assert float(mx1.loss) == float(mx2.loss)
     for a, b in zip(inexact_leaves(m1), inexact_leaves(m2), strict=True):
         np.testing.assert_array_equal(a, b)
     for a, b in zip(inexact_leaves(e1), inexact_leaves(e2), strict=True):
@@ -134,10 +148,12 @@ def test_sft_train_step_prompt_positions_have_zero_embedding_grad(
     batch = SFTJaxBatch(tokens=tokens, loss_mask=loss_mask)
     step_key = jax.random.PRNGKey(5)
 
-    new_model, _new_ema, _opt, loss = train_step(
-        model, model, opt_state, batch, step_key
+    # Clone the donated inputs so the original ``model`` stays live
+    # for the post-step comparisons below.
+    new_model, _new_ema, _opt, metrics, _ = train_step(
+        clone_state(model), clone_state(model), opt_state, batch, step_key
     )
-    assert float(loss) == 0.0
+    assert float(metrics.loss) == 0.0
     # With zero loss, the optimizer should have made no change to the model.
     for before, after in zip(
         inexact_leaves(model), inexact_leaves(new_model), strict=True
@@ -168,15 +184,15 @@ def test_make_sft_train_step_narrows_via_sfttrainstepfn_annotation(
 
     batch = _make_supervised_batch(small_config.max_seq_len, batch=2)
     key, step_key = jax.random.split(key)
-    new_model, new_ema, _new_opt_state, loss = train_step(
-        model, model, opt_state, batch, step_key
+    new_model, new_ema, _new_opt_state, metrics, _ = train_step(
+        model, clone_state(model), opt_state, batch, step_key
     )
 
     assert_type(new_model, Transformer)
     assert_type(new_ema, Transformer)
     assert type(new_model) is Transformer
     assert type(new_ema) is Transformer
-    assert jnp.isfinite(loss)
+    assert jnp.isfinite(metrics.loss)
 
 
 def _make_sft_conv(i: int) -> Conversation:
@@ -213,15 +229,29 @@ def tiny_chat_factory() -> str:
     return name
 
 
+def _tiny_config_full_vocab(small_config: ModelConfig) -> ModelConfig:
+    """Widen ``small_config``'s vocab to match the real GPT-2 tokenizer.
+
+    The general-purpose ``small_config`` fixture caps vocab at 256 for
+    unit tests that feed synthetic token IDs directly; the SFT
+    end-to-end tests pipe through :class:`Tokenizer` whose token IDs
+    reach 50263, so a mismatched-width embedding table would gather
+    out-of-bounds, which under the new NaN loss guard fails the run
+    loudly instead of silently training on garbage.
+    """
+    return small_config.model_copy(update={"vocab_size": 50264})
+
+
 def test_sft_finetune_end_to_end_smoke(
     small_config: ModelConfig,
     tmp_path: Path,
     tiny_chat_factory: str,
 ) -> None:
     """A fresh pretrain-shaped checkpoint → sft_finetune → run dir artifacts."""
+    sft_model_config = _tiny_config_full_vocab(small_config)
     key = jax.random.PRNGKey(0)
     model_key, _ = jax.random.split(key)
-    model = Transformer(small_config, key=model_key)
+    model = Transformer(sft_model_config, key=model_key)
     optimizer, _ = make_optimizer(SFTConfig(warmup_steps=1, max_steps=5))
     opt_state = optimizer.init(eqx.filter(model, eqx.is_inexact_array))
 
@@ -231,19 +261,20 @@ def test_sft_finetune_end_to_end_smoke(
         model=model,
         ema_model=model,
         opt_state=opt_state,
+        key=jax.random.PRNGKey(0),
         step=0,
         cursor=None,
     )
     # Drop a config.yaml alongside so _resolve_model_config reads it.
     import yaml  # noqa: PLC0415
 
-    ckpt_config = Config(model=small_config)
+    ckpt_config = Config(model=sft_model_config)
     (ckpt_dir / CONFIG_SIDECAR_FILENAME).write_text(
         yaml.dump(ckpt_config.model_dump(mode="json"))
     )
 
     sft_config = Config(
-        model=small_config,
+        model=sft_model_config,
         sft=SFTConfig(
             warmup_steps=1,
             max_steps=3,
@@ -301,9 +332,10 @@ def test_sft_finetune_resumes_from_saved_sft_checkpoint(
     """
     import yaml  # noqa: PLC0415
 
+    sft_model_config = _tiny_config_full_vocab(small_config)
     pretrain_dir = tmp_path / "pretrain_latest"
     key = jax.random.PRNGKey(0)
-    model = Transformer(small_config, key=key)
+    model = Transformer(sft_model_config, key=key)
     pretrain_optimizer, _ = make_optimizer(SFTConfig(warmup_steps=1, max_steps=5))
     pretrain_opt_state = pretrain_optimizer.init(
         eqx.filter(model, eqx.is_inexact_array)
@@ -313,11 +345,12 @@ def test_sft_finetune_resumes_from_saved_sft_checkpoint(
         model=model,
         ema_model=model,
         opt_state=pretrain_opt_state,
+        key=jax.random.PRNGKey(0),
         step=0,
         cursor=None,
     )
     (pretrain_dir / CONFIG_SIDECAR_FILENAME).write_text(
-        yaml.dump(Config(model=small_config).model_dump(mode="json"))
+        yaml.dump(Config(model=sft_model_config).model_dump(mode="json"))
     )
 
     # First run stops cleanly at step 2 (max_steps == save_every), so
@@ -325,7 +358,7 @@ def test_sft_finetune_resumes_from_saved_sft_checkpoint(
     # single step_2 checkpoint and there's no step_4/step_6 lying
     # around to collide with the resumed run's new saves.
     first_config = Config(
-        model=small_config,
+        model=sft_model_config,
         sft=SFTConfig(
             warmup_steps=1,
             max_steps=2,

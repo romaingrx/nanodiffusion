@@ -80,7 +80,9 @@ class TransformerBlock(eqx.Module):
         self.adaln = AdaLNModulation(config.hidden_dim, key=mkey)
 
     def __call__(
-        self, x: Float[Array, "seq dim"], cond: Float[Array, " dim"]
+        self,
+        x: Float[Array, "seq dim"],
+        cond: Float[Array, " dim"],
     ) -> Float[Array, "seq dim"]:
         shift_attn, scale_attn, gate_attn, shift_ffn, scale_ffn, gate_ffn = self.adaln(
             cond

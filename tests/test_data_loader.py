@@ -11,6 +11,7 @@ from jaxtyping import TypeCheckError
 from nanodiffusion.data.cursors import PretrainCursor
 from nanodiffusion.data.loader import (
     BatchOutput,
+    DevicePrefetchIterator,
     PrefetchIterator,
     prefetch,
     pretrain_loader,
@@ -294,6 +295,71 @@ def test_batch_output_validates_dtype() -> None:
             segments=np.zeros((4, 8), dtype=np.int32),
             state=state,
         )
+
+
+# --- DevicePrefetchIterator tests ---
+
+
+def test_device_prefetch_yields_all_items() -> None:
+    """All items from the source must appear in order."""
+    items = list(range(10))
+    prepared: list[int] = []
+
+    def prepare(x: int) -> int:
+        prepared.append(x)
+        return x * 10
+
+    with DevicePrefetchIterator(
+        iter(items), prepare, cpu_prefetch=3, device_prefetch=2
+    ) as it:
+        result = list(it)
+
+    assert result == [x * 10 for x in items]
+    assert prepared == items
+
+
+def test_device_prefetch_eagerly_fills_buffer() -> None:
+    """The buffer should be pre-filled on construction."""
+    call_count = 0
+
+    def prepare(x: int) -> int:
+        nonlocal call_count
+        call_count += 1
+        return x
+
+    with DevicePrefetchIterator(
+        iter(range(20)), prepare, cpu_prefetch=4, device_prefetch=2
+    ) as it:
+        # Before consuming anything, prepare should have been called
+        # at least device_prefetch times (eagerly filling the buffer)
+        assert call_count >= 2
+        _ = next(it)
+
+
+def test_device_prefetch_handles_empty_source() -> None:
+    """Empty source must not raise, just produce no items."""
+    with DevicePrefetchIterator(
+        iter([]), lambda x: x, cpu_prefetch=2, device_prefetch=2
+    ) as it:
+        assert list(it) == []
+
+
+def test_device_prefetch_handles_short_source() -> None:
+    """Source shorter than prefetch buffers must work correctly."""
+    with DevicePrefetchIterator(
+        iter([1]), lambda x: x * 2, cpu_prefetch=4, device_prefetch=3
+    ) as it:
+        assert list(it) == [2]
+
+
+def test_device_prefetch_context_manager_cleanup() -> None:
+    """After __exit__, iterating must raise StopIteration."""
+    it = DevicePrefetchIterator(
+        iter(range(5)), lambda x: x, cpu_prefetch=2, device_prefetch=2
+    )
+    _ = next(it)
+    it.close()
+    assert list(it) == []
 
 
 def test_prefetch_yields_same_sequence_as_loader(tok: Tokenizer) -> None:

@@ -10,7 +10,6 @@ model:
   hidden_dim: 192
   num_heads: 3
   max_seq_len: 512
-  dropout_rate: 0.0
   ffn_mult: 4
 
 train:

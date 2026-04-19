@@ -19,6 +19,7 @@ from nanodiffusion.constants import (
     META_FILENAME,
     MODEL_FILENAME,
     OPT_STATE_FILENAME,
+    RNG_FILENAME,
 )
 from nanodiffusion.data.datasets import DATASETS, DatasetFactory, DownloadOptions
 from nanodiffusion.data.source import InMemoryTextSource, TextSource
@@ -332,6 +333,7 @@ def test_pretrain_command_runs_end_to_end(
         MODEL_FILENAME,
         EMA_FILENAME,
         OPT_STATE_FILENAME,
+        RNG_FILENAME,
         META_FILENAME,
         CONFIG_SIDECAR_FILENAME,
     ):

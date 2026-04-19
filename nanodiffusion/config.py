@@ -1,7 +1,8 @@
 import math
 from pathlib import Path
-from typing import Protocol, runtime_checkable
+from typing import Literal, Protocol, runtime_checkable
 
+import jax.numpy as jnp
 import yaml
 from pydantic import BaseModel, Field, model_validator
 
@@ -33,8 +34,17 @@ class ModelConfig(BaseModel):
     hidden_dim: int = 768
     num_heads: int = 12
     max_seq_len: int = 1024
-    dropout_rate: float = 0.0
     ffn_mult: int = 4
+    compute_dtype: Literal["float32", "bfloat16"] = "float32"
+    remat_policy: Literal["none", "nothing", "dots_no_batch", "dots", "everything"] = (
+        "none"
+    )
+
+    @property
+    def jnp_dtype(self) -> type:
+        """Resolve :attr:`compute_dtype` to the JAX scalar type used at
+        trace time (``jnp.float32`` or ``jnp.bfloat16``)."""
+        return jnp.float32 if self.compute_dtype == "float32" else jnp.bfloat16
 
     @property
     def head_dim(self) -> int:
@@ -43,6 +53,16 @@ class ModelConfig(BaseModel):
     @property
     def ffn_dim(self) -> int:
         return _round_to_multiple(int(2 / 3 * self.ffn_mult * self.hidden_dim), 256)
+
+    @model_validator(mode="after")
+    def _check_attention_shape(self) -> "ModelConfig":
+        if self.hidden_dim % self.num_heads != 0:
+            msg = (
+                f"hidden_dim ({self.hidden_dim}) must be divisible by "
+                f"num_heads ({self.num_heads})"
+            )
+            raise ValueError(msg)
+        return self
 
 
 class TrainConfig(BaseModel):

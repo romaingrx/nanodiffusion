@@ -1,12 +1,15 @@
 """SFT driver: JIT train step, state loader, ``sft_finetune`` entry."""
 
 import dataclasses
+from functools import partial
 from pathlib import Path
 
 import equinox as eqx
 import jax
+import jax.numpy as jnp
 import optax
 import structlog
+from jax.sharding import Mesh
 
 from nanodiffusion.checkpoint import (
     load_checkpoint,
@@ -23,15 +26,19 @@ from nanodiffusion.loop import (
     LoopHyperparams,
     LoopState,
     StepStats,
-    TrainStepFn,
     resolve_run_dir,
     run_training_loop,
 )
 from nanodiffusion.model import DiffusionModel, Transformer, transformer_skeleton
-from nanodiffusion.optimizer import ema_update, make_optimizer
+from nanodiffusion.optimizer import make_optimizer, scale_ema_decay
+from nanodiffusion.reporter import Reporter, default_sinks
+from nanodiffusion.runtime import configure_jax_runtime, place_training_state
 from nanodiffusion.schedule import LogLinearSchedule, NoiseSchedule
 from nanodiffusion.sft.loss import compute_sft_loss
+from nanodiffusion.sharding import setup_mesh, shard_batch
 from nanodiffusion.tokenizer import Tokenizer
+from nanodiffusion.train_step import TrainStepFn
+from nanodiffusion.train_step import make_train_step as make_shared_train_step
 from nanodiffusion.types import PRNGKeyArray, Scalar
 
 logger = structlog.get_logger(__name__)
@@ -47,53 +54,33 @@ def make_sft_train_step[M: DiffusionModel](
     mask_token_id: int,
     ema_decay: float,
 ) -> SFTTrainStepFn[M]:
-    """Build an ``eqx.filter_jit`` train step for SFT.
+    """Build an SFT train step by binding the SFT loss adapter."""
 
-    Unpacks the :class:`SFTJaxBatch` tokens + loss_mask pair that
-    :func:`compute_sft_loss` expects. Closures pin ``optimizer``,
-    ``schedule``, ``mask_token_id``, and ``ema_decay`` at trace time
-    so the JIT cache key stays stable.
-    """
-
-    @eqx.filter_jit
-    def train_step(
-        model: M,
-        ema_model: M,
-        opt_state: optax.OptState,
-        batch: SFTJaxBatch,
-        key: PRNGKeyArray,
-    ) -> tuple[M, M, optax.OptState, Scalar]:
-        def loss_fn(m: M) -> Scalar:
-            return compute_sft_loss(
-                m,
-                batch.tokens,
-                batch.loss_mask,
-                schedule=schedule,
-                mask_token_id=mask_token_id,
-                key=key,
-            )
-
-        loss, grads = eqx.filter_value_and_grad(loss_fn)(model)
-        updates, new_opt_state = optimizer.update(
-            grads, opt_state, eqx.filter(model, eqx.is_inexact_array)
+    def loss_fn(m: M, batch: SFTJaxBatch, key: PRNGKeyArray) -> Scalar:
+        return compute_sft_loss(
+            m,
+            batch.tokens,
+            batch.loss_mask,
+            schedule=schedule,
+            mask_token_id=mask_token_id,
+            key=key,
         )
-        new_model = eqx.apply_updates(model, updates)
-        new_ema_model = ema_update(ema_model, new_model, ema_decay)
-        return new_model, new_ema_model, new_opt_state, loss
 
-    return train_step
+    return make_shared_train_step(
+        optimizer,
+        loss_fn=loss_fn,
+        ema_decay=ema_decay,
+    )
 
 
 def _prepare_sft_batch(
     batch: SFTBatchOutput,
+    mesh: Mesh,
 ) -> tuple[SFTJaxBatch, SFTCursor, StepStats]:
-    """Host → JAX conversion for SFT batches.
-
-    ``supervised_tokens`` is counted on the numpy side *before*
-    :meth:`SFTBatchOutput.to_jax` to avoid a JAX→host sync each step.
-    """
+    """Host → JAX conversion + device sharding for SFT batches."""
     supervised = int(batch.loss_mask.sum())
-    return batch.to_jax(), batch.state, StepStats(supervised_tokens=supervised)
+    jax_batch = shard_batch(batch.to_jax(), mesh)
+    return jax_batch, batch.state, StepStats(supervised_tokens=supervised)
 
 
 def _build_task_mixture(config: Config) -> TaskMixture:
@@ -113,11 +100,17 @@ def _build_task_mixture(config: Config) -> TaskMixture:
 
 @dataclasses.dataclass(frozen=True, slots=True)
 class _SFTInitialState:
-    """Everything :func:`sft_finetune`'s loop needs at step 0."""
+    """Everything :func:`sft_finetune`'s loop needs at step 0.
+
+    ``key`` is the loop's RNG: fresh SFT runs (from a pretrain weight
+    snapshot) seed it from ``config.sft.seed``; resumed runs restore it
+    from the checkpoint so the masking chain continues unbroken.
+    """
 
     model: Transformer
     ema_model: Transformer
     opt_state: optax.OptState
+    key: PRNGKeyArray
     step: int
     cursor: SFTCursor | None
 
@@ -164,10 +157,15 @@ def _load_fresh_sft_state(
     skeleton = transformer_skeleton(model_config)
     model = load_model(checkpoint, model_skeleton=skeleton, which="model")
     opt_state = optimizer.init(eqx.filter(model, eqx.is_inexact_array))
+    # Deep-copy so the EMA starts as an independent replica; see
+    # :func:`nanodiffusion.pretrain.train._load_fresh_pretrain_state`
+    # for the ``donate="all"`` aliasing constraint.
+    ema_model = jax.tree.map(lambda x: jnp.copy(x) if eqx.is_array(x) else x, model)
     return _SFTInitialState(
         model=model,
-        ema_model=model,
+        ema_model=ema_model,
         opt_state=opt_state,
+        key=jax.random.PRNGKey(config.sft.seed),
         step=0,
         cursor=None,
     )
@@ -188,7 +186,7 @@ def _load_resumed_sft_state(
     def build_opt_state(m: Transformer) -> optax.OptState:
         return optimizer.init(eqx.filter(m, eqx.is_inexact_array))
 
-    model, ema_model, opt_state, meta = load_checkpoint(
+    model, ema_model, opt_state, key, meta = load_checkpoint(
         checkpoint,
         model_skeleton=skeleton,
         opt_state_builder=build_opt_state,
@@ -199,6 +197,7 @@ def _load_resumed_sft_state(
         model=model,
         ema_model=ema_model,
         opt_state=opt_state,
+        key=key,
         step=meta.step,
         cursor=cursor,
     )
@@ -209,6 +208,9 @@ def sft_finetune(
     *,
     pretrain_checkpoint: Path | None = None,
     resume_from: Path | None = None,
+    wandb_project: str | None = None,
+    wandb_entity: str | None = None,
+    profile_steps: int = 0,
 ) -> Path:
     """Run an SFT fine-tuning job end-to-end.
 
@@ -233,6 +235,7 @@ def sft_finetune(
 
     tok = Tokenizer(encode_threads=config.sft.tokenizer_threads)
     run_dir = resolve_run_dir(config.sft.run_dir, resume_from=resume_from)
+    configure_jax_runtime(run_dir)
     write_config(run_dir, config)
     logger.info(
         "sft_start",
@@ -245,11 +248,13 @@ def sft_finetune(
         resumed=resume_from is not None,
     )
 
+    mesh = setup_mesh()
+    ema_decay = scale_ema_decay(config.sft.ema_decay, jax.device_count())
     train_step = make_sft_train_step(
         optimizer,
         schedule=LogLinearSchedule(),
         mask_token_id=tok.mask_token_id,
-        ema_decay=config.sft.ema_decay,
+        ema_decay=ema_decay,
     )
 
     source = _build_task_mixture(config)
@@ -263,11 +268,18 @@ def sft_finetune(
         max_empty_passes=config.sft.max_empty_passes,
     )
 
+    placed_model, placed_ema_model, placed_opt_state, placed_key = place_training_state(
+        start.model,
+        start.ema_model,
+        start.opt_state,
+        start.key,
+        mesh,
+    )
     state: LoopState[Transformer, SFTCursor] = LoopState(
-        model=start.model,
-        ema_model=start.ema_model,
-        opt_state=start.opt_state,
-        key=jax.random.PRNGKey(config.sft.seed),
+        model=placed_model,
+        ema_model=placed_ema_model,
+        opt_state=placed_opt_state,
+        key=placed_key,
         step=start.step,
         cursor=start.cursor,
     )
@@ -278,17 +290,27 @@ def sft_finetune(
         prefetch_size=config.sft.prefetch_size,
         nominal_tokens_per_step=config.sft.batch_size * config.model.max_seq_len,
         event_name="sft_train",
+        profile_steps=profile_steps,
     )
-    run_training_loop(
-        state,
-        config=config,
+    sink_factories = default_sinks(
+        event_name="sft_train",
         run_dir=run_dir,
-        train_step=train_step,
-        lr_schedule=lr_schedule,
-        base_loader=base_loader,
-        settings=settings,
-        prepare_batch=_prepare_sft_batch,
+        wandb_project=wandb_project,
+        wandb_entity=wandb_entity,
+        wandb_config=config.model_dump(mode="json"),
     )
+    with Reporter(sink_factories) as reporter:
+        run_training_loop(
+            state,
+            config=config,
+            run_dir=run_dir,
+            train_step=train_step,
+            lr_schedule=lr_schedule,
+            base_loader=base_loader,
+            settings=settings,
+            prepare_batch=partial(_prepare_sft_batch, mesh=mesh),
+            reporter=reporter,
+        )
 
     logger.info("sft_done", step=state.step, run_dir=str(run_dir))
     return run_dir
