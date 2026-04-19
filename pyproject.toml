@@ -105,4 +105,11 @@ markers = ["slow: marks tests that take a long time"]
 [dependency-groups]
 dev = [
     "pyarrow-stubs>=20.0.0.20251215",
+    "httpx",
+    { include-group = "server" },
+]
+server = [
+    "fastapi>=0.110.0",
+    "uvicorn[standard]>=0.27.0",
+    "websockets>=12.0",
 ]
