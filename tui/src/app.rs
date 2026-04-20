@@ -10,6 +10,7 @@ use ratatui::{
 use tokio::time::interval;
 
 use crate::{
+    effects::Reveal,
     render,
     session::{Session, SessionUpdate},
     state::ChatState,
@@ -23,6 +24,7 @@ pub struct App {
     base_url: String,
     chat: ChatState,
     session: Option<Session>,
+    reveal: Reveal,
     status: String,
     should_quit: bool,
 }
@@ -33,6 +35,7 @@ impl App {
             base_url,
             chat: ChatState::default(),
             session: None,
+            reveal: Reveal::new(),
             status: "ready — type, enter to send, esc to cancel, ctrl-c to quit".into(),
             should_quit: false,
         }
@@ -50,6 +53,7 @@ impl App {
             }
         }
         self.session = None;
+        self.reveal.reset();
         Ok(())
     }
 
@@ -77,20 +81,27 @@ impl App {
     fn send(&mut self) {
         let req = self.chat.commit_user_turn();
         self.session = Some(Session::spawn(self.base_url.clone(), req));
+        self.reveal.reset();
         self.status = "streaming…".into();
     }
 
     fn cancel(&mut self) {
         self.session = None;
+        self.reveal.reset();
         self.status = "cancelled".into();
     }
 
     fn on_session_update(&mut self, update: Option<SessionUpdate>) {
         match update {
-            Some(SessionUpdate::Frame) => {}
+            Some(SessionUpdate::Frame) => {
+                if let Some(frame) = self.session.as_ref().and_then(Session::latest) {
+                    self.reveal.observe(frame);
+                }
+            }
             Some(SessionUpdate::Done) | None => self.finalize(),
             Some(SessionUpdate::Error(e)) => {
                 self.session = None;
+                self.reveal.reset();
                 self.status = format!("error: {e}");
             }
         }
@@ -103,10 +114,11 @@ impl App {
             let body = render::extract_assistant(&frame.text).to_string();
             self.chat.push_assistant(body);
         }
+        self.reveal.reset();
         self.status = "ready".into();
     }
 
-    fn draw(&self, f: &mut Frame<'_>) {
+    fn draw(&mut self, f: &mut Frame<'_>) {
         let [chat_area, input_area, status_area] = Layout::vertical([
             Constraint::Min(3),
             Constraint::Length(3),
@@ -135,6 +147,8 @@ impl App {
             },
             status_area,
         );
+
+        self.reveal.apply(f.buffer_mut(), chat_area);
     }
 }
 

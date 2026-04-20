@@ -1,5 +1,6 @@
 mod app;
 mod client;
+mod effects;
 mod protocol;
 mod render;
 mod session;
