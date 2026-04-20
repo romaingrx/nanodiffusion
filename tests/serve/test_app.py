@@ -1,4 +1,6 @@
-"""FastAPI integration tests via TestClient (HTTP + WebSocket)."""
+"""FastAPI integration tests via TestClient (HTTP + SSE)."""
+
+import json
 
 from fastapi.testclient import TestClient
 
@@ -12,6 +14,14 @@ def _payload(**overrides: object) -> dict[str, object]:
     }
     payload.update(overrides)
     return payload
+
+
+def _parse_sse(body: str) -> list[dict[str, object]]:
+    return [
+        json.loads(line[len("data: ") :])
+        for line in body.splitlines()
+        if line.startswith("data: ")
+    ]
 
 
 def test_health_returns_expected_shape(client: TestClient) -> None:
@@ -47,17 +57,15 @@ def test_chat_rejects_bad_alternation(client: TestClient) -> None:
 
 
 def test_stream_yields_expected_frames(client: TestClient) -> None:
-    with client.websocket_connect("/api/chat/stream") as ws:
-        ws.send_json(_payload(steps=4))
-        frames = [ws.receive_json() for _ in range(5)]
+    res = client.post("/api/chat/stream", json=_payload(steps=4))
+    assert res.status_code == 200
+    assert res.headers["content-type"].startswith("text/event-stream")
+    frames = _parse_sse(res.text)
     assert [f["step"] for f in frames] == [0, 1, 2, 3, 4]
     assert all(f["total"] == 4 for f in frames)
     assert frames[-1]["mask_positions"] == []
 
 
-def test_stream_closes_on_invalid_request(client: TestClient) -> None:
-    with client.websocket_connect("/api/chat/stream") as ws:
-        ws.send_json(_payload(max_length=10_000))
-        data = ws.receive()
-    assert data["type"] == "websocket.close"
-    assert data["code"] == 1008
+def test_stream_rejects_invalid_request(client: TestClient) -> None:
+    res = client.post("/api/chat/stream", json=_payload(max_length=10_000))
+    assert res.status_code == 422

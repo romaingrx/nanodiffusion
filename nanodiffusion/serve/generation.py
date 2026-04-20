@@ -123,12 +123,27 @@ def generate_blocking(runtime: Runtime, req: ChatRequest) -> ChatResponse:
 
 
 def generate_stream(runtime: Runtime, req: ChatRequest) -> Iterator[StreamFrame]:
+    """Validate eagerly, then return a lazy iterator of :class:`StreamFrame`.
+
+    Validation errors raise synchronously from this call so the HTTP
+    handler can return 422 before committing to a streaming response.
+    The actual denoising work is deferred to the returned iterator.
+    """
     resolved = _resolve(req, runtime.defaults)
     messages = _to_message_list(req)
     prompt_ids = _prepare_prompt(runtime.tok, messages, resolved, runtime.max_seq_len)
     prompt_tokens = jnp.array(prompt_ids)
-    mask_id = runtime.tok.mask_token_id
+    key = _make_key(req.seed)
+    return _stream_frames(runtime, resolved, prompt_tokens, key)
 
+
+def _stream_frames(
+    runtime: Runtime,
+    resolved: _Resolved,
+    prompt_tokens: Tokens,
+    key: PRNGKeyArray,
+) -> Iterator[StreamFrame]:
+    mask_id = runtime.tok.mask_token_id
     for step in sampler.sample(
         runtime.model,
         prompt_tokens,
@@ -139,7 +154,7 @@ def generate_stream(runtime: Runtime, req: ChatRequest) -> Iterator[StreamFrame]
         temperature=resolved.temperature,
         top_k=resolved.top_k,
         top_p=resolved.top_p,
-        key=_make_key(req.seed),
+        key=key,
     ):
         token_list = step.tokens.tolist()
         yield StreamFrame(

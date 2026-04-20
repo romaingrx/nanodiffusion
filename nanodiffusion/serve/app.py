@@ -3,7 +3,7 @@
 No business logic here. Routes pull the pre-loaded runtime from
 ``app.state`` and delegate to :mod:`nanodiffusion.serve.generation`,
 wrapping blocking calls in ``asyncio.to_thread`` so the event loop
-stays free for WebSocket heartbeats during XLA-bound per-step work.
+stays free during XLA-bound per-step work.
 """
 
 import asyncio
@@ -13,8 +13,8 @@ from pathlib import Path
 from typing import Annotated
 
 import structlog
-from fastapi import Depends, FastAPI, HTTPException, Request, WebSocket
-from fastapi.websockets import WebSocketDisconnect
+from fastapi import Depends, FastAPI, HTTPException, Request
+from sse_starlette.sse import EventSourceResponse
 
 from nanodiffusion.serve.generation import generate_blocking, generate_stream
 from nanodiffusion.serve.protocol import (
@@ -33,18 +33,19 @@ from nanodiffusion.serve.runtime import (
 log = structlog.get_logger(__name__)
 
 
-async def _as_async(gen: Iterator[StreamFrame]) -> AsyncIterator[StreamFrame]:
+async def _iter_frames(frames: Iterator[StreamFrame]) -> AsyncIterator[StreamFrame]:
     """Advance a sync generator through ``asyncio.to_thread`` per step.
 
-    Each ``next(gen)`` blocks on an XLA compute; offloading keeps the
-    event loop free for WebSocket heartbeats and cancellation. StopIteration
-    is coerced to ``None`` because async generators cannot let it bubble
-    (CPython turns it into :class:`RuntimeError`).
+    Each ``next(frames)`` blocks on an XLA compute; offloading keeps
+    the event loop free so the ASGI server can detect client
+    disconnects and propagate cancellation. StopIteration is coerced
+    to ``None`` because async generators cannot let it bubble (CPython
+    turns it into :class:`RuntimeError`).
     """
 
     def _next_or_none() -> StreamFrame | None:
         try:
-            return next(gen)
+            return next(frames)
         except StopIteration:
             return None
 
@@ -53,6 +54,15 @@ async def _as_async(gen: Iterator[StreamFrame]) -> AsyncIterator[StreamFrame]:
         if value is None:
             return
         yield value
+
+
+async def _sse_events(
+    frames: Iterator[StreamFrame], request: Request
+) -> AsyncIterator[dict[str, str]]:
+    async for frame in _iter_frames(frames):
+        if await request.is_disconnected():
+            return
+        yield {"data": frame.model_dump_json(), "id": str(frame.step)}
 
 
 def create_app(
@@ -99,21 +109,16 @@ def create_app(
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
 
-    @app.websocket("/api/chat/stream")
-    async def chat_stream(ws: WebSocket) -> None:  # pyright: ignore[reportUnusedFunction]
-        await ws.accept()
-        rt: Runtime = ws.app.state.runtime
+    @app.post("/api/chat/stream")
+    async def chat_stream(  # pyright: ignore[reportUnusedFunction]
+        req: ChatRequest,
+        request: Request,
+        rt: Annotated[Runtime, Depends(_runtime)],
+    ) -> EventSourceResponse:
         try:
-            payload = await ws.receive_json()
-            req = ChatRequest.model_validate(payload)
-            gen = generate_stream(rt, req)
-            async for frame in _as_async(gen):
-                await ws.send_json(frame.model_dump())
+            frames = generate_stream(rt, req)
         except ValueError as exc:
-            await ws.close(code=1008, reason=str(exc)[:120])
-            return
-        except WebSocketDisconnect:
-            return
-        await ws.close()
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return EventSourceResponse(_sse_events(frames, request))
 
     return app

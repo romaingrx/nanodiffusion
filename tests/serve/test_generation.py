@@ -67,3 +67,11 @@ def test_bad_alternation_rejected(serve_runtime: Runtime) -> None:
     )
     with pytest.raises(ValueError, match="alternate"):
         generate_blocking(serve_runtime, req)
+
+
+def test_stream_validates_eagerly(serve_runtime: Runtime) -> None:
+    """Invalid requests must raise from the call itself, not from
+    iterating the returned generator — the SSE handler maps that to 422
+    before committing to a stream."""
+    with pytest.raises(ValueError, match="exceeds model"):
+        generate_stream(serve_runtime, _request(max_length=10_000))
