@@ -1,6 +1,7 @@
 mod app;
 mod client;
 mod protocol;
+mod render;
 mod terminal;
 
 use anyhow::Result;

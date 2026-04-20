@@ -15,6 +15,7 @@ use tokio::{sync::mpsc, task::JoinHandle, time::interval};
 use crate::{
     client::{ClientEvent, stream_chat},
     protocol::{ChatRequest, Message, Role, StreamFrame},
+    render,
     terminal::Tui,
 };
 
@@ -162,9 +163,8 @@ impl App {
         if let Some(s) = self.stream.as_ref() {
             lines.push(role_label(Role::Assistant));
             if let Some(frame) = s.latest.as_ref() {
-                for line in frame.text.lines() {
-                    lines.push(Line::from(line.to_string()));
-                }
+                let body = render::extract_assistant(&frame.text);
+                lines.extend(render::render_body(body));
             } else {
                 lines.push(Line::from(Span::styled("…", Style::default().fg(Color::DarkGray))));
             }
