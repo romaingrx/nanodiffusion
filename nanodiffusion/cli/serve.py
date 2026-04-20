@@ -33,13 +33,13 @@ def serve_command(
     steps: int | None,
     temperature: float | None,
 ) -> None:
-    """Serve a trained checkpoint over HTTP/WebSocket.
+    """Serve a trained checkpoint over HTTP + SSE.
 
     Single-tenant by design: one JAX model per process, no concurrency.
     """
-    import uvicorn  # noqa: PLC0415
+    import uvicorn
 
-    from nanodiffusion.serve import SampleDefaultsOverride, create_app  # noqa: PLC0415
+    from nanodiffusion.serve import SampleDefaultsOverride, create_app
 
     app = create_app(
         checkpoint=checkpoint,
@@ -61,7 +61,7 @@ def schema_command(*, output: Path) -> None:
     Commit the regenerated file whenever ``nanodiffusion/serve/protocol.py``
     changes. The Rust TUI consumes this via ``typify::import_types!``.
     """
-    from nanodiffusion.serve.protocol import dump_schema  # noqa: PLC0415
+    from nanodiffusion.serve.protocol import dump_schema
 
     dump_schema(output)
     click.echo(f"Wrote schema to {output}")

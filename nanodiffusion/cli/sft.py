@@ -77,8 +77,8 @@ def sft_command(
     profile_steps: int,
 ) -> None:
     """Run SFT from a pretrain checkpoint or resume an interrupted run."""
-    from nanodiffusion.config import Config  # noqa: PLC0415
-    from nanodiffusion.sft import sft_finetune  # noqa: PLC0415
+    from nanodiffusion.config import Config
+    from nanodiffusion.sft import sft_finetune
 
     if (pretrain_checkpoint is None) == (resume_from is None):
         msg = "pass exactly one of --pretrain-checkpoint or --resume-from"

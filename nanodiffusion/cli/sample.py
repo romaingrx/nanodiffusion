@@ -31,17 +31,17 @@ def sample_command(
     seed: int,
 ) -> None:
     """Generate text via iterative unmasking."""
-    import jax  # noqa: PLC0415
-    import jax.numpy as jnp  # noqa: PLC0415
+    import jax
+    import jax.numpy as jnp
 
-    from nanodiffusion import sampler  # noqa: PLC0415
-    from nanodiffusion.chat import render_for_completion  # noqa: PLC0415
-    from nanodiffusion.checkpoint import load_model  # noqa: PLC0415
-    from nanodiffusion.config import Config  # noqa: PLC0415
-    from nanodiffusion.constants import CONFIG_SIDECAR_FILENAME  # noqa: PLC0415
-    from nanodiffusion.model import Transformer  # noqa: PLC0415
-    from nanodiffusion.schedule import LogLinearSchedule  # noqa: PLC0415
-    from nanodiffusion.tokenizer import Tokenizer  # noqa: PLC0415
+    from nanodiffusion import sampler
+    from nanodiffusion.chat import render_for_completion
+    from nanodiffusion.checkpoint import load_model
+    from nanodiffusion.config import Config
+    from nanodiffusion.constants import CONFIG_SIDECAR_FILENAME
+    from nanodiffusion.model import Transformer
+    from nanodiffusion.schedule import LogLinearSchedule
+    from nanodiffusion.tokenizer import Tokenizer
 
     log = structlog.get_logger()
 

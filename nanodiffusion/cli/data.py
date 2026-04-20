@@ -22,7 +22,7 @@ def _echo_registry(registry: Mapping[str, Callable[..., object]]) -> None:
 @data_group.command(name="list")
 def list_datasets() -> None:
     """List registered pretraining datasets with one-line descriptions."""
-    from nanodiffusion.data.datasets import DATASETS  # noqa: PLC0415
+    from nanodiffusion.data.datasets import DATASETS
 
     _echo_registry(DATASETS)
 
@@ -30,7 +30,7 @@ def list_datasets() -> None:
 @data_group.command(name="list-chat")
 def list_chat_datasets() -> None:
     """List registered chat (SFT) datasets with one-line descriptions."""
-    from nanodiffusion.data.chat_datasets import CHAT_DATASETS  # noqa: PLC0415
+    from nanodiffusion.data.chat_datasets import CHAT_DATASETS
 
     _echo_registry(CHAT_DATASETS)
 
@@ -85,7 +85,7 @@ def download(
     num_workers: int,
 ) -> None:
     """Download parquet shards for a registered dataset."""
-    from nanodiffusion.data.datasets import (  # noqa: PLC0415
+    from nanodiffusion.data.datasets import (
         DownloadOptions,
         get_dataset,
     )
@@ -145,8 +145,8 @@ def download_chat(
     :mod:`nanodiffusion.data.datasets`. ``--retries`` and ``--timeout``
     therefore only affect the identity path.
     """
-    from nanodiffusion.data.chat_datasets import get_chat_dataset  # noqa: PLC0415
-    from nanodiffusion.data.datasets import DownloadOptions  # noqa: PLC0415
+    from nanodiffusion.data.chat_datasets import get_chat_dataset
+    from nanodiffusion.data.datasets import DownloadOptions
 
     try:
         factory = get_chat_dataset(dataset)
