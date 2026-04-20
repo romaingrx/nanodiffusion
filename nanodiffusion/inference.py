@@ -1,12 +1,12 @@
 """Load a checkpoint into a frozen, inference-ready :class:`Runtime`.
 
-Shared by the CLI ``serve`` command and its tests; any future non-CLI
-consumer (notebook, benchmark script) can reuse this without touching
-FastAPI. Intentionally does not depend on ``nanodiffusion.serve.app`` so
-generation tests can exercise the full model path without FastAPI.
+Shared by the ``sample`` and ``serve`` CLI commands plus their tests.
+Sits at the top level so it never has to depend on FastAPI or other
+serve-only modules.
 """
 
 import dataclasses
+from collections.abc import Iterable
 from pathlib import Path
 
 import equinox as eqx
@@ -19,12 +19,11 @@ from nanodiffusion.config import Config, SampleConfig
 from nanodiffusion.constants import CONFIG_SIDECAR_FILENAME, META_FILENAME
 from nanodiffusion.model import Transformer, transformer_skeleton
 from nanodiffusion.schedule import LogLinearSchedule, NoiseSchedule
-from nanodiffusion.serve.protocol import SampleDefaults
 from nanodiffusion.tokenizer import Tokenizer
 
 
 @dataclasses.dataclass(frozen=True)
-class SampleDefaultsOverride:
+class SampleConfigOverride:
     """Optional per-field overrides layered on top of ``config.sample``."""
 
     steps: int | None = None
@@ -39,35 +38,19 @@ class Runtime:
     model: Transformer
     tok: Tokenizer
     schedule: NoiseSchedule
-    defaults: SampleDefaults
+    defaults: SampleConfig
     train_step: int
     max_seq_len: int
     checkpoint_path: Path
 
 
-def _resolve_defaults(
-    base: SampleConfig, overrides: SampleDefaultsOverride
-) -> SampleDefaults:
-    return SampleDefaults(
-        steps=overrides.steps if overrides.steps is not None else base.steps,
-        temperature=overrides.temperature
-        if overrides.temperature is not None
-        else base.temperature,
-        top_k=overrides.top_k if overrides.top_k is not None else base.top_k,
-        top_p=overrides.top_p if overrides.top_p is not None else base.top_p,
-        max_length=overrides.max_length
-        if overrides.max_length is not None
-        else base.max_length,
-    )
-
-
 def load_runtime(
     checkpoint: Path,
     *,
-    overrides: SampleDefaultsOverride | None = None,
+    overrides: SampleConfigOverride | None = None,
 ) -> Runtime:
     """Read config + EMA weights + meta from ``checkpoint`` into a :class:`Runtime`."""
-    overrides = overrides if overrides is not None else SampleDefaultsOverride()
+    overrides = overrides if overrides is not None else SampleConfigOverride()
     sidecar = checkpoint / CONFIG_SIDECAR_FILENAME
     if not sidecar.exists():
         msg = f"checkpoint missing {CONFIG_SIDECAR_FILENAME}: {checkpoint}"
@@ -82,7 +65,13 @@ def load_runtime(
     model = eqx.nn.inference_mode(model, value=True)
 
     meta = CheckpointMeta.model_validate_json((checkpoint / META_FILENAME).read_text())
-    defaults = _resolve_defaults(config.sample, overrides)
+    defaults = config.sample.model_copy(
+        update={
+            f: ov
+            for f in SampleConfig.model_fields
+            if (ov := getattr(overrides, f)) is not None
+        }
+    )
 
     return Runtime(
         model=model,
@@ -95,24 +84,29 @@ def load_runtime(
     )
 
 
-def warmup(runtime: Runtime) -> None:
-    """Drive the full sampling pipeline once so the JIT cache is hot.
+def warmup(runtime: Runtime, *, max_lengths: Iterable[int] | None = None) -> None:
+    """Drive the sampling pipeline once per ``max_length`` to warm the JIT cache.
 
-    Uses ``steps=1`` through the real ``sample_tokens`` entry point so
-    every JIT-compiled region (including the sampler's module-scope
-    ``_forward``) is cached against the serving shape. First real
-    request at the same ``max_length`` skips the 5-15s compile;
-    requests with a different ``max_length`` still trigger a fresh
-    compile.
+    ``_forward`` is JIT-keyed on ``(seq_len, dtype)``, so one trace per
+    distinct ``max_length`` covers every request at that length.
+    Defaults to warming both the configured default and the model's
+    full ``max_seq_len`` so the two most common request shapes skip
+    the 5-15s compile.
     """
-    prompt = jnp.zeros(1, dtype=jnp.int32)
-    tokens = sampler.sample_tokens(
-        runtime.model,
-        prompt,
-        schedule=runtime.schedule,
-        mask_token_id=runtime.tok.mask_token_id,
-        max_length=runtime.defaults.max_length,
-        steps=1,
-        key=jax.random.PRNGKey(0),
+    lengths = (
+        list(max_lengths)
+        if max_lengths is not None
+        else [runtime.defaults.max_length, runtime.max_seq_len]
     )
-    tokens.block_until_ready()
+    prompt = jnp.zeros(1, dtype=jnp.int32)
+    for length in dict.fromkeys(lengths):  # dedupe, preserve order
+        tokens = sampler.sample_tokens(
+            runtime.model,
+            prompt,
+            schedule=runtime.schedule,
+            mask_token_id=runtime.tok.mask_token_id,
+            max_length=length,
+            steps=1,
+            key=jax.random.PRNGKey(0),
+        )
+        tokens.block_until_ready()

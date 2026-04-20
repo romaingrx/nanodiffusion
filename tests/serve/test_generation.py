@@ -2,14 +2,15 @@
 
 import pytest
 
-from nanodiffusion.serve.generation import generate_blocking, generate_stream
-from nanodiffusion.serve.protocol import ChatRequest, Message
-from nanodiffusion.serve.runtime import Runtime
+from nanodiffusion.config import SampleConfig
+from nanodiffusion.inference import Runtime
+from nanodiffusion.serve.generation import _resolve, generate_blocking, generate_stream
+from nanodiffusion.serve.protocol import ChatRequest
 
 
 def _request(steps: int = 4, max_length: int = 32, **overrides: object) -> ChatRequest:
     payload: dict[str, object] = {
-        "messages": [Message(role="user", content="hi")],
+        "messages": [{"role": "user", "content": "hi"}],
         "steps": steps,
         "max_length": max_length,
         "seed": 0,
@@ -60,7 +61,7 @@ def test_empty_messages_rejected(serve_runtime: Runtime) -> None:
 
 def test_bad_alternation_rejected(serve_runtime: Runtime) -> None:
     req = ChatRequest(
-        messages=[Message(role="assistant", content="hi")],
+        messages=[{"role": "assistant", "content": "hi"}],
         steps=4,
         max_length=32,
         seed=0,
@@ -75,3 +76,41 @@ def test_stream_validates_eagerly(serve_runtime: Runtime) -> None:
     before committing to a stream."""
     with pytest.raises(ValueError, match="exceeds model"):
         generate_stream(serve_runtime, _request(max_length=10_000))
+
+
+def _defaults(**overrides: object) -> SampleConfig:
+    return SampleConfig().model_copy(update=overrides)
+
+
+def test_resolve_falls_back_to_defaults_when_request_omits_fields() -> None:
+    req = ChatRequest(messages=[{"role": "user", "content": "hi"}])
+    assert _resolve(req, _defaults()) == _defaults()
+
+
+def test_resolve_request_overrides_each_field() -> None:
+    req = ChatRequest(
+        messages=[{"role": "user", "content": "hi"}],
+        steps=8,
+        temperature=0.5,
+        top_k=10,
+        top_p=0.9,
+        max_length=128,
+    )
+    resolved = _resolve(req, _defaults())
+    assert resolved == _defaults(
+        steps=8, temperature=0.5, top_k=10, top_p=0.9, max_length=128
+    )
+
+
+def test_resolve_top_k_zero_override_is_respected() -> None:
+    """Regression: ``top_k=0`` is a valid request value; falsy guards must not
+    treat it as "unset" and silently use the default."""
+    req = ChatRequest(messages=[{"role": "user", "content": "hi"}], top_k=0)
+    assert _resolve(req, _defaults(top_k=10)).top_k == 0
+
+
+def test_runtime_defaults_reflect_session_overrides(serve_runtime: Runtime) -> None:
+    """The session fixture builds a runtime with no overrides; defaults must
+    therefore mirror the checkpointed ``config.sample`` (steps=4, max_length=32)."""
+    assert serve_runtime.defaults.steps == 4
+    assert serve_runtime.defaults.max_length == 32

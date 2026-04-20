@@ -91,11 +91,11 @@ class TrainConfig(BaseModel):
 
 
 class SampleConfig(BaseModel):
-    steps: int = 64
-    temperature: float = 1.0
-    top_k: int = 0
-    top_p: float = 1.0
-    max_length: int = 256
+    steps: int = Field(default=64, gt=0)
+    temperature: float = Field(default=1.0, gt=0)
+    top_k: int = Field(default=0, ge=0)
+    top_p: float = Field(default=1.0, gt=0, le=1)
+    max_length: int = Field(default=256, gt=0)
 
 
 class DataConfig(BaseModel):

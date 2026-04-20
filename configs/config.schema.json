@@ -229,26 +229,32 @@
       "properties": {
         "steps": {
           "default": 64,
+          "exclusiveMinimum": 0,
           "title": "Steps",
           "type": "integer"
         },
         "temperature": {
           "default": 1.0,
+          "exclusiveMinimum": 0,
           "title": "Temperature",
           "type": "number"
         },
         "top_k": {
           "default": 0,
+          "minimum": 0,
           "title": "Top K",
           "type": "integer"
         },
         "top_p": {
           "default": 1.0,
+          "exclusiveMinimum": 0,
+          "maximum": 1,
           "title": "Top P",
           "type": "number"
         },
         "max_length": {
           "default": 256,
+          "exclusiveMinimum": 0,
           "title": "Max Length",
           "type": "integer"
         }

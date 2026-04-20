@@ -1,10 +1,4 @@
-"""FastAPI layer: lifespan-scoped model loading + route marshalling.
-
-No business logic here. Routes pull the pre-loaded runtime from
-``app.state`` and delegate to :mod:`nanodiffusion.serve.generation`,
-wrapping blocking calls in ``asyncio.to_thread`` so the event loop
-stays free during XLA-bound per-step work.
-"""
+"""FastAPI layer: lifespan-scoped model loading + route marshalling."""
 
 import asyncio
 from collections.abc import AsyncIterator, Iterator
@@ -16,6 +10,12 @@ import structlog
 from fastapi import Depends, FastAPI, HTTPException, Request
 from sse_starlette.sse import EventSourceResponse
 
+from nanodiffusion.inference import (
+    Runtime,
+    SampleConfigOverride,
+    load_runtime,
+    warmup,
+)
 from nanodiffusion.serve.generation import generate_blocking, generate_stream
 from nanodiffusion.serve.protocol import (
     ChatRequest,
@@ -23,24 +23,19 @@ from nanodiffusion.serve.protocol import (
     HealthResponse,
     StreamFrame,
 )
-from nanodiffusion.serve.runtime import (
-    Runtime,
-    SampleDefaultsOverride,
-    load_runtime,
-    warmup,
-)
 
 log = structlog.get_logger(__name__)
 
 
-async def _iter_frames(frames: Iterator[StreamFrame]) -> AsyncIterator[StreamFrame]:
-    """Advance a sync generator through ``asyncio.to_thread`` per step.
+async def _sse_events(
+    frames: Iterator[StreamFrame], request: Request
+) -> AsyncIterator[dict[str, str]]:
+    """Bridge a blocking sampler iterator to SSE.
 
-    Each ``next(frames)`` blocks on an XLA compute; offloading keeps
-    the event loop free so the ASGI server can detect client
-    disconnects and propagate cancellation. StopIteration is coerced
-    to ``None`` because async generators cannot let it bubble (CPython
-    turns it into :class:`RuntimeError`).
+    Each ``next(frames)`` is offloaded to a thread so the event loop
+    stays free to detect client disconnects mid-generation.
+    StopIteration is coerced to ``None`` because async generators
+    cannot let it bubble (CPython raises :class:`RuntimeError`).
     """
 
     def _next_or_none() -> StreamFrame | None:
@@ -50,17 +45,10 @@ async def _iter_frames(frames: Iterator[StreamFrame]) -> AsyncIterator[StreamFra
             return None
 
     while True:
-        value = await asyncio.to_thread(_next_or_none)
-        if value is None:
-            return
-        yield value
-
-
-async def _sse_events(
-    frames: Iterator[StreamFrame], request: Request
-) -> AsyncIterator[dict[str, str]]:
-    async for frame in _iter_frames(frames):
         if await request.is_disconnected():
+            return
+        frame = await asyncio.to_thread(_next_or_none)
+        if frame is None:
             return
         yield {"data": frame.model_dump_json(), "id": str(frame.step)}
 
@@ -68,9 +56,9 @@ async def _sse_events(
 def create_app(
     *,
     checkpoint: Path,
-    overrides: SampleDefaultsOverride | None = None,
+    overrides: SampleConfigOverride | None = None,
 ) -> FastAPI:
-    overrides = overrides if overrides is not None else SampleDefaultsOverride()
+    overrides = overrides if overrides is not None else SampleConfigOverride()
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:

@@ -13,29 +13,15 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field
 from pydantic.json_schema import models_json_schema
 
-from nanodiffusion.chat import Role
+from nanodiffusion.chat import Message
+from nanodiffusion.config import SampleConfig
 
 
-class Message(BaseModel):
+class FrozenBaseModel(BaseModel):
     model_config = ConfigDict(frozen=True)
 
-    role: Role
-    content: str
 
-
-class SampleDefaults(BaseModel):
-    """Resolved sampling hyperparameters a request falls back to."""
-
-    model_config = ConfigDict(frozen=True)
-
-    steps: int = Field(gt=0)
-    temperature: float = Field(gt=0)
-    top_k: int = Field(ge=0)
-    top_p: float = Field(gt=0, le=1)
-    max_length: int = Field(gt=0)
-
-
-class ChatRequest(BaseModel):
+class ChatRequest(FrozenBaseModel):
     messages: list[Message]
     steps: int | None = Field(default=None, gt=0)
     temperature: float | None = Field(default=None, gt=0)
@@ -45,13 +31,13 @@ class ChatRequest(BaseModel):
     seed: int | None = None
 
 
-class ChatResponse(BaseModel):
+class ChatResponse(FrozenBaseModel):
     text: str
     tokens: list[int]
     prompt_len: int
 
 
-class StreamFrame(BaseModel):
+class StreamFrame(FrozenBaseModel):
     """One frame per unmasking step. ``step == total`` marks the final cleanup."""
 
     step: int = Field(ge=0)
@@ -61,18 +47,16 @@ class StreamFrame(BaseModel):
     mask_positions: list[int]
 
 
-class HealthResponse(BaseModel):
+class HealthResponse(FrozenBaseModel):
     status: Literal["ok"] = "ok"
     checkpoint: str
     train_step: int = Field(ge=0)
     max_seq_len: int = Field(gt=0)
     vocab_size: int = Field(gt=0)
-    sample_defaults: SampleDefaults
+    sample_defaults: SampleConfig
 
 
 EXPORTED_MODELS: tuple[type[BaseModel], ...] = (
-    Message,
-    SampleDefaults,
     ChatRequest,
     ChatResponse,
     StreamFrame,

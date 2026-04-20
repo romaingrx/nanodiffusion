@@ -13,17 +13,14 @@ import click
 )
 @click.option("--host", default="127.0.0.1", show_default=True)
 @click.option("--port", default=8000, show_default=True, type=int)
+@click.option("--steps", default=None, type=int, help="Override sample.steps.")
 @click.option(
-    "--steps",
-    default=None,
-    type=int,
-    help="Override config.sample.steps for every request.",
+    "--temperature", default=None, type=float, help="Override sample.temperature."
 )
+@click.option("--top-k", default=None, type=int, help="Override sample.top_k.")
+@click.option("--top-p", default=None, type=float, help="Override sample.top_p.")
 @click.option(
-    "--temperature",
-    default=None,
-    type=float,
-    help="Override config.sample.temperature for every request.",
+    "--max-length", default=None, type=int, help="Override sample.max_length."
 )
 def serve_command(
     *,
@@ -32,6 +29,9 @@ def serve_command(
     port: int,
     steps: int | None,
     temperature: float | None,
+    top_k: int | None,
+    top_p: float | None,
+    max_length: int | None,
 ) -> None:
     """Serve a trained checkpoint over HTTP + SSE.
 
@@ -39,11 +39,18 @@ def serve_command(
     """
     import uvicorn
 
-    from nanodiffusion.serve import SampleDefaultsOverride, create_app
+    from nanodiffusion.inference import SampleConfigOverride
+    from nanodiffusion.serve import create_app
 
     app = create_app(
         checkpoint=checkpoint,
-        overrides=SampleDefaultsOverride(steps=steps, temperature=temperature),
+        overrides=SampleConfigOverride(
+            steps=steps,
+            temperature=temperature,
+            top_k=top_k,
+            top_p=top_p,
+            max_length=max_length,
+        ),
     )
     uvicorn.run(app, host=host, port=port, log_config=None)
 
