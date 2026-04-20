@@ -90,12 +90,14 @@ def _build_task_mixture(config: Config) -> TaskMixture:
     ``epochs`` times via duplicate entries — that's how oversampling
     is expressed without a separate multiplier.
     """
+    sft = config.require_sft()
+    data = config.require_data()
     sources: list[ChatSource] = []
-    for entry in config.sft.datasets:
+    for entry in sft.datasets:
         factory = get_chat_dataset(entry.name)
-        src = factory(config.data.data_dir, download=True)
+        src = factory(data.data_dir, download=True)
         sources.extend([src] * entry.epochs)
-    return TaskMixture(sources, seed=config.sft.seed)
+    return TaskMixture(sources, seed=sft.seed)
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -165,7 +167,7 @@ def _load_fresh_sft_state(
         model=model,
         ema_model=ema_model,
         opt_state=opt_state,
-        key=jax.random.PRNGKey(config.sft.seed),
+        key=jax.random.PRNGKey(config.require_sft().seed),
         step=0,
         cursor=None,
     )
@@ -225,7 +227,8 @@ def sft_finetune(
       EMA, opt-state, and cursor; the loader fast-forwards past the
       saved permutation index so no conversations are re-ingested.
     """
-    optimizer, lr_schedule = make_optimizer(config.sft)
+    sft = config.require_sft()
+    optimizer, lr_schedule = make_optimizer(sft)
     start = _load_sft_initial_state(
         config,
         optimizer,
@@ -233,23 +236,23 @@ def sft_finetune(
         resume_from=resume_from,
     )
 
-    tok = Tokenizer(encode_threads=config.sft.tokenizer_threads)
-    run_dir = resolve_run_dir(config.sft.run_dir, resume_from=resume_from)
+    tok = Tokenizer(encode_threads=sft.tokenizer_threads)
+    run_dir = resolve_run_dir(sft.run_dir, resume_from=resume_from)
     configure_jax_runtime(run_dir)
     write_config(run_dir, config)
     logger.info(
         "sft_start",
         run_dir=str(run_dir),
-        datasets=[d.name for d in config.sft.datasets],
-        max_steps=config.sft.max_steps,
-        batch_size=config.sft.batch_size,
+        datasets=[d.name for d in sft.datasets],
+        max_steps=sft.max_steps,
+        batch_size=sft.batch_size,
         seq_len=config.model.max_seq_len,
         starting_step=start.step,
         resumed=resume_from is not None,
     )
 
     mesh = setup_mesh()
-    ema_decay = scale_ema_decay(config.sft.ema_decay, jax.device_count())
+    ema_decay = scale_ema_decay(sft.ema_decay, jax.device_count())
     train_step = make_sft_train_step(
         optimizer,
         schedule=LogLinearSchedule(),
@@ -261,11 +264,11 @@ def sft_finetune(
     base_loader = sft_loader(
         source,
         tok,
-        batch_size=config.sft.batch_size,
+        batch_size=sft.batch_size,
         seq_len=config.model.max_seq_len,
-        seed=config.sft.seed,
+        seed=sft.seed,
         resume_state=start.cursor,
-        max_empty_passes=config.sft.max_empty_passes,
+        max_empty_passes=sft.max_empty_passes,
     )
 
     placed_model, placed_ema_model, placed_opt_state, placed_key = place_training_state(
@@ -284,11 +287,11 @@ def sft_finetune(
         cursor=start.cursor,
     )
     settings = LoopHyperparams(
-        max_steps=config.sft.max_steps,
-        log_every=config.sft.log_every,
-        save_every=config.sft.save_every,
-        prefetch_size=config.sft.prefetch_size,
-        nominal_tokens_per_step=config.sft.batch_size * config.model.max_seq_len,
+        max_steps=sft.max_steps,
+        log_every=sft.log_every,
+        save_every=sft.save_every,
+        prefetch_size=sft.prefetch_size,
+        nominal_tokens_per_step=sft.batch_size * config.model.max_seq_len,
         event_name="sft_train",
         profile_steps=profile_steps,
     )

@@ -1,0 +1,268 @@
+{
+  "$defs": {
+    "ChatRequest": {
+      "properties": {
+        "messages": {
+          "items": {
+            "$ref": "#/$defs/Message"
+          },
+          "title": "Messages",
+          "type": "array"
+        },
+        "steps": {
+          "anyOf": [
+            {
+              "exclusiveMinimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Steps"
+        },
+        "temperature": {
+          "anyOf": [
+            {
+              "exclusiveMinimum": 0,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Temperature"
+        },
+        "top_k": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Top K"
+        },
+        "top_p": {
+          "anyOf": [
+            {
+              "exclusiveMinimum": 0,
+              "maximum": 1,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Top P"
+        },
+        "max_length": {
+          "anyOf": [
+            {
+              "exclusiveMinimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Max Length"
+        },
+        "seed": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Seed"
+        }
+      },
+      "required": [
+        "messages"
+      ],
+      "title": "ChatRequest",
+      "type": "object"
+    },
+    "ChatResponse": {
+      "properties": {
+        "text": {
+          "title": "Text",
+          "type": "string"
+        },
+        "tokens": {
+          "items": {
+            "type": "integer"
+          },
+          "title": "Tokens",
+          "type": "array"
+        },
+        "prompt_len": {
+          "title": "Prompt Len",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "text",
+        "tokens",
+        "prompt_len"
+      ],
+      "title": "ChatResponse",
+      "type": "object"
+    },
+    "HealthResponse": {
+      "properties": {
+        "status": {
+          "const": "ok",
+          "default": "ok",
+          "title": "Status",
+          "type": "string"
+        },
+        "checkpoint": {
+          "title": "Checkpoint",
+          "type": "string"
+        },
+        "train_step": {
+          "minimum": 0,
+          "title": "Train Step",
+          "type": "integer"
+        },
+        "max_seq_len": {
+          "exclusiveMinimum": 0,
+          "title": "Max Seq Len",
+          "type": "integer"
+        },
+        "vocab_size": {
+          "exclusiveMinimum": 0,
+          "title": "Vocab Size",
+          "type": "integer"
+        },
+        "sample_defaults": {
+          "$ref": "#/$defs/SampleConfig"
+        }
+      },
+      "required": [
+        "checkpoint",
+        "train_step",
+        "max_seq_len",
+        "vocab_size",
+        "sample_defaults"
+      ],
+      "title": "HealthResponse",
+      "type": "object"
+    },
+    "Message": {
+      "properties": {
+        "role": {
+          "enum": [
+            "user",
+            "assistant",
+            "system"
+          ],
+          "title": "Role",
+          "type": "string"
+        },
+        "content": {
+          "title": "Content",
+          "type": "string"
+        }
+      },
+      "required": [
+        "role",
+        "content"
+      ],
+      "title": "Message",
+      "type": "object"
+    },
+    "SampleConfig": {
+      "properties": {
+        "steps": {
+          "default": 64,
+          "exclusiveMinimum": 0,
+          "title": "Steps",
+          "type": "integer"
+        },
+        "temperature": {
+          "default": 1.0,
+          "exclusiveMinimum": 0,
+          "title": "Temperature",
+          "type": "number"
+        },
+        "top_k": {
+          "default": 0,
+          "minimum": 0,
+          "title": "Top K",
+          "type": "integer"
+        },
+        "top_p": {
+          "default": 1.0,
+          "exclusiveMinimum": 0,
+          "maximum": 1,
+          "title": "Top P",
+          "type": "number"
+        },
+        "max_length": {
+          "default": 256,
+          "exclusiveMinimum": 0,
+          "title": "Max Length",
+          "type": "integer"
+        }
+      },
+      "title": "SampleConfig",
+      "type": "object"
+    },
+    "StreamFrame": {
+      "description": "One frame per unmasking step. ``step == total`` marks the final cleanup.",
+      "properties": {
+        "step": {
+          "minimum": 0,
+          "title": "Step",
+          "type": "integer"
+        },
+        "total": {
+          "exclusiveMinimum": 0,
+          "title": "Total",
+          "type": "integer"
+        },
+        "tokens": {
+          "items": {
+            "type": "integer"
+          },
+          "title": "Tokens",
+          "type": "array"
+        },
+        "text": {
+          "title": "Text",
+          "type": "string"
+        },
+        "mask_positions": {
+          "items": {
+            "type": "integer"
+          },
+          "title": "Mask Positions",
+          "type": "array"
+        }
+      },
+      "required": [
+        "step",
+        "total",
+        "tokens",
+        "text",
+        "mask_positions"
+      ],
+      "title": "StreamFrame",
+      "type": "object"
+    }
+  },
+  "title": "NanodiffusionProtocol"
+}

@@ -9,7 +9,13 @@ import pytest
 
 from nanodiffusion.chat import Conversation
 from nanodiffusion.checkpoint import save_checkpoint
-from nanodiffusion.config import Config, ModelConfig, SFTConfig, SFTDatasetConfig
+from nanodiffusion.config import (
+    Config,
+    DataConfig,
+    ModelConfig,
+    SFTConfig,
+    SFTDatasetConfig,
+)
 from nanodiffusion.constants import CONFIG_SIDECAR_FILENAME, LATEST_LINK_NAME
 from nanodiffusion.data.chat_datasets import CHAT_DATASETS, register_chat
 from nanodiffusion.data.chat_source import ChatSource, InMemoryChatSource
@@ -20,6 +26,8 @@ from nanodiffusion.optimizer import make_optimizer
 from nanodiffusion.schedule import LogLinearSchedule
 from nanodiffusion.sft import SFTTrainStepFn, make_sft_train_step, sft_finetune
 from tests._helpers import clone_state, inexact_leaves
+
+_DUMMY_DATASETS = [SFTDatasetConfig(name="_placeholder")]
 
 
 def _make_supervised_batch(seq_len: int, batch: int = 4) -> SFTJaxBatch:
@@ -44,6 +52,7 @@ def test_sft_train_step_decreases_loss_on_fixed_batch(
     ema_model = clone_state(model)
 
     sft_cfg = SFTConfig(
+        datasets=_DUMMY_DATASETS,
         learning_rate=3e-3,
         warmup_steps=5,
         max_steps=100,
@@ -83,7 +92,9 @@ def test_sft_train_step_is_deterministic(
     key, model_key = jax.random.split(key)
     model = Transformer(small_config, key=model_key)
 
-    optimizer, _ = make_optimizer(SFTConfig(warmup_steps=2, max_steps=10))
+    optimizer, _ = make_optimizer(
+        SFTConfig(datasets=_DUMMY_DATASETS, warmup_steps=2, max_steps=10)
+    )
     opt_state = optimizer.init(eqx.filter(model, eqx.is_inexact_array))
     train_step = make_sft_train_step(
         optimizer,
@@ -130,7 +141,9 @@ def test_sft_train_step_prompt_positions_have_zero_embedding_grad(
     key, model_key = jax.random.split(key)
     model = Transformer(small_config, key=model_key)
 
-    optimizer, _ = make_optimizer(SFTConfig(warmup_steps=1, max_steps=10))
+    optimizer, _ = make_optimizer(
+        SFTConfig(datasets=_DUMMY_DATASETS, warmup_steps=1, max_steps=10)
+    )
     opt_state = optimizer.init(eqx.filter(model, eqx.is_inexact_array))
     train_step = make_sft_train_step(
         optimizer,
@@ -171,7 +184,7 @@ def test_make_sft_train_step_narrows_via_sfttrainstepfn_annotation(
     model = Transformer(small_config, key=model_key)
 
     optimizer, _ = make_optimizer(
-        SFTConfig(warmup_steps=2, max_steps=10, ema_decay=0.9)
+        SFTConfig(datasets=_DUMMY_DATASETS, warmup_steps=2, max_steps=10, ema_decay=0.9)
     )
     opt_state = optimizer.init(eqx.filter(model, eqx.is_inexact_array))
 
@@ -252,7 +265,9 @@ def test_sft_finetune_end_to_end_smoke(
     key = jax.random.PRNGKey(0)
     model_key, _ = jax.random.split(key)
     model = Transformer(sft_model_config, key=model_key)
-    optimizer, _ = make_optimizer(SFTConfig(warmup_steps=1, max_steps=5))
+    optimizer, _ = make_optimizer(
+        SFTConfig(datasets=_DUMMY_DATASETS, warmup_steps=1, max_steps=5)
+    )
     opt_state = optimizer.init(eqx.filter(model, eqx.is_inexact_array))
 
     ckpt_dir = tmp_path / "pretrain_latest"
@@ -275,6 +290,7 @@ def test_sft_finetune_end_to_end_smoke(
 
     sft_config = Config(
         model=sft_model_config,
+        data=DataConfig(dataset="_unused", data_dir=tmp_path),
         sft=SFTConfig(
             warmup_steps=1,
             max_steps=3,
@@ -336,7 +352,9 @@ def test_sft_finetune_resumes_from_saved_sft_checkpoint(
     pretrain_dir = tmp_path / "pretrain_latest"
     key = jax.random.PRNGKey(0)
     model = Transformer(sft_model_config, key=key)
-    pretrain_optimizer, _ = make_optimizer(SFTConfig(warmup_steps=1, max_steps=5))
+    pretrain_optimizer, _ = make_optimizer(
+        SFTConfig(datasets=_DUMMY_DATASETS, warmup_steps=1, max_steps=5)
+    )
     pretrain_opt_state = pretrain_optimizer.init(
         eqx.filter(model, eqx.is_inexact_array)
     )
@@ -359,6 +377,7 @@ def test_sft_finetune_resumes_from_saved_sft_checkpoint(
     # around to collide with the resumed run's new saves.
     first_config = Config(
         model=sft_model_config,
+        data=DataConfig(dataset="_unused", data_dir=tmp_path),
         sft=SFTConfig(
             warmup_steps=1,
             max_steps=2,

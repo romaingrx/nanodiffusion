@@ -91,15 +91,32 @@ class TrainConfig(BaseModel):
 
 
 class SampleConfig(BaseModel):
-    steps: int = 64
-    temperature: float = 1.0
-    top_k: int = 0
-    top_p: float = 1.0
-    max_length: int = 256
+    steps: int = Field(default=64, gt=0)
+    temperature: float = Field(default=1.0, gt=0)
+    top_k: int = Field(default=0, ge=0)
+    top_p: float = Field(default=1.0, gt=0, le=1)
+    max_length: int = Field(default=256, gt=0)
+
+    def with_overrides(self, source: object) -> "SampleConfig":
+        """Return a copy with non-``None`` fields on ``source`` layered on top.
+
+        ``source`` only needs to expose the :class:`SampleConfig` field
+        names via ``getattr``; extra attributes (``seed``, ``messages``,
+        ...) are ignored. This lets both the CLI override dataclass and
+        the ``ChatRequest`` Pydantic model drive the same merge without
+        duplicating the loop at every call site.
+        """
+        return self.model_copy(
+            update={
+                f: v
+                for f in SampleConfig.model_fields
+                if (v := getattr(source, f, None)) is not None
+            }
+        )
 
 
 class DataConfig(BaseModel):
-    dataset: str = "climbmix-400b"
+    dataset: str
     data_dir: Path = Path("data")
     num_train_shards: int | None = None
     tokenizer_batch_size: int = 128
@@ -120,21 +137,6 @@ class SFTDatasetConfig(BaseModel):
     epochs: int = Field(default=1, gt=0)
 
 
-def _default_sft_datasets() -> list[SFTDatasetConfig]:
-    """Mirrors nanochat's SFT mixture scoped to ROM-17's three datasets.
-
-    GSM8K and identity are oversampled relative to SmolTalk — small
-    datasets drowning in a bigger chat corpus need the extra passes to
-    leave any trace in the final model. Matches nanochat's
-    ``chat_sft.py:train_tasks`` shape.
-    """
-    return [
-        SFTDatasetConfig(name="smoltalk"),
-        SFTDatasetConfig(name="gsm8k", epochs=4),
-        SFTDatasetConfig(name="identity", epochs=2),
-    ]
-
-
 class SFTConfig(BaseModel):
     seed: int = 42
     batch_size: int = Field(default=8, gt=0)
@@ -147,7 +149,7 @@ class SFTConfig(BaseModel):
     log_every: int = Field(default=20, gt=0)
     save_every: int = Field(default=500, gt=0)
     run_dir: Path = Path("runs/sft")
-    datasets: list[SFTDatasetConfig] = Field(default_factory=_default_sft_datasets)
+    datasets: list[SFTDatasetConfig]
     tokenizer_batch_size: int = 128
     tokenizer_threads: int = 4
     prefetch_size: int = 2
@@ -176,11 +178,32 @@ class Config(BaseModel):
     model: ModelConfig = ModelConfig()
     train: TrainConfig = TrainConfig()
     sample: SampleConfig = SampleConfig()
-    data: DataConfig = DataConfig()
-    sft: SFTConfig = SFTConfig()
+    data: DataConfig | None = None
+    sft: SFTConfig | None = None
 
     @classmethod
     def from_yaml(cls, path: str | Path) -> "Config":
         with Path(path).open() as f:
             data = yaml.safe_load(f)
         return cls.model_validate(data)
+
+    def require_data(self) -> DataConfig:
+        """Return ``data`` or raise with a pointer to the missing section.
+
+        Pretraining and dataset-download flows both need a concrete
+        :class:`DataConfig`; serving and schema commands don't. Making
+        the field optional and gating at the entry point keeps the YAMLs
+        for inference-only checkpoints from carrying unused ``data:``
+        blocks.
+        """
+        if self.data is None:
+            msg = "config missing 'data' section — add a 'data:' block to the YAML"
+            raise ValueError(msg)
+        return self.data
+
+    def require_sft(self) -> SFTConfig:
+        """Return ``sft`` or raise with a pointer to the missing section."""
+        if self.sft is None:
+            msg = "config missing 'sft' section — add an 'sft:' block to the YAML"
+            raise ValueError(msg)
+        return self.sft

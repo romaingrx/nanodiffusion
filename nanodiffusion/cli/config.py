@@ -22,7 +22,7 @@ def schema_document() -> dict[str, object]:
     ``Config`` class docstring — is preserved and the note is appended
     so neither message is lost.
     """
-    from nanodiffusion.config import Config  # noqa: PLC0415
+    from nanodiffusion.config import Config
 
     schema: dict[str, object] = Config.model_json_schema()
     existing = schema.get("description")
@@ -73,9 +73,9 @@ def validate(paths: tuple[Path, ...]) -> None:
     before exiting non-zero. Use directly from the command line or
     wire into a pre-commit hook to catch drift at commit time.
     """
-    from pydantic import ValidationError  # noqa: PLC0415
+    from pydantic import ValidationError
 
-    from nanodiffusion.config import Config  # noqa: PLC0415
+    from nanodiffusion.config import Config
 
     failures: list[tuple[Path, str]] = []
     for path in paths:

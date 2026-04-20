@@ -3,21 +3,23 @@ from pydantic import ValidationError
 
 from nanodiffusion.config import OptimizerHyperparams, SFTConfig, SFTDatasetConfig
 
+_DATASETS = [SFTDatasetConfig(name="smoltalk")]
 
-def test_sft_config_default_dataset_mixture_matches_issue() -> None:
-    """Defaults mirror nanochat's scoped-down mixture from ROM-17.
 
-    SmolTalk once, GSM8K x4, identity x2 — a regression against any
-    silent change to the oversampling ratios.
+def test_sft_config_requires_explicit_datasets() -> None:
+    """Removing the default_factory forces callers to name their mixture.
+
+    A silent default drowned SFT runs in the wrong data — the review for
+    PR #15 made this the explicit signal that no SFT run should start
+    without saying which datasets.
     """
-    cfg = SFTConfig()
-    names = {d.name: d.epochs for d in cfg.datasets}
-    assert names == {"smoltalk": 1, "gsm8k": 4, "identity": 2}
+    with pytest.raises(ValidationError, match="datasets"):
+        SFTConfig()  # pyright: ignore[reportCallIssue]
 
 
 def test_sft_config_satisfies_optimizer_hyperparams_protocol() -> None:
     """SFTConfig is structurally compatible with make_optimizer's Protocol."""
-    assert isinstance(SFTConfig(), OptimizerHyperparams)
+    assert isinstance(SFTConfig(datasets=_DATASETS), OptimizerHyperparams)
 
 
 def test_sft_config_rejects_empty_dataset_list() -> None:
@@ -27,7 +29,7 @@ def test_sft_config_rejects_empty_dataset_list() -> None:
 
 def test_sft_config_rejects_max_steps_below_warmup() -> None:
     with pytest.raises(ValidationError, match="max_steps"):
-        SFTConfig(warmup_steps=100, max_steps=50)
+        SFTConfig(datasets=_DATASETS, warmup_steps=100, max_steps=50)
 
 
 def test_sft_dataset_config_rejects_non_positive_epochs() -> None:
@@ -37,11 +39,11 @@ def test_sft_dataset_config_rejects_non_positive_epochs() -> None:
 
 def test_sft_config_rejects_non_positive_save_every() -> None:
     with pytest.raises(ValidationError, match="save_every"):
-        SFTConfig(save_every=0)
+        SFTConfig(datasets=_DATASETS, save_every=0)
 
 
 def test_sft_config_rejects_ema_decay_out_of_range() -> None:
     with pytest.raises(ValidationError, match="ema_decay"):
-        SFTConfig(ema_decay=1.5)
+        SFTConfig(datasets=_DATASETS, ema_decay=1.5)
     with pytest.raises(ValidationError, match="ema_decay"):
-        SFTConfig(ema_decay=-0.01)
+        SFTConfig(datasets=_DATASETS, ema_decay=-0.01)

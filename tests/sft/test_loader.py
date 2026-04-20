@@ -12,7 +12,7 @@ from nanodiffusion.checkpoint import (
     load_checkpoint,
     save_checkpoint,
 )
-from nanodiffusion.config import ModelConfig, SFTConfig
+from nanodiffusion.config import ModelConfig, SFTConfig, SFTDatasetConfig
 from nanodiffusion.data.chat_source import InMemoryChatSource
 from nanodiffusion.data.cursors import SFTCursor
 from nanodiffusion.data.sft_loader import (
@@ -23,6 +23,8 @@ from nanodiffusion.data.sft_loader import (
 from nanodiffusion.model.transformer import Transformer
 from nanodiffusion.optimizer import make_optimizer
 from nanodiffusion.tokenizer import Tokenizer
+
+_DUMMY_DATASETS = [SFTDatasetConfig(name="_placeholder")]
 
 
 def _short_conv(i: int) -> Conversation:
@@ -206,7 +208,9 @@ def test_cursor_roundtrip_through_checkpoint(
 
     model_key = jax.random.PRNGKey(0)
     model = Transformer(small_config, key=model_key)
-    optimizer, _ = make_optimizer(SFTConfig(warmup_steps=1, max_steps=10))
+    optimizer, _ = make_optimizer(
+        SFTConfig(datasets=_DUMMY_DATASETS, warmup_steps=1, max_steps=10)
+    )
     opt_state = optimizer.init(eqx.filter(model, eqx.is_inexact_array))
 
     ckpt_dir = tmp_path / "step_1"
