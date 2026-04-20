@@ -4,10 +4,15 @@ requires-python = ">=3.13"
 resolution-markers = [
     "python_full_version >= '3.14' and sys_platform == 'win32'",
     "python_full_version >= '3.14' and sys_platform == 'emscripten'",
-    "python_full_version >= '3.14' and sys_platform != 'emscripten' and sys_platform != 'win32'",
+    "(python_full_version >= '3.14' and platform_machine != 'x86_64' and sys_platform == 'linux') or (python_full_version >= '3.14' and sys_platform != 'emscripten' and sys_platform != 'linux' and sys_platform != 'win32')",
     "python_full_version < '3.14' and sys_platform == 'win32'",
     "python_full_version < '3.14' and sys_platform == 'emscripten'",
-    "python_full_version < '3.14' and sys_platform != 'emscripten' and sys_platform != 'win32'",
+    "(python_full_version < '3.14' and platform_machine != 'x86_64' and sys_platform == 'linux') or (python_full_version < '3.14' and sys_platform != 'emscripten' and sys_platform != 'linux' and sys_platform != 'win32')",
+    "python_full_version >= '3.14' and platform_machine == 'x86_64' and sys_platform == 'linux'",
+    "python_full_version < '3.14' and platform_machine == 'x86_64' and sys_platform == 'linux'",
+]
+required-markers = [
+    "platform_machine == 'x86_64' and sys_platform == 'linux'",
 ]
 
 [[package]]
@@ -1003,9 +1008,9 @@ wheels = [
 
 [package.optional-dependencies]
 tpu = [
-    { name = "jaxlib", marker = "sys_platform != 'emscripten' and sys_platform != 'win32'" },
-    { name = "libtpu", marker = "sys_platform != 'emscripten' and sys_platform != 'win32'" },
-    { name = "requests", marker = "sys_platform != 'emscripten' and sys_platform != 'win32'" },
+    { name = "jaxlib" },
+    { name = "libtpu" },
+    { name = "requests" },
 ]
 
 [[package]]
@@ -1311,8 +1316,10 @@ obs = [
 profile = [
     { name = "setuptools" },
     { name = "tensorboard" },
-    { name = "tensorboard-plugin-profile" },
-    { name = "xprof" },
+    { name = "tensorboard-plugin-profile", version = "2.22.1", source = { registry = "https://pypi.org/simple" }, marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
+    { name = "tensorboard-plugin-profile", version = "2.22.2", source = { registry = "https://pypi.org/simple" }, marker = "platform_machine != 'x86_64' or sys_platform != 'linux'" },
+    { name = "xprof", version = "2.22.1", source = { registry = "https://pypi.org/simple" }, marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
+    { name = "xprof", version = "2.22.2", source = { registry = "https://pypi.org/simple" }, marker = "platform_machine != 'x86_64' or sys_platform != 'linux'" },
 ]
 tpu = [
     { name = "jax", extra = ["tpu"], marker = "sys_platform == 'linux'" },
@@ -2269,10 +2276,33 @@ wheels = [
 
 [[package]]
 name = "tensorboard-plugin-profile"
+version = "2.22.1"
+source = { registry = "https://pypi.org/simple" }
+resolution-markers = [
+    "python_full_version >= '3.14' and platform_machine == 'x86_64' and sys_platform == 'linux'",
+    "python_full_version < '3.14' and platform_machine == 'x86_64' and sys_platform == 'linux'",
+]
+dependencies = [
+    { name = "xprof", version = "2.22.1", source = { registry = "https://pypi.org/simple" }, marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
+]
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/f6/a1/3de6a2f2c28be0d961ff3669dec220540fa9bcb8d9b674d7c3fd079cab7e/tensorboard_plugin_profile-2.22.1-cp313-none-any.whl", hash = "sha256:d2b56190121458144daef92fe3fb2aca1091ab8ac9a935c602ef959fcc6f422e", size = 6242, upload-time = "2026-04-02T15:34:29.955Z" },
+]
+
+[[package]]
+name = "tensorboard-plugin-profile"
 version = "2.22.2"
 source = { registry = "https://pypi.org/simple" }
+resolution-markers = [
+    "python_full_version >= '3.14' and sys_platform == 'win32'",
+    "python_full_version >= '3.14' and sys_platform == 'emscripten'",
+    "(python_full_version >= '3.14' and platform_machine != 'x86_64' and sys_platform == 'linux') or (python_full_version >= '3.14' and sys_platform != 'emscripten' and sys_platform != 'linux' and sys_platform != 'win32')",
+    "python_full_version < '3.14' and sys_platform == 'win32'",
+    "python_full_version < '3.14' and sys_platform == 'emscripten'",
+    "(python_full_version < '3.14' and platform_machine != 'x86_64' and sys_platform == 'linux') or (python_full_version < '3.14' and sys_platform != 'emscripten' and sys_platform != 'linux' and sys_platform != 'win32')",
+]
 dependencies = [
-    { name = "xprof" },
+    { name = "xprof", version = "2.22.2", source = { registry = "https://pypi.org/simple" }, marker = "platform_machine != 'x86_64' or sys_platform != 'linux'" },
 ]
 wheels = [
     { url = "https://files.pythonhosted.org/packages/4e/5c/a232904fa49045b68d2950f9600d0f311953ebab0c2bf23ecf6cd69f11ba/tensorboard_plugin_profile-2.22.2-py3-none-macosx_11_0_arm64.whl", hash = "sha256:195fac1df09299e83e7906d52a9395e0e5f509a109ee451586a497b383d7298a", size = 6237, upload-time = "2026-04-13T19:17:03.18Z" },
@@ -2595,18 +2625,50 @@ wheels = [
 
 [[package]]
 name = "xprof"
+version = "2.22.1"
+source = { registry = "https://pypi.org/simple" }
+resolution-markers = [
+    "python_full_version >= '3.14' and platform_machine == 'x86_64' and sys_platform == 'linux'",
+    "python_full_version < '3.14' and platform_machine == 'x86_64' and sys_platform == 'linux'",
+]
+dependencies = [
+    { name = "cheroot", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
+    { name = "etils", extra = ["epath"], marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
+    { name = "fsspec", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
+    { name = "gcsfs", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
+    { name = "gviz-api", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
+    { name = "protobuf", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
+    { name = "setuptools", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
+    { name = "six", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
+    { name = "werkzeug", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
+]
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/54/82/5072efb3c3495f2dd6948fb3840c5bd95edc66115a3fe8b92ca537f32a0c/xprof-2.22.1-cp313-none-any.whl", hash = "sha256:9566eec9306186ce66a971d612effa43c71f9e0628f583829cbd7627523fc6b8", size = 21957566, upload-time = "2026-04-02T15:53:06.167Z" },
+    { url = "https://files.pythonhosted.org/packages/59/61/57462db9f6ed5e7a20efa5c182abca317cf7c29a065f9de33adcf1a8b798/xprof-2.22.1-cp313-none-manylinux_2_27_x86_64.whl", hash = "sha256:48c782c0c6e95c026f6b94dbebfd2319dacdd96939ff8ae9b85f74d6930129e4", size = 25883360, upload-time = "2026-04-02T15:34:27.217Z" },
+]
+
+[[package]]
+name = "xprof"
 version = "2.22.2"
 source = { registry = "https://pypi.org/simple" }
+resolution-markers = [
+    "python_full_version >= '3.14' and sys_platform == 'win32'",
+    "python_full_version >= '3.14' and sys_platform == 'emscripten'",
+    "(python_full_version >= '3.14' and platform_machine != 'x86_64' and sys_platform == 'linux') or (python_full_version >= '3.14' and sys_platform != 'emscripten' and sys_platform != 'linux' and sys_platform != 'win32')",
+    "python_full_version < '3.14' and sys_platform == 'win32'",
+    "python_full_version < '3.14' and sys_platform == 'emscripten'",
+    "(python_full_version < '3.14' and platform_machine != 'x86_64' and sys_platform == 'linux') or (python_full_version < '3.14' and sys_platform != 'emscripten' and sys_platform != 'linux' and sys_platform != 'win32')",
+]
 dependencies = [
-    { name = "cheroot" },
-    { name = "etils", extra = ["epath"] },
-    { name = "fsspec" },
-    { name = "gcsfs" },
-    { name = "gviz-api" },
-    { name = "protobuf" },
-    { name = "setuptools" },
-    { name = "six" },
-    { name = "werkzeug" },
+    { name = "cheroot", marker = "platform_machine != 'x86_64' or sys_platform != 'linux'" },
+    { name = "etils", extra = ["epath"], marker = "platform_machine != 'x86_64' or sys_platform != 'linux'" },
+    { name = "fsspec", marker = "platform_machine != 'x86_64' or sys_platform != 'linux'" },
+    { name = "gcsfs", marker = "platform_machine != 'x86_64' or sys_platform != 'linux'" },
+    { name = "gviz-api", marker = "platform_machine != 'x86_64' or sys_platform != 'linux'" },
+    { name = "protobuf", marker = "platform_machine != 'x86_64' or sys_platform != 'linux'" },
+    { name = "setuptools", marker = "platform_machine != 'x86_64' or sys_platform != 'linux'" },
+    { name = "six", marker = "platform_machine != 'x86_64' or sys_platform != 'linux'" },
+    { name = "werkzeug", marker = "platform_machine != 'x86_64' or sys_platform != 'linux'" },
 ]
 wheels = [
     { url = "https://files.pythonhosted.org/packages/3b/63/d922ed4f40b84fda96bbde4da7982225ebd1650f4995417ef85c3c7c9466/xprof-2.22.2-py3-none-macosx_11_0_arm64.whl", hash = "sha256:01ee8a2ba26c5f360f0949c88f5adc3f4cba779531d2372fdd51b2edadb706a7", size = 36278544, upload-time = "2026-04-13T19:17:00.577Z" },

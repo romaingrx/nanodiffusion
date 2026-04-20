@@ -46,6 +46,14 @@ nanodiffusion = "nanodiffusion.cli:main"
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
+[tool.uv]
+# CI runs on Linux x86_64; force the lock to pick versions with Linux wheels
+# even when regenerated on macOS (otherwise newly-released arm64-only wheels
+# get selected and `uv sync --locked` fails on CI runners).
+required-environments = [
+    "sys_platform == 'linux' and platform_machine == 'x86_64'",
+]
+
 [tool.ruff]
 line-length = 88
 target-version = "py313"
