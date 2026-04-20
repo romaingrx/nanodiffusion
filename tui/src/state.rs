@@ -1,4 +1,18 @@
+use std::num::NonZeroU64;
+
 use crate::protocol::{ChatRequest, Message, Role};
+
+/// Sampling knobs applied uniformly to every request this session makes.
+/// Each `None` lets the server use its configured default.
+#[derive(Debug, Default, Clone)]
+pub struct SampleOptions {
+    pub steps: Option<NonZeroU64>,
+    pub temperature: Option<f64>,
+    pub top_k: Option<u64>,
+    pub top_p: Option<f64>,
+    pub max_length: Option<NonZeroU64>,
+    pub seed: Option<i64>,
+}
 
 /// Pure conversation state: history + current input buffer.
 ///
@@ -34,7 +48,7 @@ impl ChatState {
     }
 
     /// Drain the input into a user turn and build the request to send.
-    pub fn commit_user_turn(&mut self) -> ChatRequest {
+    pub fn commit_user_turn(&mut self, opts: &SampleOptions) -> ChatRequest {
         let content = std::mem::take(&mut self.input);
         self.history.push(Message {
             role: Role::User,
@@ -42,12 +56,12 @@ impl ChatState {
         });
         ChatRequest {
             messages: self.history.clone(),
-            max_length: None,
-            seed: None,
-            steps: None,
-            temperature: None,
-            top_k: None,
-            top_p: None,
+            max_length: opts.max_length,
+            seed: opts.seed,
+            steps: opts.steps,
+            temperature: opts.temperature,
+            top_k: opts.top_k,
+            top_p: opts.top_p,
         }
     }
 
@@ -68,12 +82,29 @@ mod tests {
         let mut state = ChatState::default();
         state.push_char('h');
         state.push_char('i');
-        let req = state.commit_user_turn();
+        let req = state.commit_user_turn(&SampleOptions::default());
         assert!(state.input().is_empty());
         assert_eq!(state.history().len(), 1);
         assert!(matches!(state.history()[0].role, Role::User));
         assert_eq!(state.history()[0].content, "hi");
         assert_eq!(req.messages.len(), 1);
+        assert!(req.steps.is_none());
+    }
+
+    #[test]
+    fn commit_threads_sample_options_into_request() {
+        let opts = SampleOptions {
+            steps: NonZeroU64::new(16),
+            temperature: Some(0.7),
+            seed: Some(42),
+            ..SampleOptions::default()
+        };
+        let mut state = ChatState::default();
+        state.push_char('q');
+        let req = state.commit_user_turn(&opts);
+        assert_eq!(req.steps, NonZeroU64::new(16));
+        assert_eq!(req.temperature, Some(0.7));
+        assert_eq!(req.seed, Some(42));
     }
 
     #[test]

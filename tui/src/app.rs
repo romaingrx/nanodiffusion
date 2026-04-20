@@ -13,7 +13,7 @@ use crate::{
     effects::Reveal,
     render,
     session::{Session, SessionUpdate},
-    state::ChatState,
+    state::{ChatState, SampleOptions},
     terminal::Tui,
     ui::{ChatPane, InputPane, StatusBar},
 };
@@ -22,6 +22,7 @@ const TICK: Duration = Duration::from_millis(50);
 
 pub struct App {
     base_url: String,
+    sample_opts: SampleOptions,
     chat: ChatState,
     session: Option<Session>,
     reveal: Reveal,
@@ -30,9 +31,10 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(base_url: String) -> Self {
+    pub fn new(base_url: String, sample_opts: SampleOptions) -> Self {
         Self {
             base_url,
+            sample_opts,
             chat: ChatState::default(),
             session: None,
             reveal: Reveal::new(),
@@ -79,7 +81,7 @@ impl App {
     }
 
     fn send(&mut self) {
-        let req = self.chat.commit_user_turn();
+        let req = self.chat.commit_user_turn(&self.sample_opts);
         self.session = Some(Session::spawn(self.base_url.clone(), req));
         self.reveal.reset();
         self.status = "streaming…".into();
@@ -144,6 +146,7 @@ impl App {
             StatusBar {
                 status: &self.status,
                 progress: self.session.as_ref().and_then(Session::latest),
+                tok_per_sec: self.session.as_ref().and_then(Session::tokens_per_second),
             },
             status_area,
         );

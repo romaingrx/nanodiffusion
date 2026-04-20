@@ -57,6 +57,7 @@ impl Widget for InputPane<'_> {
 pub struct StatusBar<'a> {
     pub status: &'a str,
     pub progress: Option<&'a StreamFrame>,
+    pub tok_per_sec: Option<f64>,
 }
 
 impl Widget for StatusBar<'_> {
@@ -72,6 +73,9 @@ impl Widget for StatusBar<'_> {
                 " step {}/{} — {masks} masked ",
                 frame.step, total
             )));
+            if let Some(rate) = self.tok_per_sec {
+                spans.push(Span::raw(format!("— {rate:.1} tok/s ")));
+            }
         }
         Paragraph::new(Line::from(spans)).render(area, buf);
     }

@@ -1,3 +1,5 @@
+use std::time::Instant;
+
 use tokio::{sync::mpsc, task::AbortHandle};
 
 use crate::{
@@ -11,6 +13,7 @@ pub struct Session {
     rx: mpsc::Receiver<ClientEvent>,
     abort: AbortHandle,
     latest: Option<StreamFrame>,
+    started: Instant,
 }
 
 /// Coarse update the app reacts to, decoupled from the wire [`ClientEvent`].
@@ -30,6 +33,7 @@ impl Session {
             rx,
             abort: handle.abort_handle(),
             latest: None,
+            started: Instant::now(),
         }
     }
 
@@ -39,6 +43,17 @@ impl Session {
 
     pub fn take_latest(&mut self) -> Option<StreamFrame> {
         self.latest.take()
+    }
+
+    /// Throughput in tokens-per-second based on revealed positions so far.
+    /// Returns `None` before enough wall time has elapsed to be meaningful.
+    pub fn tokens_per_second(&self) -> Option<f64> {
+        const WARMUP: f64 = 0.05;
+        let frame = self.latest.as_ref()?;
+        let total = u64::from(frame.total) as f64;
+        let revealed = total - frame.mask_positions.len() as f64;
+        let elapsed = self.started.elapsed().as_secs_f64();
+        (elapsed > WARMUP).then_some(revealed / elapsed)
     }
 
     /// Await the next wire event and fold it into local state.
