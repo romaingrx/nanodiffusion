@@ -34,3 +34,6 @@ nanodiffusion-bruno/
 
 # GCP service-account keys (never commit)
 sa.json
+
+# Rust
+tui/target/

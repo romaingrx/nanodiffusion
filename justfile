@@ -20,4 +20,13 @@ typecheck:
 schema:
     uv run nanodiffusion config gen-schema
 
+tui *args:
+    cd tui && cargo run --release -- {{ args }}
+
+tui-build:
+    cd tui && cargo build --release
+
+tui-check:
+    cd tui && cargo fmt --check && cargo clippy -- -D warnings
+
 check: lint format typecheck test
