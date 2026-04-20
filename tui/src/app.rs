@@ -101,23 +101,39 @@ impl App {
                 }
             }
             Some(SessionUpdate::Done) | None => self.finalize(),
-            Some(SessionUpdate::Error(e)) => {
-                self.session = None;
-                self.reveal.reset();
-                self.status = format!("error: {e}");
-            }
+            Some(SessionUpdate::Error(e)) => self.fail(e),
         }
     }
 
     fn finalize(&mut self) {
-        if let Some(mut session) = self.session.take()
-            && let Some(frame) = session.take_latest()
-        {
-            let body = render::extract_assistant(&frame.text).to_string();
-            self.chat.push_assistant(body);
+        let body = self
+            .session
+            .take()
+            .as_mut()
+            .and_then(Session::take_latest)
+            .map(|frame| render::finalized_body(&frame.text))
+            .filter(|b| !b.is_empty());
+        match body {
+            Some(assistant) => self.chat.push_assistant(assistant),
+            None => {
+                // Nothing usable came back — drop the user message so we keep
+                // a strict user/assistant/… alternation (the server rejects
+                // anything else with 422) and give the user back their input.
+                self.chat.rollback_last_user();
+                self.status = "no response — input restored".into();
+                self.reveal.reset();
+                return;
+            }
         }
         self.reveal.reset();
         self.status = "ready".into();
+    }
+
+    fn fail(&mut self, msg: String) {
+        self.session = None;
+        self.reveal.reset();
+        self.chat.rollback_last_user();
+        self.status = format!("error: {msg}");
     }
 
     fn draw(&mut self, f: &mut Frame<'_>) {

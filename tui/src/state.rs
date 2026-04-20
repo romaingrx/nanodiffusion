@@ -71,6 +71,20 @@ impl ChatState {
             content,
         });
     }
+
+    /// Undo the most recent user turn and restore its text to the input buffer.
+    /// No-op if the last message isn't a user turn (e.g., already confirmed).
+    /// Returns whether a rollback actually happened.
+    pub fn rollback_last_user(&mut self) -> bool {
+        if !matches!(self.history.last().map(|m| m.role), Some(Role::User)) {
+            return false;
+        }
+        let popped = self.history.pop().expect("matches! above guaranteed Some");
+        if self.input.is_empty() {
+            self.input = popped.content;
+        }
+        true
+    }
 }
 
 #[cfg(test)]
@@ -113,5 +127,30 @@ mod tests {
         state.push_char(' ');
         state.push_char('\t');
         assert!(state.input_is_empty());
+    }
+
+    #[test]
+    fn rollback_pops_user_and_restores_input_buffer() {
+        let mut state = ChatState::default();
+        for c in "hello".chars() {
+            state.push_char(c);
+        }
+        let _ = state.commit_user_turn(&SampleOptions::default());
+        assert_eq!(state.history().len(), 1);
+
+        assert!(state.rollback_last_user());
+        assert_eq!(state.history().len(), 0);
+        assert_eq!(state.input(), "hello");
+    }
+
+    #[test]
+    fn rollback_is_noop_after_assistant_confirms() {
+        let mut state = ChatState::default();
+        state.push_char('q');
+        let _ = state.commit_user_turn(&SampleOptions::default());
+        state.push_assistant("answer".into());
+
+        assert!(!state.rollback_last_user());
+        assert_eq!(state.history().len(), 2);
     }
 }

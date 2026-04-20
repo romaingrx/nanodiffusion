@@ -29,6 +29,13 @@ pub fn extract_assistant(text: &str) -> &str {
         .unwrap_or(before_end)
 }
 
+/// Assistant body with mask literals stripped — safe to append to history so
+/// the next request's tokenization doesn't rehydrate them as regular text
+/// (tiktoken's base encoder doesn't know our special tokens).
+pub fn finalized_body(text: &str) -> String {
+    extract_assistant(text).replace(MASK_LITERAL, "").trim().to_string()
+}
+
 /// Render a partially-unmasked assistant body as LLaDA-palette spans.
 /// Mask literals render as a short dim glyph; decoded text uses the settled color.
 pub fn render_body(body: &str) -> Vec<Line<'static>> {
@@ -92,5 +99,17 @@ mod tests {
     fn render_preserves_newlines_as_separate_lines() {
         let lines = render_body("a\nb");
         assert_eq!(lines.len(), 2);
+    }
+
+    #[test]
+    fn finalized_strips_masks_and_trims() {
+        let raw = "<|assistant_start|>  hello<|mask|><|mask|> world <|assistant_end|>";
+        assert_eq!(finalized_body(raw), "hello world");
+    }
+
+    #[test]
+    fn finalized_returns_empty_when_all_masks() {
+        let raw = "<|assistant_start|><|mask|><|mask|><|assistant_end|>";
+        assert_eq!(finalized_body(raw), "");
     }
 }
