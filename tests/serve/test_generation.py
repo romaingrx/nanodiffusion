@@ -4,7 +4,7 @@ import pytest
 
 from nanodiffusion.config import SampleConfig
 from nanodiffusion.inference import Runtime
-from nanodiffusion.serve.generation import _resolve, generate_blocking, generate_stream
+from nanodiffusion.serve.generation import generate_blocking, generate_stream
 from nanodiffusion.serve.protocol import ChatRequest
 
 
@@ -82,12 +82,12 @@ def _defaults(**overrides: object) -> SampleConfig:
     return SampleConfig().model_copy(update=overrides)
 
 
-def test_resolve_falls_back_to_defaults_when_request_omits_fields() -> None:
+def test_with_overrides_falls_back_to_defaults_when_request_omits_fields() -> None:
     req = ChatRequest(messages=[{"role": "user", "content": "hi"}])
-    assert _resolve(req, _defaults()) == _defaults()
+    assert _defaults().with_overrides(req) == _defaults()
 
 
-def test_resolve_request_overrides_each_field() -> None:
+def test_with_overrides_request_overrides_each_field() -> None:
     req = ChatRequest(
         messages=[{"role": "user", "content": "hi"}],
         steps=8,
@@ -96,17 +96,17 @@ def test_resolve_request_overrides_each_field() -> None:
         top_p=0.9,
         max_length=128,
     )
-    resolved = _resolve(req, _defaults())
+    resolved = _defaults().with_overrides(req)
     assert resolved == _defaults(
         steps=8, temperature=0.5, top_k=10, top_p=0.9, max_length=128
     )
 
 
-def test_resolve_top_k_zero_override_is_respected() -> None:
+def test_with_overrides_top_k_zero_override_is_respected() -> None:
     """Regression: ``top_k=0`` is a valid request value; falsy guards must not
     treat it as "unset" and silently use the default."""
     req = ChatRequest(messages=[{"role": "user", "content": "hi"}], top_k=0)
-    assert _resolve(req, _defaults(top_k=10)).top_k == 0
+    assert _defaults(top_k=10).with_overrides(req).top_k == 0
 
 
 def test_runtime_defaults_reflect_session_overrides(serve_runtime: Runtime) -> None:

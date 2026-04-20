@@ -77,10 +77,11 @@ def make_train_step[M: DiffusionModel](
 
 
 def _init_source(config: Config) -> TextSource:
-    factory = get_dataset(config.data.dataset)
+    data = config.require_data()
+    factory = get_dataset(data.dataset)
     return factory(
-        config.data.data_dir,
-        num_train=config.data.num_train_shards,
+        data.data_dir,
+        num_train=data.num_train_shards,
         download=False,
     )
 
@@ -202,10 +203,12 @@ def pretrain(
     Returns the run directory so callers (tests, notebooks) can inspect
     the produced artifacts without re-deriving the auto-generated path.
     """
-    seed_key = jax.random.PRNGKey(config.train.seed)
+    data = config.require_data()
+    train = config.train
+    seed_key = jax.random.PRNGKey(train.seed)
     model_key, loop_key = jax.random.split(seed_key)
 
-    optimizer, lr_schedule = make_optimizer(config.train)
+    optimizer, lr_schedule = make_optimizer(train)
     start = _load_pretrain_initial_state(
         config,
         optimizer,
@@ -214,17 +217,17 @@ def pretrain(
         loop_key=loop_key,
     )
 
-    tok = Tokenizer(encode_threads=config.data.tokenizer_threads)
+    tok = Tokenizer(encode_threads=data.tokenizer_threads)
     source = _init_source(config)
-    run_dir = resolve_run_dir(config.train.run_dir, resume_from=resume_from)
+    run_dir = resolve_run_dir(train.run_dir, resume_from=resume_from)
     configure_jax_runtime(run_dir)
     write_config(run_dir, config)
     logger.info(
         "pretrain_start",
         run_dir=str(run_dir),
-        dataset=config.data.dataset,
-        max_steps=config.train.max_steps,
-        batch_size=config.train.batch_size,
+        dataset=data.dataset,
+        max_steps=train.max_steps,
+        batch_size=train.batch_size,
         seq_len=config.model.max_seq_len,
         starting_step=start.step,
         resumed=resume_from is not None,
@@ -232,7 +235,7 @@ def pretrain(
     )
 
     mesh = setup_mesh()
-    ema_decay = scale_ema_decay(config.train.ema_decay, jax.device_count())
+    ema_decay = scale_ema_decay(train.ema_decay, jax.device_count())
     train_step = make_train_step(
         optimizer,
         schedule=LogLinearSchedule(),
@@ -242,12 +245,12 @@ def pretrain(
     base_loader = pretrain_loader(
         source,
         tok,
-        batch_size=config.train.batch_size,
+        batch_size=train.batch_size,
         seq_len=config.model.max_seq_len,
         split="train",
-        tokenizer_batch_size=config.data.tokenizer_batch_size,
+        tokenizer_batch_size=data.tokenizer_batch_size,
         resume_state=start.cursor,
-        max_empty_passes=config.data.max_empty_passes,
+        max_empty_passes=data.max_empty_passes,
     )
 
     placed_model, placed_ema_model, placed_opt_state, placed_key = place_training_state(
@@ -266,11 +269,11 @@ def pretrain(
         cursor=start.cursor,
     )
     settings = LoopHyperparams(
-        max_steps=config.train.max_steps,
-        log_every=config.train.log_every,
-        save_every=config.train.save_every,
-        prefetch_size=config.data.prefetch_size,
-        nominal_tokens_per_step=config.train.batch_size * config.model.max_seq_len,
+        max_steps=train.max_steps,
+        log_every=train.log_every,
+        save_every=train.save_every,
+        prefetch_size=data.prefetch_size,
+        nominal_tokens_per_step=train.batch_size * config.model.max_seq_len,
         event_name="train",
         profile_steps=profile_steps,
     )

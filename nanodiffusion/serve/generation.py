@@ -20,16 +20,6 @@ from nanodiffusion.tokenizer import Tokenizer
 from nanodiffusion.types import PRNGKeyArray, Tokens
 
 
-def _resolve(req: ChatRequest, defaults: SampleConfig) -> SampleConfig:
-    return defaults.model_copy(
-        update={
-            f: v
-            for f in SampleConfig.model_fields
-            if (v := getattr(req, f)) is not None
-        }
-    )
-
-
 def _make_key(seed: int | None) -> PRNGKeyArray:
     chosen = seed if seed is not None else secrets.randbits(32)
     return jax.random.PRNGKey(chosen)
@@ -60,7 +50,7 @@ def _prepare_prompt(
 
 
 def generate_blocking(runtime: Runtime, req: ChatRequest) -> ChatResponse:
-    resolved = _resolve(req, runtime.defaults)
+    resolved = runtime.defaults.with_overrides(req)
     prompt_ids = _prepare_prompt(runtime.tok, req, resolved, runtime.max_seq_len)
     prompt_tokens = jnp.array(prompt_ids)
 
@@ -90,7 +80,7 @@ def generate_stream(runtime: Runtime, req: ChatRequest) -> Iterator[StreamFrame]
     Errors raise synchronously so the HTTP handler maps them to 422
     before committing to a streaming response.
     """
-    resolved = _resolve(req, runtime.defaults)
+    resolved = runtime.defaults.with_overrides(req)
     prompt_ids = _prepare_prompt(runtime.tok, req, resolved, runtime.max_seq_len)
     prompt_tokens = jnp.array(prompt_ids)
     key = _make_key(req.seed)

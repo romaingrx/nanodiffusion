@@ -35,7 +35,9 @@ def serve_command(
 ) -> None:
     """Serve a trained checkpoint over HTTP + SSE.
 
-    Single-tenant by design: one JAX model per process, no concurrency.
+    Single-tenant by design: one JAX model per process, no concurrency,
+    no auth. Binding ``--host 0.0.0.0`` exposes the endpoint to anything
+    on the network; only do so behind a trusted reverse proxy.
     """
     import uvicorn
 
@@ -52,6 +54,8 @@ def serve_command(
             max_length=max_length,
         ),
     )
+    # log_config=None keeps uvicorn from replacing our structlog-backed root
+    # handler; access/error logs inherit from the root logger instead.
     uvicorn.run(app, host=host, port=port, log_config=None)
 
 

@@ -65,13 +65,7 @@ def load_runtime(
     model = eqx.nn.inference_mode(model, value=True)
 
     meta = CheckpointMeta.model_validate_json((checkpoint / META_FILENAME).read_text())
-    defaults = config.sample.model_copy(
-        update={
-            f: ov
-            for f in SampleConfig.model_fields
-            if (ov := getattr(overrides, f)) is not None
-        }
-    )
+    defaults = config.sample.with_overrides(overrides)
 
     return Runtime(
         model=model,
@@ -98,6 +92,10 @@ def warmup(runtime: Runtime, *, max_lengths: Iterable[int] | None = None) -> Non
         if max_lengths is not None
         else [runtime.defaults.max_length, runtime.max_seq_len]
     )
+    # Prompt content is immaterial for warmup: the sampler pads out to
+    # ``max_length`` with masks before calling ``_forward``, whose JIT
+    # cache keys on ``(seq_len, dtype)`` — any 1-token int32 prompt traces
+    # the same shape real requests will use.
     prompt = jnp.zeros(1, dtype=jnp.int32)
     for length in dict.fromkeys(lengths):  # dedupe, preserve order
         tokens = sampler.sample_tokens(

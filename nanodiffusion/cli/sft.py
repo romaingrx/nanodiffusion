@@ -86,7 +86,7 @@ def sft_command(
 
     config = Config.from_yaml(config_path)
     if seed is not None:
-        config.sft.seed = seed
+        config.require_sft().seed = seed
     sft_finetune(
         config,
         pretrain_checkpoint=pretrain_checkpoint,
