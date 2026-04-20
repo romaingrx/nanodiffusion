@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use eventsource_client::{Client, ClientBuilder, ReconnectOptions, SSE};
+use eventsource_client::{Client, ClientBuilder, Error as SseError, ReconnectOptions, SSE};
 use futures::TryStreamExt;
 use launchdarkly_sdk_transport::HyperTransport;
 use tokio::sync::mpsc;
@@ -40,7 +40,7 @@ pub async fn stream_chat(
                 }
             }
             Ok(Some(_)) => continue,
-            Ok(None) => {
+            Ok(None) | Err(SseError::Eof) => {
                 let _ = tx.send(ClientEvent::Done).await;
                 return Ok(());
             }
