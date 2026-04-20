@@ -7,9 +7,7 @@
 #![allow(clippy::all)]
 #![allow(warnings)]
 
-typify::import_types!(
-    schema = "../schemas/protocol.json",
-);
+typify::import_types!(schema = "../schemas/protocol.json",);
 
 #[cfg(test)]
 mod tests {

@@ -2,7 +2,10 @@ mod app;
 mod client;
 mod protocol;
 mod render;
+mod session;
+mod state;
 mod terminal;
+mod ui;
 
 use anyhow::Result;
 use clap::Parser;

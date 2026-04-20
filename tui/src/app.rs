@@ -5,137 +5,105 @@ use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyModifiers};
 use futures::StreamExt;
 use ratatui::{
     Frame,
-    layout::{Constraint, Layout, Rect},
-    style::{Color, Modifier, Style},
-    text::{Line, Span},
-    widgets::{Block, Paragraph, Wrap},
+    layout::{Constraint, Layout},
 };
-use tokio::{sync::mpsc, task::JoinHandle, time::interval};
+use tokio::time::interval;
 
 use crate::{
-    client::{ClientEvent, stream_chat},
-    protocol::{ChatRequest, Message, Role, StreamFrame},
     render,
+    session::{Session, SessionUpdate},
+    state::ChatState,
     terminal::Tui,
+    ui::{ChatPane, InputPane, StatusBar},
 };
+
+const TICK: Duration = Duration::from_millis(50);
 
 pub struct App {
     base_url: String,
-    history: Vec<Message>,
-    input: String,
-    stream: Option<Stream>,
+    chat: ChatState,
+    session: Option<Session>,
     status: String,
     should_quit: bool,
-}
-
-struct Stream {
-    rx: mpsc::Receiver<ClientEvent>,
-    handle: JoinHandle<Result<()>>,
-    latest: Option<StreamFrame>,
 }
 
 impl App {
     pub fn new(base_url: String) -> Self {
         Self {
             base_url,
-            history: Vec::new(),
-            input: String::new(),
-            stream: None,
-            status: "ready — type a message, enter to send, esc to cancel, ctrl-c to quit".into(),
+            chat: ChatState::default(),
+            session: None,
+            status: "ready — type, enter to send, esc to cancel, ctrl-c to quit".into(),
             should_quit: false,
         }
     }
 
     pub async fn run(mut self, term: &mut Tui) -> Result<()> {
         let mut events = EventStream::new();
-        let mut ticker = interval(Duration::from_millis(50));
+        let mut ticker = interval(TICK);
         while !self.should_quit {
             term.draw(|f| self.draw(f))?;
             tokio::select! {
                 _ = ticker.tick() => {}
-                evt = events.next() => match evt {
-                    Some(Ok(e)) => self.on_event(e),
-                    Some(Err(e)) => return Err(e.into()),
-                    None => self.should_quit = true,
-                },
-                msg = recv_stream(&mut self.stream) => self.on_stream(msg),
+                maybe_evt = events.next() => self.on_raw_event(maybe_evt)?,
+                update = poll_session(&mut self.session) => self.on_session_update(update),
             }
         }
-        if let Some(s) = self.stream.take() {
-            s.handle.abort();
+        self.session = None;
+        Ok(())
+    }
+
+    fn on_raw_event(&mut self, evt: Option<std::io::Result<Event>>) -> Result<()> {
+        match evt {
+            Some(Ok(Event::Key(key))) => self.on_key(key),
+            Some(Ok(_)) => {}
+            Some(Err(e)) => return Err(e.into()),
+            None => self.should_quit = true,
         }
         Ok(())
     }
 
-    fn on_event(&mut self, evt: Event) {
-        let Event::Key(KeyEvent { code, modifiers, .. }) = evt else { return };
-        if modifiers.contains(KeyModifiers::CONTROL) && matches!(code, KeyCode::Char('c')) {
-            self.should_quit = true;
-            return;
-        }
-        match code {
-            KeyCode::Esc => {
-                if self.stream.is_some() {
-                    self.cancel();
-                } else {
-                    self.should_quit = true;
-                }
-            }
-            KeyCode::Enter if self.stream.is_none() && !self.input.trim().is_empty() => {
-                self.send();
-            }
-            KeyCode::Backspace => {
-                self.input.pop();
-            }
-            KeyCode::Char(c) if self.stream.is_none() => {
-                self.input.push(c);
-            }
-            _ => {}
+    fn on_key(&mut self, key: KeyEvent) {
+        match KeyAction::from(key, self.session.is_some(), self.chat.input_is_empty()) {
+            KeyAction::Nothing => {}
+            KeyAction::Quit => self.should_quit = true,
+            KeyAction::Cancel => self.cancel(),
+            KeyAction::Send => self.send(),
+            KeyAction::Type(c) => self.chat.push_char(c),
+            KeyAction::Backspace => self.chat.pop_char(),
         }
     }
 
     fn send(&mut self) {
-        let content = std::mem::take(&mut self.input);
-        self.history.push(Message { role: Role::User, content });
-        let req = ChatRequest {
-            messages: self.history.clone(),
-            max_length: None,
-            seed: None,
-            steps: None,
-            temperature: None,
-            top_k: None,
-            top_p: None,
-        };
-        let (tx, rx) = mpsc::channel(64);
-        let base_url = self.base_url.clone();
-        let handle = tokio::spawn(async move { stream_chat(&base_url, &req, tx).await });
+        let req = self.chat.commit_user_turn();
+        self.session = Some(Session::spawn(self.base_url.clone(), req));
         self.status = "streaming…".into();
-        self.stream = Some(Stream { rx, handle, latest: None });
     }
 
     fn cancel(&mut self) {
-        if let Some(s) = self.stream.take() {
-            s.handle.abort();
-        }
+        self.session = None;
         self.status = "cancelled".into();
     }
 
-    fn on_stream(&mut self, msg: Option<ClientEvent>) {
-        let Some(s) = self.stream.as_mut() else { return };
-        match msg {
-            Some(ClientEvent::Frame(frame)) => s.latest = Some(frame),
-            Some(ClientEvent::Done) | None => {
-                if let Some(frame) = s.latest.take() {
-                    self.history.push(Message { role: Role::Assistant, content: frame.text });
-                }
-                self.stream = None;
-                self.status = "ready".into();
-            }
-            Some(ClientEvent::Error(e)) => {
-                self.stream = None;
+    fn on_session_update(&mut self, update: Option<SessionUpdate>) {
+        match update {
+            Some(SessionUpdate::Frame) => {}
+            Some(SessionUpdate::Done) | None => self.finalize(),
+            Some(SessionUpdate::Error(e)) => {
+                self.session = None;
                 self.status = format!("error: {e}");
             }
         }
+    }
+
+    fn finalize(&mut self) {
+        if let Some(mut session) = self.session.take()
+            && let Some(frame) = session.take_latest()
+        {
+            let body = render::extract_assistant(&frame.text).to_string();
+            self.chat.push_assistant(body);
+        }
+        self.status = "ready".into();
     }
 
     fn draw(&self, f: &mut Frame<'_>) {
@@ -146,74 +114,119 @@ impl App {
         ])
         .areas(f.area());
 
-        self.draw_chat(f, chat_area);
-        self.draw_input(f, input_area);
-        self.draw_status(f, status_area);
-    }
-
-    fn draw_chat(&self, f: &mut Frame<'_>, area: Rect) {
-        let mut lines: Vec<Line> = Vec::new();
-        for msg in &self.history {
-            lines.push(role_label(msg.role));
-            for line in msg.content.lines() {
-                lines.push(Line::from(line.to_string()));
-            }
-            lines.push(Line::from(""));
-        }
-        if let Some(s) = self.stream.as_ref() {
-            lines.push(role_label(Role::Assistant));
-            if let Some(frame) = s.latest.as_ref() {
-                let body = render::extract_assistant(&frame.text);
-                lines.extend(render::render_body(body));
-            } else {
-                lines.push(Line::from(Span::styled("…", Style::default().fg(Color::DarkGray))));
-            }
-        }
-        let block = Block::bordered().title(" chat ");
-        let p = Paragraph::new(lines).wrap(Wrap { trim: false }).block(block);
-        f.render_widget(p, area);
-    }
-
-    fn draw_input(&self, f: &mut Frame<'_>, area: Rect) {
-        let block = Block::bordered().title(" message ");
-        let style = if self.stream.is_some() {
-            Style::default().fg(Color::DarkGray)
-        } else {
-            Style::default()
-        };
-        let p = Paragraph::new(self.input.as_str()).style(style).block(block);
-        f.render_widget(p, area);
-    }
-
-    fn draw_status(&self, f: &mut Frame<'_>, area: Rect) {
-        let stats = self.stream.as_ref().and_then(|s| s.latest.as_ref()).map(|frame| {
-            let masks = frame.mask_positions.len();
-            let total = u64::from(frame.total);
-            format!(" step {}/{} — {masks} masked ", frame.step, total)
-        });
-        let line = Line::from(vec![
-            Span::styled(format!(" {} ", self.status), Style::default().add_modifier(Modifier::DIM)),
-            Span::raw(stats.unwrap_or_default()),
-        ]);
-        f.render_widget(Paragraph::new(line), area);
+        f.render_widget(
+            ChatPane {
+                history: self.chat.history(),
+                streaming: self.session.as_ref().and_then(Session::latest),
+            },
+            chat_area,
+        );
+        f.render_widget(
+            InputPane {
+                buffer: self.chat.input(),
+                locked: self.session.is_some(),
+            },
+            input_area,
+        );
+        f.render_widget(
+            StatusBar {
+                status: &self.status,
+                progress: self.session.as_ref().and_then(Session::latest),
+            },
+            status_area,
+        );
     }
 }
 
-fn role_label(role: Role) -> Line<'static> {
-    let (label, color) = match role {
-        Role::User => ("you", Color::Cyan),
-        Role::Assistant => ("model", Color::Magenta),
-        Role::System => ("system", Color::Yellow),
-    };
-    Line::from(Span::styled(
-        format!("{label}:"),
-        Style::default().fg(color).add_modifier(Modifier::BOLD),
-    ))
+enum KeyAction {
+    Nothing,
+    Quit,
+    Cancel,
+    Send,
+    Type(char),
+    Backspace,
 }
 
-async fn recv_stream(stream: &mut Option<Stream>) -> Option<ClientEvent> {
-    match stream {
-        Some(s) => s.rx.recv().await,
+impl KeyAction {
+    fn from(key: KeyEvent, streaming: bool, input_empty: bool) -> Self {
+        if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('c')) {
+            return Self::Quit;
+        }
+        match key.code {
+            KeyCode::Esc if streaming => Self::Cancel,
+            KeyCode::Esc => Self::Quit,
+            KeyCode::Enter if !streaming && !input_empty => Self::Send,
+            KeyCode::Backspace if !streaming => Self::Backspace,
+            KeyCode::Char(c) if !streaming => Self::Type(c),
+            _ => Self::Nothing,
+        }
+    }
+}
+
+async fn poll_session(session: &mut Option<Session>) -> Option<SessionUpdate> {
+    match session {
+        Some(s) => s.poll().await,
         None => std::future::pending().await,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crossterm::event::KeyEventKind;
+
+    fn key(code: KeyCode, mods: KeyModifiers) -> KeyEvent {
+        KeyEvent {
+            code,
+            modifiers: mods,
+            kind: KeyEventKind::Press,
+            state: crossterm::event::KeyEventState::NONE,
+        }
+    }
+
+    #[test]
+    fn ctrl_c_always_quits() {
+        let a = KeyAction::from(key(KeyCode::Char('c'), KeyModifiers::CONTROL), true, false);
+        assert!(matches!(a, KeyAction::Quit));
+    }
+
+    #[test]
+    fn esc_cancels_while_streaming_else_quits() {
+        assert!(matches!(
+            KeyAction::from(key(KeyCode::Esc, KeyModifiers::NONE), true, false),
+            KeyAction::Cancel
+        ));
+        assert!(matches!(
+            KeyAction::from(key(KeyCode::Esc, KeyModifiers::NONE), false, false),
+            KeyAction::Quit
+        ));
+    }
+
+    #[test]
+    fn enter_sends_only_when_idle_with_input() {
+        assert!(matches!(
+            KeyAction::from(key(KeyCode::Enter, KeyModifiers::NONE), false, false),
+            KeyAction::Send
+        ));
+        assert!(matches!(
+            KeyAction::from(key(KeyCode::Enter, KeyModifiers::NONE), true, false),
+            KeyAction::Nothing
+        ));
+        assert!(matches!(
+            KeyAction::from(key(KeyCode::Enter, KeyModifiers::NONE), false, true),
+            KeyAction::Nothing
+        ));
+    }
+
+    #[test]
+    fn typing_is_blocked_during_stream() {
+        assert!(matches!(
+            KeyAction::from(key(KeyCode::Char('a'), KeyModifiers::NONE), false, true),
+            KeyAction::Type('a')
+        ));
+        assert!(matches!(
+            KeyAction::from(key(KeyCode::Char('a'), KeyModifiers::NONE), true, true),
+            KeyAction::Nothing
+        ));
     }
 }

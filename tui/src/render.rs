@@ -23,7 +23,10 @@ pub fn extract_assistant(text: &str) -> &str {
         .split_once(ASSISTANT_END)
         .map(|(head, _)| head)
         .unwrap_or(after_start);
-    before_end.split_once(EOS).map(|(h, _)| h).unwrap_or(before_end)
+    before_end
+        .split_once(EOS)
+        .map(|(h, _)| h)
+        .unwrap_or(before_end)
 }
 
 /// Render a partially-unmasked assistant body as LLaDA-palette spans.
@@ -63,7 +66,8 @@ mod tests {
 
     #[test]
     fn extracts_assistant_body() {
-        let raw = "<|bos|><|user_start|>hi<|user_end|><|assistant_start|>hello world<|assistant_end|>";
+        let raw =
+            "<|bos|><|user_start|>hi<|user_end|><|assistant_start|>hello world<|assistant_end|>";
         assert_eq!(extract_assistant(raw), "hello world");
     }
 

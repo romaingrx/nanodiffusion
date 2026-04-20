@@ -1,0 +1,63 @@
+use tokio::{sync::mpsc, task::AbortHandle};
+
+use crate::{
+    client::{ClientEvent, stream_chat},
+    protocol::{ChatRequest, StreamFrame},
+};
+
+/// One in-flight chat completion: the receiver side of the stream, plus the
+/// abort handle for the task feeding it. Dropping the session aborts the task.
+pub struct Session {
+    rx: mpsc::Receiver<ClientEvent>,
+    abort: AbortHandle,
+    latest: Option<StreamFrame>,
+}
+
+/// Coarse update the app reacts to, decoupled from the wire [`ClientEvent`].
+pub enum SessionUpdate {
+    Frame,
+    Done,
+    Error(String),
+}
+
+impl Session {
+    pub fn spawn(base_url: String, request: ChatRequest) -> Self {
+        let (tx, rx) = mpsc::channel(64);
+        let handle = tokio::spawn(async move {
+            let _ = stream_chat(&base_url, &request, tx).await;
+        });
+        Self {
+            rx,
+            abort: handle.abort_handle(),
+            latest: None,
+        }
+    }
+
+    pub fn latest(&self) -> Option<&StreamFrame> {
+        self.latest.as_ref()
+    }
+
+    pub fn take_latest(&mut self) -> Option<StreamFrame> {
+        self.latest.take()
+    }
+
+    /// Await the next wire event and fold it into local state.
+    /// Returns `None` when the stream channel closes.
+    pub async fn poll(&mut self) -> Option<SessionUpdate> {
+        match self.rx.recv().await {
+            Some(ClientEvent::Frame(frame)) => {
+                self.latest = Some(frame);
+                Some(SessionUpdate::Frame)
+            }
+            Some(ClientEvent::Done) => Some(SessionUpdate::Done),
+            Some(ClientEvent::Error(e)) => Some(SessionUpdate::Error(e)),
+            None => None,
+        }
+    }
+}
+
+impl Drop for Session {
+    fn drop(&mut self) {
+        self.abort.abort();
+    }
+}
