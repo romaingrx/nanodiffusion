@@ -1,4 +1,5 @@
 mod app;
+mod protocol;
 mod terminal;
 
 use anyhow::Result;
