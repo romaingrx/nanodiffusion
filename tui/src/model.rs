@@ -139,12 +139,11 @@ pub struct PromptEstimate {
 }
 
 impl PromptEstimate {
-    /// Fraction used as a percentage, saturating on overflow.
+    /// Fraction used as a percentage, saturating on overflow, `0` when `max == 0`.
     pub const fn used_pct(self) -> u64 {
-        if self.max == 0 {
-            0
-        } else {
-            self.used.saturating_mul(100) / self.max
+        match self.used.saturating_mul(100).checked_div(self.max) {
+            Some(pct) => pct,
+            None => 0,
         }
     }
 

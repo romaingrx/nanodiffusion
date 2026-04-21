@@ -16,7 +16,7 @@ use crate::{
 const STREAM_PATH: &str = "/api/chat/stream";
 const HEALTH_PATH: &str = "/api/health";
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
-const READ_TIMEOUT: Duration = Duration::from_secs(300);
+const READ_TIMEOUT: Duration = Duration::from_mins(5);
 const HEALTH_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Typed error surface for the SSE client, so the UI can distinguish between
