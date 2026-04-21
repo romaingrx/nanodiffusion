@@ -17,23 +17,21 @@ const SETTLED_COLOR: Color = Color::Rgb(0x66, 0x99, 0xCC);
 pub fn extract_assistant(text: &str) -> &str {
     let after_start = text
         .rsplit_once(ASSISTANT_START)
-        .map(|(_, rest)| rest)
-        .unwrap_or(text);
+        .map_or(text, |(_, rest)| rest);
     let before_end = after_start
         .split_once(ASSISTANT_END)
-        .map(|(head, _)| head)
-        .unwrap_or(after_start);
-    before_end
-        .split_once(EOS)
-        .map(|(h, _)| h)
-        .unwrap_or(before_end)
+        .map_or(after_start, |(head, _)| head);
+    before_end.split_once(EOS).map_or(before_end, |(h, _)| h)
 }
 
 /// Assistant body with mask literals stripped — safe to append to history so
 /// the next request's tokenization doesn't rehydrate them as regular text
 /// (tiktoken's base encoder doesn't know our special tokens).
 pub fn finalized_body(text: &str) -> String {
-    extract_assistant(text).replace(MASK_LITERAL, "").trim().to_string()
+    extract_assistant(text)
+        .replace(MASK_LITERAL, "")
+        .trim()
+        .to_string()
 }
 
 /// Render a partially-unmasked assistant body as LLaDA-palette spans.

@@ -40,7 +40,7 @@ impl Reveal {
     }
 
     /// Clear any state tracked across a streaming session. Call on finalize or cancel.
-    pub fn reset(&mut self) {
+    pub const fn reset(&mut self) {
         self.previous_masks = None;
     }
 

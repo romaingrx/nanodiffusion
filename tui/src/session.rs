@@ -1,73 +1,41 @@
-use std::time::Instant;
+//! Thin wrapper around an in-flight SSE task. Owns the abort handle and the
+//! receiver side of the frame channel. Dropping a `Session` aborts the task —
+//! which is exactly the lifecycle guarantee the runtime wants when it assigns
+//! `*session = None` or `*session = Some(new)`.
+//!
+//! Frame-level state (`latest`, `started`) lives on [`crate::model::Model`]
+//! instead of here — the spawned task sends `Msg` values directly through the
+//! channel and the reducer folds them into `Model::streaming`.
 
 use tokio::{sync::mpsc, task::AbortHandle};
 
-use crate::{
-    client::{ClientEvent, stream_chat},
-    protocol::{ChatRequest, StreamFrame},
-};
+use crate::{client::stream_chat, msg::Msg, protocol::ChatRequest};
 
-/// One in-flight chat completion: the receiver side of the stream, plus the
-/// abort handle for the task feeding it. Dropping the session aborts the task.
 pub struct Session {
-    rx: mpsc::Receiver<ClientEvent>,
+    rx: mpsc::Receiver<Msg>,
     abort: AbortHandle,
-    latest: Option<StreamFrame>,
-    started: Instant,
-}
-
-/// Coarse update the app reacts to, decoupled from the wire [`ClientEvent`].
-pub enum SessionUpdate {
-    Frame,
-    Done,
-    Error(String),
 }
 
 impl Session {
-    pub fn spawn(base_url: String, request: ChatRequest) -> Self {
+    /// Spawn a task streaming frames into an internal channel.
+    ///
+    /// `http_client` is the shared `reqwest::Client` (cheap to clone —
+    /// internally `Arc`-wrapped). Sharing it avoids a new connection pool + TLS
+    /// handshake per turn.
+    pub fn spawn(http_client: reqwest::Client, base_url: String, request: ChatRequest) -> Self {
         let (tx, rx) = mpsc::channel(64);
         let handle = tokio::spawn(async move {
-            let _ = stream_chat(&base_url, &request, tx).await;
+            let _ = stream_chat(&http_client, &base_url, &request, tx).await;
         });
         Self {
             rx,
             abort: handle.abort_handle(),
-            latest: None,
-            started: Instant::now(),
         }
     }
 
-    pub fn latest(&self) -> Option<&StreamFrame> {
-        self.latest.as_ref()
-    }
-
-    pub fn take_latest(&mut self) -> Option<StreamFrame> {
-        self.latest.take()
-    }
-
-    /// Throughput in tokens-per-second based on revealed positions so far.
-    /// Returns `None` before enough wall time has elapsed to be meaningful.
-    pub fn tokens_per_second(&self) -> Option<f64> {
-        const WARMUP: f64 = 0.05;
-        let frame = self.latest.as_ref()?;
-        let total = u64::from(frame.total) as f64;
-        let revealed = total - frame.mask_positions.len() as f64;
-        let elapsed = self.started.elapsed().as_secs_f64();
-        (elapsed > WARMUP).then_some(revealed / elapsed)
-    }
-
-    /// Await the next wire event and fold it into local state.
-    /// Returns `None` when the stream channel closes.
-    pub async fn poll(&mut self) -> Option<SessionUpdate> {
-        match self.rx.recv().await {
-            Some(ClientEvent::Frame(frame)) => {
-                self.latest = Some(frame);
-                Some(SessionUpdate::Frame)
-            }
-            Some(ClientEvent::Done) => Some(SessionUpdate::Done),
-            Some(ClientEvent::Error(e)) => Some(SessionUpdate::Error(e)),
-            None => None,
-        }
+    /// Next message from the stream, or `None` if the channel closed.
+    pub async fn poll(&mut self) -> Option<Msg> {
+        self.rx.recv().await
     }
 }
 

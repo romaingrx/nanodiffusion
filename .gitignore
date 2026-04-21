@@ -37,3 +37,4 @@ sa.json
 
 # Rust
 tui/target/
+tui/tui.log*

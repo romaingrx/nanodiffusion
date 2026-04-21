@@ -1,6 +1,6 @@
 use std::io::{Stdout, stdout};
 
-use anyhow::Result;
+use color_eyre::Result;
 use crossterm::{
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
@@ -21,4 +21,11 @@ pub fn leave(term: &mut Tui) -> Result<()> {
     execute!(term.backend_mut(), LeaveAlternateScreen)?;
     term.show_cursor()?;
     Ok(())
+}
+
+/// Best-effort restore for panic paths — doesn't require a live `Tui` handle.
+/// Errors are swallowed because there's no sensible recovery mid-panic.
+pub fn restore() {
+    let _ = disable_raw_mode();
+    let _ = execute!(stdout(), LeaveAlternateScreen);
 }

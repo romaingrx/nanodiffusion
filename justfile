@@ -27,6 +27,6 @@ tui-build:
     cd tui && cargo build --release
 
 tui-check:
-    cd tui && cargo fmt --check && cargo clippy -- -D warnings
+    cd tui && cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test
 
 check: lint format typecheck test
