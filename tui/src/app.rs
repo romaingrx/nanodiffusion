@@ -82,6 +82,12 @@ impl App {
 
     fn send(&mut self) {
         let req = self.chat.commit_user_turn(&self.sample_opts);
+        tracing::info!(
+            turns = req.messages.len(),
+            roles = ?req.messages.iter().map(|m| m.role).collect::<Vec<_>>(),
+            last_len = req.messages.last().map(|m| m.content.len()).unwrap_or(0),
+            "sending chat request"
+        );
         self.session = Some(Session::spawn(self.base_url.clone(), req));
         self.reveal.reset();
         self.status = "streaming…".into();
@@ -114,11 +120,12 @@ impl App {
             .map(|frame| render::finalized_body(&frame.text))
             .filter(|b| !b.is_empty());
         match body {
-            Some(assistant) => self.chat.push_assistant(assistant),
+            Some(assistant) => {
+                tracing::info!(len = assistant.len(), "assistant turn committed");
+                self.chat.push_assistant(assistant);
+            }
             None => {
-                // Nothing usable came back — drop the user message so we keep
-                // a strict user/assistant/… alternation (the server rejects
-                // anything else with 422) and give the user back their input.
+                tracing::warn!("empty response — rolling back user turn");
                 self.chat.rollback_last_user();
                 self.status = "no response — input restored".into();
                 self.reveal.reset();
@@ -130,6 +137,7 @@ impl App {
     }
 
     fn fail(&mut self, msg: String) {
+        tracing::error!(error = %msg, "stream failed");
         self.session = None;
         self.reveal.reset();
         self.chat.rollback_last_user();

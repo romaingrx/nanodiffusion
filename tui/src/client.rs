@@ -25,6 +25,11 @@ pub async fn stream_chat(
     tx: mpsc::Sender<ClientEvent>,
 ) -> Result<()> {
     let client = build_client(base_url, req)?;
+    tracing::debug!(
+        url = %format!("{}{}", base_url.trim_end_matches('/'), STREAM_PATH),
+        turns = req.messages.len(),
+        "opening sse stream"
+    );
     let mut stream = Box::pin(client.stream());
 
     loop {
@@ -33,6 +38,7 @@ pub async fn stream_chat(
                 let frame = serde_json::from_str::<StreamFrame>(&ev.data)
                     .context("decode StreamFrame")
                     .inspect_err(|e| {
+                        tracing::error!(error = %e, data = %ev.data, "failed to decode frame");
                         let _ = tx.try_send(ClientEvent::Error(e.to_string()));
                     })?;
                 if tx.send(ClientEvent::Frame(frame)).await.is_err() {
@@ -45,6 +51,7 @@ pub async fn stream_chat(
                 return Ok(());
             }
             Err(e) => {
+                tracing::error!(error = %e, debug = ?e, "sse stream error");
                 let message = e.to_string();
                 let _ = tx.send(ClientEvent::Error(message)).await;
                 return Err(anyhow::Error::msg(e.to_string())).context("sse stream");
