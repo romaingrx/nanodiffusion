@@ -33,6 +33,7 @@ from nanodiffusion.metrics import (
 )
 from nanodiffusion.model import DiffusionModel
 from nanodiffusion.reporter import MetricReporter
+from nanodiffusion.signals import StopRequest, install_stop_handlers, signal_name
 from nanodiffusion.train_step import TrainStepFn
 from nanodiffusion.types import PRNGKeyArray
 
@@ -105,11 +106,35 @@ class LoopState[M: DiffusionModel, C: LoaderCursor]:
 type PrepareBatch[B, JB, C: LoaderCursor] = Callable[[B], tuple[JB, C, StepStats]]
 
 
+def _save_final_checkpoint_if_needed[M: DiffusionModel, C: LoaderCursor](
+    state: LoopState[M, C],
+    *,
+    initial_step: int,
+    save: Callable[[], None],
+) -> None:
+    if state.step > initial_step and state.last_saved_step != state.step:
+        save()
+
+
+def _log_graceful_stop(stop_request: StopRequest, *, step: int, run_dir: Path) -> None:
+    if stop_request.signum is None:
+        return
+    logger.info(
+        "training_stopped_gracefully",
+        signal=signal_name(stop_request.signum),
+        step=step,
+        run_dir=str(run_dir),
+    )
+
+
 def _collect_host_metrics(
     step_metrics: CoreStepMetrics,
     lr_schedule: optax.Schedule,
     step: int,
     tok_per_s: int,
+    steps_in_window: int,
+    nominal_tokens_per_step: int,
+    max_steps: int,
     supervised_tokens_in_window: int,
     elapsed: float,
 ) -> ReportMetrics:
@@ -125,6 +150,10 @@ def _collect_host_metrics(
         lr_schedule=lr_schedule,
         step=step,
         tok_per_s=tok_per_s,
+        steps_per_s=steps_in_window / max(elapsed, 1e-9),
+        step_time_ms=elapsed * 1000.0 / max(steps_in_window, 1),
+        tokens_seen=step * nominal_tokens_per_step,
+        progress_pct=min(100.0, 100.0 * step / max_steps),
     )
     if not math.isfinite(core.loss):
         logger.warning(
@@ -193,21 +222,32 @@ def run_training_loop[M: DiffusionModel, B, JB, C: LoaderCursor](
         logger.info("checkpoint_saved", path=str(ckpt_dir), step=state.step)
 
     t_window_start = time.monotonic()
-    with DevicePrefetchIterator(
-        base_loader,
-        prepare_batch,
-        cpu_prefetch=settings.prefetch_size,
-        device_prefetch=2,
-    ) as loader:
+    with (
+        install_stop_handlers() as stop_request,
+        DevicePrefetchIterator(
+            base_loader,
+            prepare_batch,
+            cpu_prefetch=settings.prefetch_size,
+            device_prefetch=2,
+        ) as loader,
+    ):
         for jax_batch, cursor, stats in loader:
-            if state.step >= settings.max_steps:
+            if state.step >= settings.max_steps or stop_request.requested:
                 break
             state.cursor = cursor
             supervised_tokens_in_window += stats.supervised_tokens
-            state.model, state.ema_model, state.opt_state, step_metrics, state.key = (
-                train_step(
-                    state.model, state.ema_model, state.opt_state, jax_batch, state.key
-                )
+            (
+                state.model,
+                state.ema_model,
+                state.opt_state,
+                step_metrics,
+                state.key,
+            ) = train_step(
+                state.model,
+                state.ema_model,
+                state.opt_state,
+                jax_batch,
+                state.key,
             )
             state.step += 1
 
@@ -244,6 +284,9 @@ def run_training_loop[M: DiffusionModel, B, JB, C: LoaderCursor](
                     lr_schedule,
                     step=state.step,
                     tok_per_s=tok_per_s,
+                    steps_in_window=steps_in_window,
+                    nominal_tokens_per_step=settings.nominal_tokens_per_step,
+                    max_steps=settings.max_steps,
                     supervised_tokens_in_window=supervised_tokens_in_window,
                     elapsed=elapsed,
                 )
@@ -255,5 +298,8 @@ def run_training_loop[M: DiffusionModel, B, JB, C: LoaderCursor](
             if state.step % settings.save_every == 0:
                 _save()
 
-    if state.step > initial_step and state.last_saved_step != state.step:
-        _save()
+            if stop_request.requested:
+                break
+
+    _save_final_checkpoint_if_needed(state, initial_step=initial_step, save=_save)
+    _log_graceful_stop(stop_request, step=state.step, run_dir=run_dir)

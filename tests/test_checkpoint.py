@@ -42,7 +42,9 @@ def test_roundtrip_preserves_model_weights(
     optimizer = optax.adamw(1e-3)
     opt_state = optimizer.init(eqx.filter(model, eqx.is_inexact_array))
 
-    cursor = PretrainCursor(epoch=2, shard_idx=5, row_group_idx=7)
+    cursor = PretrainCursor(
+        epoch=2, shard_idx=5, row_group_idx=7, doc_idx=11, token_offset=13
+    )
     save_checkpoint(
         tmp_path / "ckpt",
         model=model,
@@ -417,9 +419,27 @@ def test_checkpoint_meta_rejects_negative_step() -> None:
         CheckpointMeta(step=-1, cursor=None)
 
 
+def test_checkpoint_meta_rejects_legacy_pretrain_cursor() -> None:
+    """Legacy row-group-only cursors are ambiguous under exact resume semantics."""
+    legacy = {
+        "step": 10,
+        "cursor": {
+            "kind": "pretrain",
+            "epoch": 1,
+            "shard_idx": 2,
+            "row_group_idx": 3,
+        },
+    }
+
+    with pytest.raises(ValueError, match="doc_idx"):
+        CheckpointMeta.model_validate(legacy)
+
+
 def test_checkpoint_meta_json_round_trip() -> None:
     """``model_dump_json`` output parses back into an equal model."""
-    cursor = PretrainCursor(epoch=1, shard_idx=2, row_group_idx=3)
+    cursor = PretrainCursor(
+        epoch=1, shard_idx=2, row_group_idx=3, doc_idx=0, token_offset=0
+    )
     meta = CheckpointMeta(step=10, cursor=cursor)
     blob = meta.model_dump_json()
     assert CheckpointMeta.model_validate_json(blob) == meta
@@ -432,5 +452,7 @@ def test_checkpoint_meta_json_round_trip() -> None:
             "epoch": 1,
             "shard_idx": 2,
             "row_group_idx": 3,
+            "doc_idx": 0,
+            "token_offset": 0,
         },
     }

@@ -333,7 +333,9 @@ def test_prepare_batch_uses_async_device_put(small_config: ModelConfig) -> None:
     batch = BatchOutput(
         tokens=np.zeros((4, small_config.max_seq_len), dtype=np.int32),
         segments=np.zeros((4, small_config.max_seq_len), dtype=np.int32),
-        state=PretrainCursor(epoch=1, shard_idx=0, row_group_idx=0),
+        state=PretrainCursor(
+            epoch=1, shard_idx=0, row_group_idx=0, doc_idx=0, token_offset=0
+        ),
     )
     tokens, cursor, _stats = _prepare_batch(batch, mesh)
     assert isinstance(tokens, jax.Array)

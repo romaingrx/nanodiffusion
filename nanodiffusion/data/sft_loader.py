@@ -4,8 +4,9 @@ Consumes any :class:`ChatSource` and emits ``(batch, seq_len)``
 batches with a parallel boolean ``loss_mask``. Conversations are
 rendered via :func:`nanodiffusion.chat.render_conversation`, right-
 padded with EOS if they fit, or skipped if they don't. Iteration
-order is a seeded per-epoch shuffle so saved :class:`SFTCursor`
-resumes pick up where they left off.
+order is a seeded per-epoch shuffle. Saved :class:`SFTCursor` values
+point at the next permutation position to read, so resume produces the
+same next batch as an uninterrupted run.
 """
 
 import random
@@ -118,15 +119,13 @@ def sft_loader(
 
     eos = tokenizer.eos_token_id
     epoch = resume_state.epoch if resume_state is not None else 1
-    cursor = resume_state.permutation_idx + 1 if resume_state is not None else 0
+    cursor = resume_state.permutation_idx if resume_state is not None else 0
     permutation = _epoch_permutation(seed, epoch, n)
     consecutive_skips = 0
 
     while True:
         rows_tokens: list[np.ndarray] = []
         rows_mask: list[np.ndarray] = []
-        last_idx_in_epoch = cursor - 1
-
         while len(rows_tokens) < batch_size:
             if cursor >= n:
                 epoch += 1
@@ -134,7 +133,6 @@ def sft_loader(
                 cursor = 0
 
             source_idx = permutation[cursor]
-            last_idx_in_epoch = cursor
             cursor += 1
 
             ids, mask = render_conversation(tokenizer, source[source_idx])
@@ -157,5 +155,5 @@ def sft_loader(
         yield SFTBatchOutput(
             tokens=np.stack(rows_tokens),
             loss_mask=np.stack(rows_mask),
-            state=SFTCursor(epoch=epoch, permutation_idx=last_idx_in_epoch),
+            state=SFTCursor(epoch=epoch, permutation_idx=cursor),
         )

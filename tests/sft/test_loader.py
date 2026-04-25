@@ -203,6 +203,7 @@ def test_cursor_roundtrip_through_checkpoint(
     first = next(sft_loader(src, tok, batch_size=2, seq_len=32, seed=9))
     cursor = first.state
     assert isinstance(cursor, SFTCursor)
+    assert cursor.permutation_idx == 2
 
     import jax  # noqa: PLC0415
 

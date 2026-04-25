@@ -31,6 +31,10 @@ class CoreHostMetrics:
     grad_finite: float
     lr: float
     tok_per_s: int
+    steps_per_s: float
+    step_time_ms: float
+    tokens_seen: int
+    progress_pct: float
     num_devices: int
     hbm_used_gb: float | None = None
     hbm_peak_gb: float | None = None
@@ -43,6 +47,10 @@ class CoreHostMetrics:
         lr_schedule: optax.Schedule,
         step: int,
         tok_per_s: int,
+        steps_per_s: float,
+        step_time_ms: float,
+        tokens_seen: int,
+        progress_pct: float,
     ) -> "CoreHostMetrics":
         mem = jax.devices()[0].memory_stats()
         return cls(
@@ -52,6 +60,10 @@ class CoreHostMetrics:
             grad_finite=float(step_metrics.grad_finite),
             lr=float(jnp.asarray(lr_schedule(step)).item()),
             tok_per_s=tok_per_s,
+            steps_per_s=round(steps_per_s, 4),
+            step_time_ms=round(step_time_ms, 2),
+            tokens_seen=tokens_seen,
+            progress_pct=round(progress_pct, 4),
             num_devices=jax.device_count(),
             hbm_used_gb=None if mem is None else round(mem["bytes_in_use"] / 1e9, 2),
             hbm_peak_gb=(
@@ -67,6 +79,10 @@ class CoreHostMetrics:
             "grad_finite": self.grad_finite,
             "lr": self.lr,
             "tok_per_s": self.tok_per_s,
+            "steps_per_s": self.steps_per_s,
+            "step_time_ms": self.step_time_ms,
+            "tokens_seen": self.tokens_seen,
+            "progress_pct": self.progress_pct,
             "num_devices": self.num_devices,
         }
         if self.hbm_used_gb is not None:

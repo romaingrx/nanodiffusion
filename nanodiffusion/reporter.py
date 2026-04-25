@@ -25,7 +25,7 @@ from multiprocessing.context import (
 from multiprocessing.queues import Queue as MPQueue
 from pathlib import Path
 from types import TracebackType
-from typing import Any, Protocol, runtime_checkable
+from typing import Any, Literal, Protocol, runtime_checkable
 
 import structlog
 
@@ -35,6 +35,7 @@ logger = structlog.get_logger(__name__)
 type MetricValue = float | int | str
 type Metrics = Mapping[str, MetricValue]
 type SinkFactory = Callable[[], "MetricSink"]
+type WandbResumeMode = bool | Literal["allow", "never", "must", "auto"] | None
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -127,9 +128,11 @@ class WandbSink:
         self,
         *,
         project: str,
+        run_id: str,
         run_name: str | None,
         config: Mapping[str, Any],
         entity: str | None = None,
+        resume: WandbResumeMode = "allow",
     ) -> None:
         import wandb  # noqa: PLC0415
 
@@ -137,8 +140,10 @@ class WandbSink:
         self._run = wandb.init(
             project=project,
             entity=entity,
+            id=run_id,
             name=run_name,
             config=dict(config),
+            resume=resume,
             reinit=True,
         )
 
@@ -176,13 +181,16 @@ def default_sinks(
         partial(JsonlSink, run_dir / "metrics.jsonl"),
     ]
     if wandb_project is not None:
+        wandb_run_id = run_dir.name
         factories.append(
             partial(
                 WandbSink,
                 project=wandb_project,
                 entity=wandb_entity,
+                run_id=wandb_run_id,
                 run_name=run_dir.name,
-                config=dict(wandb_config),
+                config=dict(wandb_config)
+                | {"run_dir": str(run_dir), "wandb_run_id": wandb_run_id},
             )
         )
     return factories
@@ -194,8 +202,10 @@ class Reporter(AbstractContextManager["Reporter"]):
     The training process only calls :meth:`log` which does a
     non-blocking ``put_nowait`` on a bounded queue; a spawned worker
     drains the queue and forwards each event to every configured sink.
-    On queue saturation the event is dropped and a warning is emitted;
-    the training loop must never block on I/O.
+    Sink startup is acknowledged before training begins so a requested
+    wandb run cannot fail silently. After startup, queue saturation
+    drops the event and emits a warning; the training loop must never
+    block on per-step I/O.
 
     ``spawn`` is used because ``fork`` is unsafe once JAX/XLA has
     initialised its device backends. The cost is a one-time ~1s worker
@@ -208,22 +218,40 @@ class Reporter(AbstractContextManager["Reporter"]):
         *,
         max_queue: int = 1024,
         join_timeout: float = 30.0,
+        startup_timeout: float = 60.0,
     ) -> None:
         self._factories = tuple(sink_factories)
         self._max_queue = max_queue
         self._join_timeout = join_timeout
+        self._startup_timeout = startup_timeout
         self._ctx = mp.get_context("spawn")
         self._queue: MPQueue[MetricEvent | None] | None = None
         self._proc: SpawnProcess | None = None
 
     def __enter__(self) -> "Reporter":  # noqa: PYI034  beartype can't handle PEP 673 Self
         self._queue = self._ctx.Queue(maxsize=self._max_queue)
+        init_queue: MPQueue[str | None] = self._ctx.Queue(maxsize=1)
         self._proc = self._ctx.Process(
             target=_worker_main,
-            args=(self._factories, self._queue),
+            args=(self._factories, self._queue, init_queue),
             daemon=True,
         )
         self._proc.start()
+        try:
+            init_error = init_queue.get(timeout=self._startup_timeout)
+        except queue.Empty as exc:
+            self._proc.terminate()
+            self._proc.join(timeout=5.0)
+            self._queue = None
+            self._proc = None
+            msg = "metric reporter worker did not finish sink startup"
+            raise RuntimeError(msg) from exc
+        if init_error is not None:
+            self._proc.join(timeout=5.0)
+            self._queue = None
+            self._proc = None
+            msg = f"metric reporter worker failed to initialize sinks: {init_error}"
+            raise RuntimeError(msg)
         return self
 
     def __exit__(
@@ -299,22 +327,46 @@ class InlineReporter(AbstractContextManager["InlineReporter"]):
         self._sinks = []
 
 
-def _worker_main(
-    factories: Sequence[SinkFactory],
-    q: MPQueue[MetricEvent | None],
-) -> None:
-    """Worker entry: construct sinks, drain the queue, close on sentinel.
+def _close_sinks(sinks: Sequence[MetricSink]) -> None:
+    for sink in sinks:
+        try:
+            sink.close()
+        except Exception:
+            logger.exception("sink_close_failed", sink=type(sink).__name__)
 
-    Sink failures are logged and swallowed so one broken sink cannot
-    kill the worker and silently stop metric forwarding for the other
-    sinks.
-    """
+
+def _build_sinks(
+    factories: Sequence[SinkFactory],
+) -> tuple[list[MetricSink], str | None]:
     sinks: list[MetricSink] = []
+    init_errors: list[str] = []
     for f in factories:
         try:
             sinks.append(f())
-        except Exception:
+        except Exception as exc:
             logger.exception("sink_init_failed")
+            init_errors.append(f"{type(exc).__name__}: {exc}")
+    return sinks, "; ".join(init_errors) if init_errors else None
+
+
+def _worker_main(
+    factories: Sequence[SinkFactory],
+    q: MPQueue[MetricEvent | None],
+    init_queue: MPQueue[str | None],
+) -> None:
+    """Worker entry: construct sinks, drain the queue, close on sentinel.
+
+    Startup failures are reported to the parent so the training run can
+    fail before spending accelerator time untracked. Per-event sink
+    failures are logged and swallowed so one transient backend issue
+    cannot stop metric forwarding to the other sinks.
+    """
+    sinks, init_error = _build_sinks(factories)
+    if init_error is not None:
+        init_queue.put(init_error)
+        _close_sinks(sinks)
+        return
+    init_queue.put(None)
     try:
         while True:
             event = q.get()
@@ -326,8 +378,4 @@ def _worker_main(
                 except Exception:
                     logger.exception("sink_log_failed", sink=type(sink).__name__)
     finally:
-        for sink in sinks:
-            try:
-                sink.close()
-            except Exception:
-                logger.exception("sink_close_failed", sink=type(sink).__name__)
+        _close_sinks(sinks)

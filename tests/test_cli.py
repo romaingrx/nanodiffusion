@@ -518,7 +518,9 @@ def test_pretrain_resume_continues_step_and_reuses_run_dir(
 
     # Both step_2 (from the first run) and step_4 (from the resume) coexist.
     ckpt_dirs = {
-        p.name for p in single_run.iterdir() if p.is_dir() and not p.is_symlink()
+        p.name
+        for p in single_run.iterdir()
+        if p.is_dir() and not p.is_symlink() and p.name.startswith("step_")
     }
     assert ckpt_dirs == {"step_2", "step_4"}, ckpt_dirs
 

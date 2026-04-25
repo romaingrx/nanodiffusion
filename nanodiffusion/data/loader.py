@@ -48,6 +48,30 @@ class BatchOutput:
         )
 
 
+@dataclass(frozen=True, slots=True)
+class _TokenSpan:
+    tokens: np.ndarray
+    start: PretrainCursor
+    total_doc_tokens: int
+    segment_id: int
+
+    def cursor_after(self, consumed: int) -> PretrainCursor:
+        token_offset = self.start.token_offset + consumed
+        if token_offset < self.total_doc_tokens:
+            return self.start.model_copy(update={"token_offset": token_offset})
+        return self.start.model_copy(
+            update={"doc_idx": self.start.doc_idx + 1, "token_offset": 0}
+        )
+
+    def tail(self, consumed: int) -> "_TokenSpan":
+        return _TokenSpan(
+            tokens=self.tokens[consumed:],
+            start=self.cursor_after(consumed),
+            total_doc_tokens=self.total_doc_tokens,
+            segment_id=self.segment_id,
+        )
+
+
 class _ChunkBuffer:
     """Mutable token + segment-id buffer used by :func:`pretrain_loader`.
 
@@ -58,8 +82,7 @@ class _ChunkBuffer:
     """
 
     def __init__(self) -> None:
-        self._tokens: list[np.ndarray] = []
-        self._segments: list[np.ndarray] = []
+        self._spans: deque[_TokenSpan] = deque()
         self._size = 0
         self._next_doc_id = 0
 
@@ -67,36 +90,52 @@ class _ChunkBuffer:
     def size(self) -> int:
         return self._size
 
-    def append_doc(self, doc_tokens: list[int], eos: int) -> None:
-        n = len(doc_tokens) + 1  # +1 for trailing EOS separator
-        tok = np.empty(n, dtype=np.int32)
+    def append_doc(
+        self, doc_tokens: list[int], eos: int, cursor: PretrainCursor
+    ) -> bool:
+        total = len(doc_tokens) + 1
+        if cursor.token_offset >= total:
+            return False
+        tok = np.empty(total, dtype=np.int32)
         tok[:-1] = doc_tokens
         tok[-1] = eos
-        self._tokens.append(tok)
-        self._segments.append(np.full(n, self._next_doc_id, dtype=np.int32))
-        self._size += n
+        remaining = tok[cursor.token_offset :]
+        self._spans.append(
+            _TokenSpan(
+                tokens=remaining,
+                start=cursor,
+                total_doc_tokens=total,
+                segment_id=self._next_doc_id,
+            )
+        )
+        self._size += remaining.size
         self._next_doc_id += 1
+        return True
 
-    def drain(self, chunk_size: int) -> tuple[np.ndarray, np.ndarray]:
+    def drain(self, chunk_size: int) -> tuple[np.ndarray, np.ndarray, PretrainCursor]:
         """Cut off ``chunk_size`` tokens. Caller must ensure size >= chunk_size."""
-        all_tokens = np.concatenate(self._tokens)
-        all_segments = np.concatenate(self._segments)
-        chunk_tokens = all_tokens[:chunk_size]
-        chunk_segments = all_segments[:chunk_size]
-        tail_tokens = all_tokens[chunk_size:]
-        tail_segments = all_segments[chunk_size:]
-        if tail_tokens.size:
-            self._tokens = [tail_tokens]
-            self._segments = [tail_segments]
-            self._size = tail_tokens.size
-        else:
-            # Buffer is empty: no live segment ids reference the counter,
-            # so it's safe to reset and keep numbering small.
-            self._tokens = []
-            self._segments = []
-            self._size = 0
+        remaining = chunk_size
+        token_parts: list[np.ndarray] = []
+        segment_parts: list[np.ndarray] = []
+        next_cursor: PretrainCursor | None = None
+
+        while remaining > 0:
+            span = self._spans.popleft()
+            take = min(remaining, span.tokens.size)
+            token_parts.append(span.tokens[:take])
+            segment_parts.append(np.full(take, span.segment_id, dtype=np.int32))
+            next_cursor = span.cursor_after(take)
+            self._size -= take
+            remaining -= take
+            if take < span.tokens.size:
+                self._spans.appendleft(span.tail(take))
+
+        if self._size == 0:
             self._next_doc_id = 0
-        return chunk_tokens, chunk_segments
+        if next_cursor is None:
+            msg = "cannot drain an empty chunk buffer"
+            raise RuntimeError(msg)
+        return np.concatenate(token_parts), np.concatenate(segment_parts), next_cursor
 
 
 def pretrain_loader(
@@ -120,10 +159,11 @@ def pretrain_loader(
     ``segments`` array is renumbered per row so the first segment of every
     row is 0.
 
-    ``resume_state`` is forwarded to ``source.iter_documents`` to fast-forward
-    past already processed data; ``max_empty_passes`` guards against the
-    silent infinite loop that would occur if the tokenizer returned empty for
-    every input doc (e.g. wrong special-token config).
+    Each yielded ``state`` is the exact cursor for the next token after
+    the emitted batch, so checkpoint ``step_N`` resumes at precisely the
+    first token for batch ``N + 1``. ``max_empty_passes`` guards against
+    the silent infinite loop that would occur if the tokenizer returned
+    empty for every input doc (e.g. wrong special-token config).
     """
     if batch_size <= 0 or seq_len <= 0:
         msg = f"batch_size and seq_len must be positive, got {batch_size}, {seq_len}"
@@ -133,12 +173,6 @@ def pretrain_loader(
     chunk_size = batch_size * seq_len
     buffer = _ChunkBuffer()
     empty_passes = 0
-    # Sentinel state; the first source pull always overwrites this before
-    # any yield since chunk_size > 0.
-    last_state: PretrainCursor = resume_state or PretrainCursor(
-        epoch=1, shard_idx=0, row_group_idx=0
-    )
-
     docs_iter = source.iter_documents(
         split,
         start=start,
@@ -160,14 +194,19 @@ def pretrain_loader(
                         chunk_size=chunk_size,
                     )
                 return
-            last_state = position
             encoded = tokenizer.encode_batch(doc_batch)
             produced = False
-            for doc_tokens in encoded:
+            for local_idx, doc_tokens in enumerate(encoded):
                 if not doc_tokens:
                     continue
-                produced = True
-                buffer.append_doc(doc_tokens, eos)
+                doc_cursor = position.cursor_for_batch_doc(local_idx)
+                token_offset = (
+                    0
+                    if resume_state is None
+                    else resume_state.token_offset_for(doc_cursor)
+                )
+                cursor = doc_cursor.with_token_offset(token_offset)
+                produced = buffer.append_doc(doc_tokens, eos, cursor) or produced
             if produced:
                 empty_passes = 0
             else:
@@ -180,7 +219,7 @@ def pretrain_loader(
                     )
                     raise RuntimeError(msg)
 
-        chunk_tokens, chunk_segments = buffer.drain(chunk_size)
+        chunk_tokens, chunk_segments, next_cursor = buffer.drain(chunk_size)
         tokens_chunk = chunk_tokens.reshape(batch_size, seq_len)
         segments_chunk = chunk_segments.reshape(batch_size, seq_len)
         # Tokens within a row are written in document order, so the per-row
@@ -191,7 +230,7 @@ def pretrain_loader(
         yield BatchOutput(
             tokens=tokens_chunk,
             segments=segments_chunk,
-            state=last_state,
+            state=next_cursor,
         )
 
 
