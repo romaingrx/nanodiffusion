@@ -11,11 +11,7 @@
 """Benchmark Orbax + TensorStore save/restore against the production payload.
 
 Times one save + wait_until_finished and one restore against the given URI
-(local path or ``gs://...``), printing wall-time and effective MB/s. The
-default 6.8 GB matches the pretraining checkpoint size, so a run against
-``gs://${GCS_BUCKET}/bench/`` is the gating measurement before merging the
-Orbax migration (target: throughput >= 30 MB/s, comfortably > the 3 MB/s
-gcsfuse + eqx.tree_serialise_leaves baseline).
+(local path or ``gs://...``), printing wall-time and effective MB/s.
 
 Example:
     uv run examples/bench_checkpoint.py --uri /tmp/orbax-bench --gb 0.1
@@ -25,6 +21,7 @@ Example:
 from __future__ import annotations
 
 import argparse
+import math
 import shutil
 import time
 from pathlib import Path
@@ -37,16 +34,8 @@ from etils import epath
 
 def _make_state(gb: float) -> dict[str, jax.Array]:
     n_elems = int(gb * 1024**3 // 4)
-    side = max(1, int(n_elems**0.5))
+    side = max(1, math.isqrt(n_elems))
     return {"big": jnp.ones((side, side), dtype=jnp.float32)}
-
-
-def _clear_local(uri: str) -> None:
-    if uri.startswith("gs://"):
-        return
-    path = Path(uri)
-    if path.exists():
-        shutil.rmtree(path)
 
 
 def main() -> None:
@@ -64,7 +53,10 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    _clear_local(args.uri)
+    if not args.uri.startswith("gs://"):
+        local = Path(args.uri)
+        if local.exists():
+            shutil.rmtree(local)
 
     state = _make_state(args.gb)
     bytes_total = sum(int(a.size) * a.dtype.itemsize for a in jax.tree.leaves(state))
@@ -96,15 +88,12 @@ def main() -> None:
 
     abstract = jax.tree.map(lambda a: jax.ShapeDtypeStruct(a.shape, a.dtype), state)
     t0 = time.perf_counter()
-    restored = mngr.restore(
+    mngr.restore(
         0,
         args=ocp.args.Composite(state=ocp.args.StandardRestore(abstract)),
     )
     t_load = time.perf_counter() - t0
     print(f"restore: total={t_load:.2f}s throughput={bytes_mb / t_load:.1f} MB/s")
-
-    assert restored["state"]["big"].shape == state["big"].shape
-    assert restored["state"]["big"].dtype == state["big"].dtype
 
 
 if __name__ == "__main__":

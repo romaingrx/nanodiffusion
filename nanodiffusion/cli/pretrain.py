@@ -26,8 +26,8 @@ import click
     default=None,
     help=(
         "Run directory to resume from (e.g. runs/pretrain/<id>). The "
-        "latest finalised step is selected automatically by the Orbax "
-        "checkpoint manager — no step subdir is needed."
+        "Orbax checkpoint manager picks the latest finalised step from "
+        "the run dir; no step subdir is needed."
     ),
 )
 @click.option(

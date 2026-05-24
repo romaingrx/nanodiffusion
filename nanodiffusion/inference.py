@@ -49,12 +49,7 @@ def load_runtime(
     *,
     overrides: SampleConfigOverride | None = None,
 ) -> Runtime:
-    """Read config + EMA weights + meta from a run directory.
-
-    ``checkpoint`` is a *run* directory (the one that holds
-    ``config.yaml`` at its root and Orbax-managed ``step_N/`` children);
-    the Orbax manager opens it and serves the latest finalised step.
-    """
+    """Read config + EMA weights + meta from a run directory."""
     overrides = overrides if overrides is not None else SampleConfigOverride()
     sidecar = checkpoint / CONFIG_SIDECAR_FILENAME
     if not sidecar.exists():

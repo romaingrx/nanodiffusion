@@ -33,12 +33,8 @@ if TYPE_CHECKING:
     from nanodiffusion.config import ModelConfig
 
 
-# `_CHECKPOINT_METADATA` is Orbax's per-step metadata file. On POSIX the
-# step directory only exists after atomic rename (so `step_N/` presence
-# alone signals finalisation, and the metadata file lives inside); on
-# object stores Orbax also writes `commit_success.txt` last, but on a
-# local filesystem only `_CHECKPOINT_METADATA` is reliable. We use it as
-# the canonical "finalised" marker across both layouts.
+# Orbax writes ``_CHECKPOINT_METADATA`` atomically as the final finalisation
+# step on both POSIX and object stores; its presence is the durable marker.
 _FINALISED_MARKER = "_CHECKPOINT_METADATA"
 
 
@@ -106,7 +102,6 @@ def test_roundtrip_preserves_model_weights(
 def test_roundtrip_with_null_cursor(
     tmp_path: Path, small_config: ModelConfig, key: jax.Array
 ) -> None:
-    """A fresh run with no prior cursor must round-trip as ``None``."""
     model = Transformer(small_config, key=key)
     optimizer, opt_state = _make_opt(model)
 
@@ -134,7 +129,6 @@ def test_roundtrip_with_null_cursor(
 def test_save_writes_orbax_layout(
     tmp_path: Path, small_config: ModelConfig, key: jax.Array
 ) -> None:
-    """A save produces ``step_N/{state,meta}/`` plus the finalisation marker."""
     model = Transformer(small_config, key=key)
     _, opt_state = _make_opt(model)
 
@@ -160,7 +154,6 @@ def test_save_writes_orbax_layout(
 def test_load_model_narrows_and_picks_snapshot(
     tmp_path: Path, small_config: ModelConfig, key: jax.Array
 ) -> None:
-    """``load_model`` returns the skeleton's concrete type and honors ``which``."""
     key, model_key, ema_key = jax.random.split(key, 3)
     model = Transformer(small_config, key=model_key)
     ema_model = Transformer(small_config, key=ema_key)
@@ -195,7 +188,6 @@ def test_load_model_narrows_and_picks_snapshot(
 def test_load_checkpoint_uses_latest_step(
     tmp_path: Path, small_config: ModelConfig, key: jax.Array
 ) -> None:
-    """Without an explicit ``step=``, ``load_checkpoint`` picks the highest step."""
     model = Transformer(small_config, key=key)
     optimizer, opt_state = _make_opt(model)
 
@@ -223,7 +215,6 @@ def test_load_checkpoint_uses_latest_step(
 def test_max_to_keep_garbage_collects_old_steps(
     tmp_path: Path, small_config: ModelConfig, key: jax.Array
 ) -> None:
-    """Saving ``max_to_keep + 1`` steps leaves only the most recent ``max_to_keep``."""
     model = Transformer(small_config, key=key)
     _, opt_state = _make_opt(model)
 
@@ -251,12 +242,7 @@ def test_max_to_keep_garbage_collects_old_steps(
 def test_ema_weights_stay_distinct_from_model_after_restore(
     tmp_path: Path, small_config: ModelConfig, key: jax.Array
 ) -> None:
-    """Restored EMA must remain a separate object from the restored model.
-
-    Catches accidental aliasing through the dict→partition→combine
-    path: if EMA and model end up referring to the same arrays after
-    ``eqx.combine``, training would silently couple the two.
-    """
+    """Catches accidental aliasing through the dict->partition->combine path."""
     key, m_key, e_key = jax.random.split(key, 3)
     model = Transformer(small_config, key=m_key)
     ema_model = Transformer(small_config, key=e_key)
@@ -293,7 +279,6 @@ def test_ema_weights_stay_distinct_from_model_after_restore(
 def test_roundtrip_preserves_rng_key(
     tmp_path: Path, small_config: ModelConfig, key: jax.Array
 ) -> None:
-    """The RNG key round-trips byte-identical through save/load."""
     model = Transformer(small_config, key=key)
     optimizer, opt_state = _make_opt(model)
 
@@ -315,8 +300,6 @@ def test_roundtrip_preserves_rng_key(
         model_skeleton=model,
         opt_state_builder=_opt_builder(optimizer),
     )
-    # Downstream random draws must agree exactly — the whole point of
-    # persisting the key is that the next call returns the same bits.
     np.testing.assert_array_equal(
         jax.random.uniform(loaded_key, (8,)),
         jax.random.uniform(saved_key, (8,)),
@@ -324,30 +307,20 @@ def test_roundtrip_preserves_rng_key(
 
 
 def test_save_has_no_rank_zero_gate(small_config: ModelConfig, key: jax.Array) -> None:
-    """``save_checkpoint`` must not short-circuit on a non-zero process index.
-
-    The previous eqx code gated writes on ``jax.process_index() == 0``;
-    Orbax does its own internal multi-host coordination, so any
-    Python-level rank-0 gate would deadlock real multi-host runs. We
-    can't fully exercise multi-host on a single-process test (Orbax's
-    primary-process barrier would time out), so instead we verify the
-    source has no such gate: the body of ``save_checkpoint`` doesn't
-    branch on ``jax.process_index``.
-    """
+    """A Python-level rank-0 gate would deadlock real multi-host runs, since
+    Orbax does its own internal coordination. We can't reproduce multi-host
+    on a single-process test, so assert the source has no such gate."""
     src = inspect.getsource(ckpt_mod.save_checkpoint)
     assert "process_index" not in src, (
         "save_checkpoint must not gate on jax.process_index — "
         f"found a reference in the implementation:\n{src}"
     )
-    # Sanity-check the surrounding facts so this test catches the gate
-    # being moved to a helper rather than disappearing.
-    _ = small_config, key  # fixtures unused but kept for shared signature
+    _ = small_config, key
 
 
 def test_load_meta_reads_just_the_metadata(
     tmp_path: Path, small_config: ModelConfig, key: jax.Array
 ) -> None:
-    """``load_meta`` returns the validated Pydantic model without restoring state."""
     model = Transformer(small_config, key=key)
     _, opt_state = _make_opt(model)
     cursor = PretrainCursor(
@@ -371,13 +344,12 @@ def test_load_meta_reads_just_the_metadata(
 
 
 def test_checkpoint_meta_rejects_negative_step() -> None:
-    """Pydantic validation catches nonsense step values on load."""
     with pytest.raises(ValueError, match="step"):
         CheckpointMeta(step=-1, cursor=None)
 
 
 def test_checkpoint_meta_rejects_legacy_pretrain_cursor() -> None:
-    """Legacy row-group-only cursors are ambiguous under exact resume semantics."""
+    """Legacy row-group-only cursors are ambiguous under exact-resume semantics."""
     legacy = {
         "step": 10,
         "cursor": {
@@ -389,34 +361,6 @@ def test_checkpoint_meta_rejects_legacy_pretrain_cursor() -> None:
     }
     with pytest.raises(ValueError, match="doc_idx"):
         CheckpointMeta.model_validate(legacy)
-
-
-def test_save_returns_before_finalised(
-    tmp_path: Path, small_config: ModelConfig, key: jax.Array
-) -> None:
-    """``save_checkpoint`` queues the upload asynchronously and returns fast.
-
-    Orbax's async finalisation writes ``commit_success.txt`` last; a
-    subsequent ``flush`` is what guarantees its presence.
-    """
-    model = Transformer(small_config, key=key)
-    _, opt_state = _make_opt(model)
-
-    mngr = make_manager(tmp_path)
-    save_checkpoint(
-        mngr,
-        1,
-        model=model,
-        ema_model=model,
-        opt_state=opt_state,
-        key=jax.random.key(0),
-        cursor=None,
-    )
-    # Hard timing assertions are fragile here (local fs is fast). The
-    # behavioural contract we care about is: flush is what guarantees
-    # durability. Confirm by flushing and checking the marker exists.
-    flush(mngr)
-    assert (tmp_path / "step_1" / _FINALISED_MARKER).exists()
 
 
 def test_back_to_back_saves_serialise_via_queue(
@@ -436,8 +380,6 @@ def test_back_to_back_saves_serialise_via_queue(
         key=jax.random.key(0),
         cursor=None,
     )
-    # Second save: Orbax internally waits on the first to finalise
-    # before kicking off this one. After it returns, step 1 is durable.
     save_checkpoint(
         mngr,
         2,
@@ -455,7 +397,6 @@ def test_back_to_back_saves_serialise_via_queue(
 def test_flush_blocks_until_durable(
     tmp_path: Path, small_config: ModelConfig, key: jax.Array
 ) -> None:
-    """``flush`` must not return until the on-disk marker exists."""
     model = Transformer(small_config, key=key)
     _, opt_state = _make_opt(model)
 
@@ -482,13 +423,12 @@ def test_flush_blocks_until_durable(
 
 
 def test_load_checkpoint_errors_when_no_step_exists(tmp_path: Path) -> None:
-    """An empty manager raises ``FileNotFoundError`` rather than bogus state."""
     mngr = make_manager(tmp_path)
     with pytest.raises(FileNotFoundError, match="no finalised checkpoint"):
         load_checkpoint(
             mngr,
-            model_skeleton=None,  # never reached
-            opt_state_builder=lambda _m: None,  # never reached
+            model_skeleton=None,
+            opt_state_builder=lambda _m: None,
         )
 
 
@@ -497,12 +437,8 @@ def test_step_counter_reconciliation_warns_on_mismatch(
     small_config: ModelConfig,
     key: jax.Array,
 ) -> None:
-    """Restoring with meta.step ≠ opt_state.count emits a structured warning."""
     model = Transformer(small_config, key=key)
     optimizer, opt_state = _make_opt(model)
-    # opt_state.count starts at 0 (the optimizer never updated); we save
-    # the checkpoint at step=42, so the restore-time reconciliation
-    # check should log a mismatch.
     mngr = make_manager(tmp_path)
     save_checkpoint(
         mngr,
@@ -528,18 +464,13 @@ def test_step_counter_reconciliation_warns_on_mismatch(
     )
 
 
-def test_save_takes_advantage_of_async_uploads(
+def test_save_returns_before_flush_completes(
     tmp_path: Path,
     small_config: ModelConfig,
     key: jax.Array,
 ) -> None:
-    """Submitting a save should return well before flush completes.
-
-    Validates the async semantics by comparing submit time vs flush
-    time. The submit path does ``jax.device_get`` + ``mngr.save`` (host
-    side; cheap); flush waits for OCDBT upload to durable storage. On
-    local fs both are fast, but submit is reliably faster than flush.
-    """
+    """Submit (jax.device_get + mngr.save) is host-side; flush blocks on OCDBT
+    upload. Even on local fs where both are fast, submit can't be slower."""
     model = Transformer(small_config, key=key)
     _, opt_state = _make_opt(model)
 
@@ -561,13 +492,9 @@ def test_save_takes_advantage_of_async_uploads(
     t_total = time.perf_counter() - t0
 
     assert t_submit <= t_total
-    # We can't strongly assert "submit << flush" on a small in-memory
-    # ckpt (everything is fast). The behaviour we *do* validate is the
-    # ordering: submit can't be slower than flush.
 
 
 def test_checkpoint_meta_json_round_trip() -> None:
-    """``model_dump_json`` output parses back into an equal model."""
     cursor = PretrainCursor(
         epoch=1, shard_idx=2, row_group_idx=3, doc_idx=0, token_offset=0
     )

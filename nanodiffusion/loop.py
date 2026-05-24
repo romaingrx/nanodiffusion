@@ -1,13 +1,4 @@
-"""Shared training loop driving pretrain and SFT.
-
-Paradigm-specific differences (batch pytree shape and optional host-side
-extras) are threaded through a :class:`PrepareBatch` callback and the
-typed metrics returned by :data:`TrainStepFn`, so
-:func:`run_training_loop` owns the timing/saving/metric-forwarding
-logic once. The loop never imports wandb or any other metric backend;
-it calls into a :class:`~nanodiffusion.reporter.MetricReporter` which
-fans out to whatever sinks the caller configured.
-"""
+"""Shared training loop driving pretrain and SFT."""
 
 import dataclasses
 import datetime
@@ -20,6 +11,7 @@ from pathlib import Path
 import equinox as eqx
 import jax
 import optax
+import orbax.checkpoint as ocp
 import structlog
 
 from nanodiffusion.checkpoint import (
@@ -47,17 +39,10 @@ logger = structlog.get_logger(__name__)
 
 
 def make_run_id() -> str:
-    """UTC timestamp run id, e.g. ``20260408-193015``."""
     return datetime.datetime.now(tz=datetime.UTC).strftime("%Y%m%d-%H%M%S")
 
 
 def resolve_run_dir(run_dir_root: Path, *, resume_from: Path | None) -> Path:
-    """Fresh timestamped run dir, or reuse ``resume_from`` on resume.
-
-    With the Orbax migration ``--resume-from`` points at the run dir
-    itself (the manager finds the latest step internally), so the
-    returned path is just the resolved input on resume.
-    """
     if resume_from is not None:
         run_dir = resume_from.resolve()
     else:
@@ -68,20 +53,11 @@ def resolve_run_dir(run_dir_root: Path, *, resume_from: Path | None) -> Path:
 
 @dataclasses.dataclass(frozen=True, slots=True)
 class StepStats:
-    """Per-step metrics returned by the batch-prepare hook.
-
-    ``supervised_tokens`` is non-zero only for SFT; pretrain leaves it
-    at 0 and the loop omits the derived ``supervised_tok_per_s`` field
-    from its log output in that case.
-    """
-
     supervised_tokens: int = 0
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
 class LoopHyperparams:
-    """Paradigm-independent knobs that drive :func:`run_training_loop`."""
-
     max_steps: int
     log_every: int
     save_every: int
@@ -93,13 +69,6 @@ class LoopHyperparams:
 
 @dataclasses.dataclass
 class LoopState[M: DiffusionModel, C: LoaderCursor]:
-    """Mutable per-iteration state threaded through the loop body.
-
-    Plain Python — not a JAX pytree — so the loop can update
-    ``step`` / ``cursor`` / ``last_saved_step`` with normal
-    assignment between JIT'd train-step calls.
-    """
-
     model: M
     ema_model: M
     opt_state: optax.OptState
@@ -127,17 +96,13 @@ def _save_final_checkpoint_if_needed[M: DiffusionModel, C: LoaderCursor](
 def _save_with_logging[M: DiffusionModel, C: LoaderCursor](
     state: LoopState[M, C],
     *,
-    mngr: object,
+    mngr: ocp.CheckpointManager,
     ckpt_uri: str,
 ) -> None:
-    """Submit a save, log submit/finalize events, time the upload."""
-    state_tree = {
-        "model": state.model,
-        "ema": state.ema_model,
-        "opt": state.opt_state,
-        "key": state.key,
-    }
-    arrays, _static = eqx.partition(state_tree, eqx.is_array)
+    arrays = eqx.filter(
+        (state.model, state.ema_model, state.opt_state, state.key),
+        eqx.is_array,
+    )
     bytes_est = sum(int(a.size) * a.dtype.itemsize for a in jax.tree.leaves(arrays))
     save_step = state.step
     t0 = time.perf_counter()
@@ -148,7 +113,7 @@ def _save_with_logging[M: DiffusionModel, C: LoaderCursor](
         uri=ckpt_uri,
     )
     save_checkpoint(
-        mngr,  # type: ignore[arg-type]
+        mngr,
         save_step,
         model=state.model,
         ema_model=state.ema_model,
@@ -160,7 +125,7 @@ def _save_with_logging[M: DiffusionModel, C: LoaderCursor](
 
     def _await_and_log() -> None:
         try:
-            mngr.wait_until_finished()  # type: ignore[attr-defined]
+            mngr.wait_until_finished()
         except Exception as exc:  # noqa: BLE001
             logger.warning("checkpoint_save_failed", step=save_step, error=str(exc))
             return
@@ -202,13 +167,6 @@ def _collect_host_metrics(
     supervised_tokens_in_window: int,
     elapsed: float,
 ) -> ReportMetrics:
-    """Merge device-side step metrics with host-side throughput + HBM.
-
-    Non-finite losses no longer raise. The JIT'd train step skips the
-    model update on non-finite gradients (see
-    :func:`nanodiffusion.optimizer.apply_or_skip`), so training can
-    recover from transient spikes while still surfacing a warning.
-    """
     core = CoreHostMetrics.from_step_metrics(
         step_metrics,
         lr_schedule=lr_schedule,
@@ -250,19 +208,9 @@ def run_training_loop[M: DiffusionModel, B, JB, C: LoaderCursor](
 ) -> None:
     """Drive the training loop in place.
 
-    Deliberately not JIT'd: mutates ``state`` via Python assignment
-    between JIT'd train-step calls so prefetch, logging, and
-    checkpointing interleave with device work. The throughput window is
-    reset once after the first post-compile step so JIT compile latency
-    is excluded from the first ``tok_per_s`` report; the end-of-training
-    save is skipped when a periodic save already landed on the terminal
-    step.
-
-    Device placement (replicate / shard) is the caller's responsibility:
-    the ``state`` pytrees should already be placed on the target devices,
-    and ``prepare_batch`` should shard the batch before returning it.
-    This keeps the loop device-agnostic and avoids importing the
-    sharding module here.
+    Device placement is the caller's responsibility: ``state`` pytrees
+    must already be on-device and ``prepare_batch`` must shard the batch
+    before returning it.
     """
     initial_step = state.step
     last_log_step = state.step
