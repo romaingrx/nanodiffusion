@@ -1,8 +1,12 @@
 """Tests for the async metrics reporter and its sinks."""
 
 import json
+import sys
 from functools import partial
 from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
 
 from nanodiffusion.reporter import (
     InlineReporter,
@@ -11,6 +15,7 @@ from nanodiffusion.reporter import (
     MetricSink,
     Reporter,
     StructlogSink,
+    WandbSink,
 )
 
 
@@ -22,6 +27,18 @@ class _MemorySink:
 
     def log(self, event: MetricEvent) -> None:
         self._records.append(event)
+
+    def close(self) -> None:
+        pass
+
+
+class _BadInitSink:
+    def __init__(self) -> None:
+        msg = "init failed"
+        raise RuntimeError(msg)
+
+    def log(self, event: MetricEvent) -> None:
+        pass
 
     def close(self) -> None:
         pass
@@ -119,6 +136,51 @@ def test_reporter_async_worker_forwards_events_to_jsonl(tmp_path: Path) -> None:
     assert rows[0]["step"] == 1
     assert rows[0]["loss"] == 1.5
     assert rows[1]["grad_norm"] == 0.3
+
+
+def test_reporter_fails_fast_when_sink_startup_fails() -> None:
+    with (
+        pytest.raises(RuntimeError, match="init failed"),
+        Reporter([_BadInitSink], startup_timeout=15.0),
+    ):
+        pass
+
+
+def test_wandb_sink_uses_stable_id_and_resume(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    init_calls: list[dict[str, object]] = []
+    log_calls: list[tuple[dict[str, object], int | None]] = []
+    finished: list[bool] = []
+
+    class _FakeRun:
+        def finish(self) -> None:
+            finished.append(True)
+
+    def init(**kwargs: object) -> _FakeRun:
+        init_calls.append(dict(kwargs))
+        return _FakeRun()
+
+    def log(payload: dict[str, object], *, step: int | None = None) -> None:
+        log_calls.append((payload, step))
+
+    monkeypatch.setitem(sys.modules, "wandb", SimpleNamespace(init=init, log=log))
+
+    sink = WandbSink(
+        project="nanodiffusion",
+        entity="romaingrx",
+        run_id="20260425-120000",
+        run_name="20260425-120000",
+        config={"train": {"max_steps": 10}},
+    )
+    sink.log(MetricEvent(step=7, metrics={"loss": 1.25}, wall_time=123.0))
+    sink.close()
+
+    assert init_calls[0]["id"] == "20260425-120000"
+    assert init_calls[0]["resume"] == "allow"
+    assert init_calls[0]["name"] == "20260425-120000"
+    assert log_calls == [({"loss": 1.25}, 7)]
+    assert finished == [True]
 
 
 def test_metric_sink_protocol_accepts_duck_typed_classes() -> None:

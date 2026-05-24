@@ -17,6 +17,10 @@ def test_core_host_metrics_omits_none_optionals() -> None:
         grad_finite=1.0,
         lr=1e-3,
         tok_per_s=42,
+        steps_per_s=0.5,
+        step_time_ms=2000.0,
+        tokens_seen=1024,
+        progress_pct=12.5,
         num_devices=8,
     )
 
@@ -27,6 +31,10 @@ def test_core_host_metrics_omits_none_optionals() -> None:
         "grad_finite": 1.0,
         "lr": 1e-3,
         "tok_per_s": 42,
+        "steps_per_s": 0.5,
+        "step_time_ms": 2000.0,
+        "tokens_seen": 1024,
+        "progress_pct": 12.5,
         "num_devices": 8,
     }
 
@@ -40,6 +48,10 @@ def test_report_metrics_merges_sft_extras() -> None:
             grad_finite=1.0,
             lr=1e-3,
             tok_per_s=42,
+            steps_per_s=0.5,
+            step_time_ms=2000.0,
+            tokens_seen=1024,
+            progress_pct=12.5,
             num_devices=8,
             hbm_used_gb=10.5,
         ),
@@ -60,6 +72,10 @@ def test_report_metrics_pretrain_extras_are_empty() -> None:
             grad_finite=1.0,
             lr=1e-3,
             tok_per_s=42,
+            steps_per_s=0.5,
+            step_time_ms=2000.0,
+            tokens_seen=1024,
+            progress_pct=12.5,
             num_devices=1,
         )
     )
@@ -90,10 +106,18 @@ def test_core_host_metrics_from_step_metrics_collects_runtime_fields(
         lr_schedule=lambda step: jnp.asarray(step / 1000),
         step=5,
         tok_per_s=42,
+        steps_per_s=2.0,
+        step_time_ms=500.0,
+        tokens_seen=5120,
+        progress_pct=50.0,
     )
 
     assert metrics.num_devices == 8
     assert metrics.lr == pytest.approx(0.005)
+    assert metrics.steps_per_s == 2.0
+    assert metrics.step_time_ms == 500.0
+    assert metrics.tokens_seen == 5120
+    assert metrics.progress_pct == 50.0
     assert metrics.hbm_used_gb == 12.34
     assert metrics.hbm_peak_gb == 23.45
 

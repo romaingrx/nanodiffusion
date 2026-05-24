@@ -96,26 +96,24 @@ def test_in_memory_source_rejects_zero_step() -> None:
         next(src.iter_documents("train", batch_size=1, step=0))
 
 
-def test_in_memory_source_resume_advances_past_saved_position() -> None:
-    """``resume`` must yield strictly later positions than the saved one."""
+def test_in_memory_source_resume_starts_at_saved_doc_idx() -> None:
+    """``resume`` starts at the exact source doc; loader applies token offset."""
     src = InMemoryTextSource([f"d{i}" for i in range(20)], val_size=2)
-    first = list(islice(src.iter_documents("train", batch_size=2), 3))
-    saved = first[-1][1]
+    saved = PretrainCursor(
+        epoch=1, shard_idx=0, row_group_idx=1, doc_idx=1, token_offset=0
+    )
 
     resumed_first = next(src.iter_documents("train", batch_size=2, resume=saved))
-    new_state = resumed_first[1]
-    saved_tup = (saved.epoch, saved.shard_idx, saved.row_group_idx)
-    new_tup = (new_state.epoch, new_state.shard_idx, new_state.row_group_idx)
-    assert new_tup > saved_tup
-    # The doc at the saved batch must not appear again immediately after resume.
-    assert resumed_first[0] != first[-1][0]
+    assert resumed_first[0] == ["d3"]
+    assert resumed_first[1] == saved.model_copy(update={"token_offset": 0})
 
 
 def test_in_memory_source_resume_at_last_position_advances_epoch() -> None:
     """Resuming at the very last batch of an epoch must roll into the next epoch."""
     src = InMemoryTextSource([f"d{i}" for i in range(5)], val_size=1)
-    all_first_epoch = list(islice(src.iter_documents("train", batch_size=2), 2))
-    saved = all_first_epoch[-1][1]
+    saved = PretrainCursor(
+        epoch=1, shard_idx=0, row_group_idx=1, doc_idx=2, token_offset=0
+    )
 
     resumed = next(src.iter_documents("train", batch_size=2, resume=saved))
     assert resumed[1].epoch == saved.epoch + 1
@@ -233,23 +231,21 @@ def test_parquet_source_rejects_unsatisfiable_stride(tmp_path: Path) -> None:
         list(islice(src.iter_documents("train", batch_size=10, start=99), 1))
 
 
-def test_parquet_source_resume_advances_past_saved_row_group(tmp_path: Path) -> None:
-    """``resume`` must skip the saved row group so training doesn't re-ingest it."""
+def test_parquet_source_resume_starts_at_saved_doc_idx(tmp_path: Path) -> None:
+    """``resume`` starts at the exact parquet doc; loader applies token offset."""
     train = tmp_path / "train.parquet"
     val = tmp_path / "val.parquet"
-    write_parquet(train, [f"d{i}" for i in range(6)], row_group_size=1)
+    write_parquet(train, [f"d{i}" for i in range(6)], row_group_size=3)
     write_parquet(val, ["v"], row_group_size=1)
     src = ParquetTextSource([train], [val])
 
-    first = list(islice(src.iter_documents("train", batch_size=10), 3))
-    saved = first[-1][1]
+    saved = PretrainCursor(
+        epoch=1, shard_idx=0, row_group_idx=0, doc_idx=1, token_offset=0
+    )
 
     resumed_first = next(src.iter_documents("train", batch_size=10, resume=saved))
-    new_state = resumed_first[1]
-    saved_tup = (saved.epoch, saved.shard_idx, saved.row_group_idx)
-    new_tup = (new_state.epoch, new_state.shard_idx, new_state.row_group_idx)
-    assert new_tup > saved_tup
-    assert resumed_first[0] != first[-1][0]
+    assert resumed_first[0] == ["d1", "d2"]
+    assert resumed_first[1] == saved.model_copy(update={"token_offset": 0})
 
 
 def test_parquet_source_resume_across_shards(tmp_path: Path) -> None:
@@ -262,9 +258,11 @@ def test_parquet_source_resume_across_shards(tmp_path: Path) -> None:
     write_parquet(val, ["v"], row_group_size=1)
     src = ParquetTextSource([train_a, train_b], [val])
 
-    saved = PretrainCursor(epoch=1, shard_idx=0, row_group_idx=1)
+    saved = PretrainCursor(
+        epoch=1, shard_idx=0, row_group_idx=1, doc_idx=1, token_offset=0
+    )
     batches = list(islice(src.iter_documents("train", batch_size=10, resume=saved), 2))
-    # Shard 0 row group 1 is skipped; next is shard 1 row group 0.
+    # Shard 0 row group 1 is exhausted; next is shard 1 row group 0.
     assert batches[0][1].shard_idx == 1
     assert batches[0][1].row_group_idx == 0
     assert batches[0][0] == ["b0"]

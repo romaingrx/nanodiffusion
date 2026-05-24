@@ -21,10 +21,11 @@ class TextSource(Protocol):
 
     After exhausting the assigned shards, implementations must loop back
     and increment ``position.epoch``. ``start`` / ``step`` partition the
-    work at the implementation's natural granularity and are safe to use
-    as a data-parallel sharding hook. ``resume`` fast-forwards past a
-    previously yielded position so checkpoint resumption skips already
-    processed data.
+    work at the implementation's row-group-like granularity and are safe
+    to use as a data-parallel sharding hook. ``position`` points at the
+    first document in ``batch`` with ``token_offset=0``. ``resume``
+    starts at that exact document, letting the loader apply any
+    non-zero token offset after tokenization.
     """
 
     def iter_documents(
@@ -84,7 +85,7 @@ class ParquetTextSource:
                     continue
                 pf = pq.ParquetFile(path)
                 if skip is not None and shard_idx == skip.shard_idx:
-                    rg_start = skip.row_group_idx + step
+                    rg_start = skip.row_group_idx
                 else:
                     rg_start = start
                 for row_group_idx in range(rg_start, pf.num_row_groups, step):
@@ -94,12 +95,21 @@ class ParquetTextSource:
                     column = row_group.column(self._text_column).to_pylist()
                     # Parquet may contain null rows; drop them and cast.
                     docs: list[str] = [v for v in column if isinstance(v, str)]
-                    for offset in range(0, len(docs), batch_size):
+                    doc_start = (
+                        skip.doc_idx
+                        if skip is not None
+                        and shard_idx == skip.shard_idx
+                        and row_group_idx == skip.row_group_idx
+                        else 0
+                    )
+                    for offset in range(doc_start, len(docs), batch_size):
                         batch = docs[offset : offset + batch_size]
                         position = PretrainCursor(
                             epoch=epoch,
                             shard_idx=shard_idx,
                             row_group_idx=row_group_idx,
+                            doc_idx=offset,
+                            token_offset=0,
                         )
                         yielded = True
                         yield batch, position
@@ -118,8 +128,8 @@ class ParquetTextSource:
 class InMemoryTextSource:
     """Test double: serves a fixed list of documents; last ``val_size`` are val.
 
-    Strides at the batch level so ``row_group_idx`` matches
-    :class:`ParquetTextSource`'s cursor semantics.
+    Strides at the batch level so ``row_group_idx`` acts like a small
+    in-memory row group for source tests.
     """
 
     def __init__(self, docs: list[str], *, val_size: int = 1) -> None:
@@ -152,14 +162,23 @@ class InMemoryTextSource:
         skip = resume
         while True:
             yielded = False
-            batch_start = skip.row_group_idx + step if skip is not None else start
+            batch_start = skip.row_group_idx if skip is not None else start
             for batch_idx in range(batch_start, batch_count, step):
                 offset = batch_idx * batch_size
-                batch = docs[offset : offset + batch_size]
+                doc_start = (
+                    skip.doc_idx
+                    if skip is not None and batch_idx == skip.row_group_idx
+                    else 0
+                )
+                batch = docs[offset + doc_start : offset + batch_size]
+                if not batch:
+                    continue
                 position = PretrainCursor(
                     epoch=epoch,
                     shard_idx=0,
                     row_group_idx=batch_idx,
+                    doc_idx=doc_start,
+                    token_offset=0,
                 )
                 yielded = True
                 yield batch, position

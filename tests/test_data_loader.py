@@ -136,8 +136,14 @@ def test_long_doc_spans_multiple_chunks(tok: Tokenizer) -> None:
     assert any((b.segments == 0).all() for b in batches)
 
 
-def _state_tuple(state: PretrainCursor) -> tuple[int, int, int]:
-    return state.epoch, state.shard_idx, state.row_group_idx
+def _state_tuple(state: PretrainCursor) -> tuple[int, int, int, int, int]:
+    return (
+        state.epoch,
+        state.shard_idx,
+        state.row_group_idx,
+        state.doc_idx,
+        state.token_offset,
+    )
 
 
 def test_resume_state_advances_past_saved_position(tok: Tokenizer) -> None:
@@ -172,6 +178,44 @@ def test_resume_state_advances_past_saved_position(tok: Tokenizer) -> None:
     for b in resumed:
         assert b.tokens.shape == (2, 32)
         assert (b.segments[:, 0] == 0).all()
+
+
+def test_resume_state_reproduces_uninterrupted_next_batches(tok: Tokenizer) -> None:
+    docs = [("alpha beta gamma delta " * 400), "tail train doc", "val doc"]
+    source = InMemoryTextSource(docs, val_size=1)
+    uninterrupted = pretrain_loader(
+        source,
+        tok,
+        batch_size=2,
+        seq_len=31,
+        split="train",
+        tokenizer_batch_size=1,
+    )
+    consumed = list(islice(uninterrupted, 3))
+    cursor = consumed[-1].state
+    assert cursor.token_offset > 0
+
+    expected = list(islice(uninterrupted, 3))
+    resumed_source = InMemoryTextSource(docs, val_size=1)
+    resumed = list(
+        islice(
+            pretrain_loader(
+                resumed_source,
+                tok,
+                batch_size=2,
+                seq_len=31,
+                split="train",
+                tokenizer_batch_size=1,
+                resume_state=cursor,
+            ),
+            3,
+        )
+    )
+
+    for resumed_batch, expected_batch in zip(resumed, expected, strict=True):
+        np.testing.assert_array_equal(resumed_batch.tokens, expected_batch.tokens)
+        np.testing.assert_array_equal(resumed_batch.segments, expected_batch.segments)
+        assert resumed_batch.state == expected_batch.state
 
 
 def test_state_epoch_monotonic(tok: Tokenizer) -> None:
@@ -231,7 +275,9 @@ def test_pretrain_loader_handles_finite_source(tok: Tokenizer) -> None:
             resume: PretrainCursor | None = None,
         ) -> Iterator[tuple[list[str], PretrainCursor]]:
             del split, start, step, batch_size, resume
-            position = PretrainCursor(epoch=1, shard_idx=0, row_group_idx=0)
+            position = PretrainCursor(
+                epoch=1, shard_idx=0, row_group_idx=0, doc_idx=0, token_offset=0
+            )
             yield ["just one doc"], position
 
     loader = pretrain_loader(
@@ -267,7 +313,9 @@ def test_batch_output_to_jax_returns_jax_batch(tok: Tokenizer) -> None:
 
 
 def test_batch_output_validates_shape_mismatch() -> None:
-    state = PretrainCursor(epoch=1, shard_idx=0, row_group_idx=0)
+    state = PretrainCursor(
+        epoch=1, shard_idx=0, row_group_idx=0, doc_idx=0, token_offset=0
+    )
     with pytest.raises(_ShapeError):
         BatchOutput(
             tokens=np.zeros((4, 8), dtype=np.int32),
@@ -277,7 +325,9 @@ def test_batch_output_validates_shape_mismatch() -> None:
 
 
 def test_batch_output_validates_ndim() -> None:
-    state = PretrainCursor(epoch=1, shard_idx=0, row_group_idx=0)
+    state = PretrainCursor(
+        epoch=1, shard_idx=0, row_group_idx=0, doc_idx=0, token_offset=0
+    )
     with pytest.raises(_ShapeError):
         BatchOutput(
             tokens=np.zeros((8,), dtype=np.int32),
@@ -288,7 +338,9 @@ def test_batch_output_validates_ndim() -> None:
 
 def test_batch_output_validates_dtype() -> None:
     """jaxtyping rejects float arrays for Int[...] annotations."""
-    state = PretrainCursor(epoch=1, shard_idx=0, row_group_idx=0)
+    state = PretrainCursor(
+        epoch=1, shard_idx=0, row_group_idx=0, doc_idx=0, token_offset=0
+    )
     with pytest.raises(_ShapeError):
         BatchOutput(
             tokens=np.zeros((4, 8), dtype=np.float32),
