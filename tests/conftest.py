@@ -9,7 +9,12 @@ from jaxtyping import install_import_hook
 
 install_import_hook("nanodiffusion", "beartype.beartype")
 
-from nanodiffusion.checkpoint import save_checkpoint, write_config  # noqa: E402
+from nanodiffusion.checkpoint import (  # noqa: E402
+    flush,
+    make_manager,
+    save_checkpoint,
+    write_config,
+)
 from nanodiffusion.config import Config, ModelConfig  # noqa: E402
 from nanodiffusion.model.transformer import Transformer  # noqa: E402
 from nanodiffusion.tokenizer import Tokenizer  # noqa: E402
@@ -69,7 +74,7 @@ def saved_checkpoint(tmp_path_factory: pytest.TempPathFactory) -> Path:
     Shared by ``tests/test_inference.py`` and ``tests/serve/`` since both
     need a load-able checkpoint with a real-tokenizer vocab.
     """
-    tmp = tmp_path_factory.mktemp("inference")
+    run_dir = tmp_path_factory.mktemp("inference")
     serve_tok = Tokenizer()
     config = Config(
         model=ModelConfig(
@@ -86,15 +91,16 @@ def saved_checkpoint(tmp_path_factory: pytest.TempPathFactory) -> Path:
     optimizer = optax.adamw(1e-3)
     opt_state = optimizer.init(eqx.filter(model, eqx.is_inexact_array))
 
-    ckpt = tmp / "step_0"
+    write_config(run_dir, config)
+    mngr = make_manager(run_dir)
     save_checkpoint(
-        ckpt,
+        mngr,
+        0,
         model=model,
         ema_model=model,
         opt_state=opt_state,
-        key=key,
-        step=0,
+        key=jax.random.key(0),
         cursor=None,
     )
-    write_config(ckpt, config)
-    return ckpt
+    flush(mngr)
+    return run_dir

@@ -14,9 +14,9 @@ import jax
 import jax.numpy as jnp
 
 from nanodiffusion import sampler
-from nanodiffusion.checkpoint import CheckpointMeta, load_model
+from nanodiffusion.checkpoint import load_meta, load_model
 from nanodiffusion.config import Config, SampleConfig
-from nanodiffusion.constants import CONFIG_SIDECAR_FILENAME, META_FILENAME
+from nanodiffusion.constants import CONFIG_SIDECAR_FILENAME
 from nanodiffusion.model import Transformer, transformer_skeleton
 from nanodiffusion.schedule import LogLinearSchedule, NoiseSchedule
 from nanodiffusion.tokenizer import Tokenizer
@@ -49,7 +49,7 @@ def load_runtime(
     *,
     overrides: SampleConfigOverride | None = None,
 ) -> Runtime:
-    """Read config + EMA weights + meta from ``checkpoint`` into a :class:`Runtime`."""
+    """Read config + EMA weights + meta from a run directory."""
     overrides = overrides if overrides is not None else SampleConfigOverride()
     sidecar = checkpoint / CONFIG_SIDECAR_FILENAME
     if not sidecar.exists():
@@ -64,7 +64,7 @@ def load_runtime(
     model = load_model(checkpoint, model_skeleton=skeleton, which="ema")
     model = eqx.nn.inference_mode(model, value=True)
 
-    meta = CheckpointMeta.model_validate_json((checkpoint / META_FILENAME).read_text())
+    meta = load_meta(checkpoint)
     defaults = config.sample.with_overrides(overrides)
 
     return Runtime(

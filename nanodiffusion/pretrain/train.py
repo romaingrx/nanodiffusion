@@ -287,7 +287,6 @@ def pretrain(
     with Reporter(sink_factories) as reporter:
         run_training_loop(
             state,
-            config=config,
             run_dir=run_dir,
             train_step=train_step,
             lr_schedule=lr_schedule,

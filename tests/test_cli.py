@@ -6,21 +6,13 @@ import pytest
 import yaml
 from click.testing import CliRunner
 
-from nanodiffusion.checkpoint import CheckpointMeta
+from nanodiffusion.checkpoint import load_meta
 from nanodiffusion.cli import main
 from nanodiffusion.cli.data import data_group
 from nanodiffusion.cli.pretrain import pretrain_command
 from nanodiffusion.cli.sample import sample_command
 from nanodiffusion.config import Config
-from nanodiffusion.constants import (
-    CONFIG_SIDECAR_FILENAME,
-    EMA_FILENAME,
-    LATEST_LINK_NAME,
-    META_FILENAME,
-    MODEL_FILENAME,
-    OPT_STATE_FILENAME,
-    RNG_FILENAME,
-)
+from nanodiffusion.constants import CONFIG_SIDECAR_FILENAME
 from nanodiffusion.data.datasets import DATASETS, DatasetFactory, DownloadOptions
 from nanodiffusion.data.source import InMemoryTextSource, TextSource
 
@@ -329,20 +321,11 @@ def test_pretrain_command_runs_end_to_end(
     # _write_pretrain_config uses max_steps=3, save_every=1000 → single save.
     final = single_run / "step_3"
     assert final.is_dir()
-    for name in (
-        MODEL_FILENAME,
-        EMA_FILENAME,
-        OPT_STATE_FILENAME,
-        RNG_FILENAME,
-        META_FILENAME,
-        CONFIG_SIDECAR_FILENAME,
-    ):
-        assert (final / name).exists(), name
-
-    # `latest` symlink points at the newest checkpoint after the last save.
-    latest = single_run / LATEST_LINK_NAME
-    assert latest.is_symlink()
-    assert str(latest.readlink()) == "step_3"
+    # Orbax atomically writes ``_CHECKPOINT_METADATA`` last; its presence
+    # is the finalisation marker for the step.
+    assert (final / "_CHECKPOINT_METADATA").exists()
+    assert (final / "state").is_dir()
+    assert (final / "meta").is_dir()
 
 
 def test_pretrain_latest_reflects_max_step(
@@ -361,9 +344,7 @@ def test_pretrain_latest_reflects_max_step(
     assert result.exit_code == 0, result.output
 
     single_run = next(iter(run_dir.iterdir()))
-    meta = CheckpointMeta.model_validate_json(
-        (single_run / LATEST_LINK_NAME / META_FILENAME).read_text()
-    )
+    meta = load_meta(single_run)
     # _write_pretrain_config uses max_steps=3.
     assert meta.step == 3
 
@@ -469,12 +450,10 @@ def test_pretrain_resume_continues_step_and_reuses_run_dir(
     assert first.exit_code == 0, first.output
 
     single_run = next(iter(run_dir.iterdir()))
-    latest = single_run / LATEST_LINK_NAME
-    assert latest.is_symlink()
-    meta = CheckpointMeta.model_validate_json((latest / META_FILENAME).read_text())
+    meta = load_meta(single_run)
     assert meta.step == 2
 
-    # Second phase: same run dir, bumped max_steps, resume via `latest`.
+    # Second phase: same run dir, bumped max_steps, resume via the run dir.
     second_config = tmp_path / "second.yaml"
     second_config.write_text(
         yaml.dump(
@@ -509,7 +488,7 @@ def test_pretrain_resume_continues_step_and_reuses_run_dir(
 
     second = runner.invoke(
         pretrain_command,
-        ["--config", str(second_config), "--resume-from", str(latest)],
+        ["--config", str(second_config), "--resume-from", str(single_run)],
     )
     assert second.exit_code == 0, second.output
 
@@ -520,14 +499,12 @@ def test_pretrain_resume_continues_step_and_reuses_run_dir(
     ckpt_dirs = {
         p.name
         for p in single_run.iterdir()
-        if p.is_dir() and not p.is_symlink() and p.name.startswith("step_")
+        if p.is_dir() and p.name.startswith("step_")
     }
     assert ckpt_dirs == {"step_2", "step_4"}, ckpt_dirs
 
-    # `latest` now points at the newest snapshot; its meta reflects the resumed step.
-    assert str(latest.readlink()) == "step_4"
-    final_meta_json = (latest / META_FILENAME).read_text()
-    final_meta = CheckpointMeta.model_validate_json(final_meta_json)
+    # The Orbax manager's latest step is the newest finalised checkpoint.
+    final_meta = load_meta(single_run)
     assert final_meta.step == 4
 
 

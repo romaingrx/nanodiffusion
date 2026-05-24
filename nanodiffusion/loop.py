@@ -1,17 +1,9 @@
-"""Shared training loop driving pretrain and SFT.
-
-Paradigm-specific differences (batch pytree shape and optional host-side
-extras) are threaded through a :class:`PrepareBatch` callback and the
-typed metrics returned by :data:`TrainStepFn`, so
-:func:`run_training_loop` owns the timing/saving/metric-forwarding
-logic once. The loop never imports wandb or any other metric backend;
-it calls into a :class:`~nanodiffusion.reporter.MetricReporter` which
-fans out to whatever sinks the caller configured.
-"""
+"""Shared training loop driving pretrain and SFT."""
 
 import dataclasses
 import datetime
 import math
+import os
 import time
 from collections.abc import Callable, Iterator
 from pathlib import Path
@@ -19,11 +11,12 @@ from pathlib import Path
 import jax
 import optax
 import structlog
-from pydantic import BaseModel
 
 from nanodiffusion.checkpoint import (
-    flush_pending_save,
-    save_checkpoint_async,
+    flush,
+    make_manager,
+    resolve_checkpoint_uri,
+    save_checkpoint_with_logging,
 )
 from nanodiffusion.data.cursors import LoaderCursor
 from nanodiffusion.data.loader import DevicePrefetchIterator
@@ -44,19 +37,12 @@ logger = structlog.get_logger(__name__)
 
 
 def make_run_id() -> str:
-    """UTC timestamp run id, e.g. ``20260408-193015``."""
     return datetime.datetime.now(tz=datetime.UTC).strftime("%Y%m%d-%H%M%S")
 
 
 def resolve_run_dir(run_dir_root: Path, *, resume_from: Path | None) -> Path:
-    """Fresh timestamped run dir, or reuse ``resume_from.parent`` on resume.
-
-    The returned directory exists on disk; callers drop their own
-    ``config.yaml`` and ``logger.info`` on top so pretrain and SFT keep
-    their event-name conventions separate.
-    """
     if resume_from is not None:
-        run_dir = resume_from.parent.resolve()
+        run_dir = resume_from.resolve()
     else:
         run_dir = run_dir_root / make_run_id()
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -65,20 +51,11 @@ def resolve_run_dir(run_dir_root: Path, *, resume_from: Path | None) -> Path:
 
 @dataclasses.dataclass(frozen=True, slots=True)
 class StepStats:
-    """Per-step metrics returned by the batch-prepare hook.
-
-    ``supervised_tokens`` is non-zero only for SFT; pretrain leaves it
-    at 0 and the loop omits the derived ``supervised_tok_per_s`` field
-    from its log output in that case.
-    """
-
     supervised_tokens: int = 0
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
 class LoopHyperparams:
-    """Paradigm-independent knobs that drive :func:`run_training_loop`."""
-
     max_steps: int
     log_every: int
     save_every: int
@@ -90,13 +67,6 @@ class LoopHyperparams:
 
 @dataclasses.dataclass
 class LoopState[M: DiffusionModel, C: LoaderCursor]:
-    """Mutable per-iteration state threaded through the loop body.
-
-    Plain Python — not a JAX pytree — so the loop can update
-    ``step`` / ``cursor`` / ``last_saved_step`` with normal
-    assignment between JIT'd train-step calls.
-    """
-
     model: M
     ema_model: M
     opt_state: optax.OptState
@@ -115,8 +85,12 @@ def _save_final_checkpoint_if_needed[M: DiffusionModel, C: LoaderCursor](
     initial_step: int,
     save: Callable[[], None],
 ) -> None:
+    """Submit a final save if training advanced past the last submitted step.
+
+    Orbax's internal queue-depth-1 means any subsequent ``save()`` already
+    blocks on the prior, so no manual pre-flush is needed.
+    """
     if state.step > initial_step and state.last_saved_step != state.step:
-        flush_pending_save()
         save()
 
 
@@ -142,13 +116,6 @@ def _collect_host_metrics(
     supervised_tokens_in_window: int,
     elapsed: float,
 ) -> ReportMetrics:
-    """Merge device-side step metrics with host-side throughput + HBM.
-
-    Non-finite losses no longer raise. The JIT'd train step skips the
-    model update on non-finite gradients (see
-    :func:`nanodiffusion.optimizer.apply_or_skip`), so training can
-    recover from transient spikes while still surfacing a warning.
-    """
     core = CoreHostMetrics.from_step_metrics(
         step_metrics,
         lr_schedule=lr_schedule,
@@ -180,7 +147,6 @@ def _collect_host_metrics(
 def run_training_loop[M: DiffusionModel, B, JB, C: LoaderCursor](
     state: LoopState[M, C],
     *,
-    config: BaseModel,
     run_dir: Path,
     train_step: TrainStepFn[M, JB],
     lr_schedule: optax.Schedule,
@@ -191,39 +157,29 @@ def run_training_loop[M: DiffusionModel, B, JB, C: LoaderCursor](
 ) -> None:
     """Drive the training loop in place.
 
-    Deliberately not JIT'd: mutates ``state`` via Python assignment
-    between JIT'd train-step calls so prefetch, logging, and
-    checkpointing interleave with device work. The throughput window is
-    reset once after the first post-compile step so JIT compile latency
-    is excluded from the first ``tok_per_s`` report; the end-of-training
-    save is skipped when a periodic save already landed on the terminal
-    step.
-
-    Device placement (replicate / shard) is the caller's responsibility:
-    the ``state`` pytrees should already be placed on the target devices,
-    and ``prepare_batch`` should shard the batch before returning it.
-    This keeps the loop device-agnostic and avoids importing the
-    sharding module here.
+    Device placement is the caller's responsibility: ``state`` pytrees
+    must already be on-device and ``prepare_batch`` must shard the batch
+    before returning it.
     """
     initial_step = state.step
     last_log_step = state.step
     supervised_tokens_in_window = 0
 
+    ckpt_uri = resolve_checkpoint_uri(run_dir, bucket=os.environ.get("GCS_BUCKET"))
+    mngr = make_manager(ckpt_uri)
+    logger.info("checkpoint_manager_ready", uri=ckpt_uri)
+
     def _save() -> None:
-        ckpt_dir = run_dir / f"step_{state.step}"
-        save_checkpoint_async(
-            ckpt_dir,
+        save_checkpoint_with_logging(
+            mngr,
+            state.step,
             model=state.model,
             ema_model=state.ema_model,
             opt_state=state.opt_state,
             key=state.key,
-            step=state.step,
             cursor=state.cursor,
-            config=config,
-            update_latest=True,
         )
         state.last_saved_step = state.step
-        logger.info("checkpoint_queued", path=str(ckpt_dir), step=state.step)
 
     t_window_start = time.monotonic()
     with (
@@ -305,7 +261,6 @@ def run_training_loop[M: DiffusionModel, B, JB, C: LoaderCursor](
             if stop_request.requested:
                 break
 
-    flush_pending_save()
     _save_final_checkpoint_if_needed(state, initial_step=initial_step, save=_save)
-    flush_pending_save()
+    flush(mngr)
     _log_graceful_stop(stop_request, step=state.step, run_dir=run_dir)

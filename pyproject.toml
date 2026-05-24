@@ -28,6 +28,12 @@ dependencies = [
     # Logging
     "structlog>=24.0.0",
     "datasets>=4.8.4",
+    # Checkpointing: Orbax + TensorStore write the GCS JSON API directly
+    # (via OCDBT chunked uploads), bypassing the gcsfuse mount that caps
+    # eqx.tree_serialise_leaves at ~3 MB/s.
+    "orbax-checkpoint>=0.11,<0.12",
+    "tensorstore>=0.1.65,<0.2",
+    "etils[epath-gcs]",
 ]
 
 [project.optional-dependencies]
@@ -82,6 +88,7 @@ ignore = [
 "examples/**" = [
     "T201",    # print is the primary output mechanism for scripts
     "INP001",  # examples don't need __init__.py
+    "S101",    # asserts are fine as one-off sanity checks in scripts
 ]
 
 [tool.basedpyright]

@@ -9,7 +9,9 @@ import pytest
 from nanodiffusion.chat import Conversation, render_conversation
 from nanodiffusion.checkpoint import (
     CheckpointMeta,
+    flush,
     load_checkpoint,
+    make_manager,
     save_checkpoint,
 )
 from nanodiffusion.config import ModelConfig, SFTConfig, SFTDatasetConfig
@@ -214,18 +216,20 @@ def test_cursor_roundtrip_through_checkpoint(
     )
     opt_state = optimizer.init(eqx.filter(model, eqx.is_inexact_array))
 
-    ckpt_dir = tmp_path / "step_1"
+    run_dir = tmp_path / "run"
+    mngr = make_manager(run_dir)
     save_checkpoint(
-        ckpt_dir,
+        mngr,
+        1,
         model=model,
         ema_model=model,
         opt_state=opt_state,
-        key=jax.random.PRNGKey(0),
-        step=1,
+        key=jax.random.key(0),
         cursor=cursor,
     )
+    flush(mngr)
     _m, _e, _o, _k, meta = load_checkpoint(
-        ckpt_dir,
+        mngr,
         model_skeleton=model,
         opt_state_builder=lambda m: optimizer.init(eqx.filter(m, eqx.is_inexact_array)),
     )
