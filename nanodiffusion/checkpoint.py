@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-import os
+from pathlib import Path
 from typing import TYPE_CHECKING, Literal, cast
 
 import equinox as eqx
@@ -20,8 +20,8 @@ from nanodiffusion.data.cursors import LoaderCursor
 from nanodiffusion.model import DiffusionModel
 
 if TYPE_CHECKING:
+    import os
     from collections.abc import Callable
-    from pathlib import Path
 
     import optax
 
@@ -50,18 +50,18 @@ class CheckpointMeta(BaseModel):
         return self.cursor
 
 
-def resolve_checkpoint_uri(local_run_dir: Path, *, env_var: str = "GCS_BUCKET") -> str:
-    """Map a local ``runs/...`` path onto ``gs://<bucket>/<rel>`` when set."""
-    bucket = os.environ.get(env_var)
+def resolve_checkpoint_uri(local_run_dir: Path, *, bucket: str | None) -> str:
+    """Return ``gs://<bucket>/<local_run_dir>`` or the local path when no bucket.
+
+    ``local_run_dir`` must be a path under ``cwd`` (typical for training runs:
+    ``runs/<paradigm>/<id>``). The local view stays the gcsfuse mount for
+    ``.jax_cache``, ``metrics.jsonl``, ``profile/``, ``config.yaml``; Orbax
+    bypasses the mount and writes ``step_*/`` directly through TensorStore.
+    """
     if bucket is None:
         return str(local_run_dir)
-    parts = local_run_dir.absolute().parts
-    try:
-        idx = parts.index("runs")
-    except ValueError:
-        return str(local_run_dir)
-    rel = "/".join(parts[idx:])
-    return f"gs://{bucket}/{rel}"
+    rel = local_run_dir.resolve().relative_to(Path.cwd())
+    return f"gs://{bucket}/{rel.as_posix()}"
 
 
 def make_manager(
@@ -118,7 +118,7 @@ def load_checkpoint[M: DiffusionModel](
     mngr = (
         mngr_or_uri
         if isinstance(mngr_or_uri, ocp.CheckpointManager)
-        else make_manager(mngr_or_uri, max_to_keep=1)
+        else make_manager(mngr_or_uri)
     )
     resolved_step = step if step is not None else mngr.latest_step()
     if resolved_step is None:
@@ -150,7 +150,7 @@ def load_checkpoint[M: DiffusionModel](
 def load_meta(
     uri: str | os.PathLike[str], *, step: int | None = None
 ) -> CheckpointMeta:
-    mngr = make_manager(uri, max_to_keep=1)
+    mngr = make_manager(uri)
     resolved_step = step if step is not None else mngr.latest_step()
     if resolved_step is None:
         msg = f"no finalised checkpoint to read in {uri}"
@@ -169,7 +169,7 @@ def load_model[M: DiffusionModel](
     which: ModelSnapshot = "ema",
     step: int | None = None,
 ) -> M:
-    mngr = make_manager(uri, max_to_keep=1)
+    mngr = make_manager(uri)
     resolved_step = step if step is not None else mngr.latest_step()
     if resolved_step is None:
         msg = f"no finalised checkpoint to load in {uri}"

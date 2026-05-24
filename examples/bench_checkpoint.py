@@ -88,12 +88,18 @@ def main() -> None:
 
     abstract = jax.tree.map(lambda a: jax.ShapeDtypeStruct(a.shape, a.dtype), state)
     t0 = time.perf_counter()
-    mngr.restore(
+    restored = mngr.restore(
         0,
         args=ocp.args.Composite(state=ocp.args.StandardRestore(abstract)),
     )
     t_load = time.perf_counter() - t0
     print(f"restore: total={t_load:.2f}s throughput={bytes_mb / t_load:.1f} MB/s")
+    restored_bytes = sum(
+        int(a.size) * a.dtype.itemsize for a in jax.tree.leaves(restored["state"])
+    )
+    assert restored_bytes == bytes_total, (
+        f"restored payload size {restored_bytes} != saved {bytes_total}"
+    )
 
 
 if __name__ == "__main__":

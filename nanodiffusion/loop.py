@@ -3,6 +3,7 @@
 import dataclasses
 import datetime
 import math
+import os
 import threading
 import time
 from collections.abc import Callable, Iterator
@@ -86,10 +87,13 @@ def _save_final_checkpoint_if_needed[M: DiffusionModel, C: LoaderCursor](
     *,
     initial_step: int,
     save: Callable[[], None],
-    flush_pending: Callable[[], None],
 ) -> None:
+    """Submit a final save if training advanced past the last submitted step.
+
+    Orbax's internal queue-depth-1 means any subsequent ``save()`` already
+    blocks on the prior, so no manual pre-flush is needed.
+    """
     if state.step > initial_step and state.last_saved_step != state.step:
-        flush_pending()
         save()
 
 
@@ -216,7 +220,7 @@ def run_training_loop[M: DiffusionModel, B, JB, C: LoaderCursor](
     last_log_step = state.step
     supervised_tokens_in_window = 0
 
-    ckpt_uri = resolve_checkpoint_uri(run_dir)
+    ckpt_uri = resolve_checkpoint_uri(run_dir, bucket=os.environ.get("GCS_BUCKET"))
     mngr = make_manager(ckpt_uri)
     logger.info("checkpoint_manager_ready", uri=ckpt_uri)
 
@@ -303,12 +307,6 @@ def run_training_loop[M: DiffusionModel, B, JB, C: LoaderCursor](
             if stop_request.requested:
                 break
 
-    flush(mngr)
-    _save_final_checkpoint_if_needed(
-        state,
-        initial_step=initial_step,
-        save=_save,
-        flush_pending=lambda: flush(mngr),
-    )
+    _save_final_checkpoint_if_needed(state, initial_step=initial_step, save=_save)
     flush(mngr)
     _log_graceful_stop(stop_request, step=state.step, run_dir=run_dir)
