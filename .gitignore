@@ -24,3 +24,13 @@ data/
 # Claude Code memory (user-specific)
 .claude/projects/*/memory/
 overfit_pattern.png
+
+# Local experiment notes (per ROM-18 research log; not pushed)
+docs/
+
+# Bruno API client (local request collections)
+*.bru
+nanodiffusion-bruno/
+
+# GCP service-account keys (never commit)
+sa.json
