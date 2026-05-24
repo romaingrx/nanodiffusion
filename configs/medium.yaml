@@ -27,18 +27,21 @@ model:
   compute_dtype: bfloat16
   remat_policy: none
 
-# Pretrain: ~11B tokens. Effective batch of 256 sequences (32 per device
-# x 8 devices when data-parallel is wired up) at seq_len=1024 gives
-# 262k tokens/step → ~42k steps for 11B tokens. This single-file config
-# assumes the runner fans out per-device — on a single card, drop
-# batch_size to 16 and halve max_steps accordingly.
+# Pretrain: ~11B tokens. On v6e-8 with batch_size=64 (per-chip=8, matches
+# the bs=32-on-v6e-4 sweet spot from exp 003), seq_len=1024 gives 65,536
+# tokens/step → ~168k steps for 11B tokens. The earlier comment assuming
+# "32 per device x 8 devices = 256 global" was wishful; batch_size here is
+# global and is sharded across whatever chips the loop sees. Keep per-chip
+# at ~8 to stay within HBM at remat=none (16/chip OOMs the attention score
+# matrix at this seq length). For a v6e-4, drop batch_size to 32 and double
+# max_steps to 336000.
 train:
   seed: 42
-  batch_size: 32
+  batch_size: 64
   learning_rate: 3e-4
   weight_decay: 0.1
   warmup_steps: 1000
-  max_steps: 42000
+  max_steps: 168000
   ema_decay: 0.9999
   grad_clip: 1.0
   log_every: 50
