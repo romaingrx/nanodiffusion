@@ -12,7 +12,7 @@
 set -euo pipefail
 
 REPO_URL="${REPO_URL:-https://github.com/romaingrx/nanodiffusion.git}"
-REPO_BRANCH="${REPO_BRANCH:-romaingrx/rom-18-scale-training}"
+REPO_BRANCH="${REPO_BRANCH:-main}"
 REPO_DIR="${REPO_DIR:-$HOME/nanodiffusion}"
 GCS_BUCKET="${GCS_BUCKET:-nanodiffusion-runs}"
 GCS_MOUNT="$HOME/gcs-${GCS_BUCKET}"
@@ -137,7 +137,6 @@ fi
 echo ""
 ok "TPU VM ready."
 echo ""
-echo "  tmux new -s nano"
-echo "  cd $REPO_DIR"
-echo "  uv run nanodiffusion pretrain --config configs/medium.yaml $RESUME_FLAG"
+echo "Launch (or relaunch) training with:"
+echo "  bash $REPO_DIR/scripts/launch.sh $RESUME"
 echo ""
