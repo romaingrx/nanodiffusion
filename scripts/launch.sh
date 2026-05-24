@@ -2,7 +2,10 @@
 # Launch pretrain on this TPU VM under tmux (survives ssh disconnect).
 #
 # Usage (fresh run, first time or after VM recreate):
-#   GITHUB_TOKEN=ghp_xxx GCS_BUCKET=nanodiffusion-runs-us-east5 bash launch.sh
+#   bash launch.sh
+#
+# Override the GCS bucket (must be same region as TPU for fast writes):
+#   GCS_BUCKET=nanodiffusion-runs-other bash launch.sh
 #
 # Usage (resume after preemption / manual kill):
 #   bash launch.sh --resume

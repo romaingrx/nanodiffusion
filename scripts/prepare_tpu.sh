@@ -14,7 +14,7 @@ set -euo pipefail
 REPO_URL="${REPO_URL:-https://github.com/romaingrx/nanodiffusion.git}"
 REPO_BRANCH="${REPO_BRANCH:-main}"
 REPO_DIR="${REPO_DIR:-$HOME/nanodiffusion}"
-GCS_BUCKET="${GCS_BUCKET:-nanodiffusion-runs}"
+GCS_BUCKET="${GCS_BUCKET:-nanodiffusion-runs-eu4}"
 GCS_MOUNT="$HOME/gcs-${GCS_BUCKET}"
 RESUME="${1:-}"
 
