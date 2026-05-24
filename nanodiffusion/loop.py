@@ -21,7 +21,10 @@ import optax
 import structlog
 from pydantic import BaseModel
 
-from nanodiffusion.checkpoint import save_checkpoint, write_config
+from nanodiffusion.checkpoint import (
+    flush_pending_save,
+    save_checkpoint_async,
+)
 from nanodiffusion.data.cursors import LoaderCursor
 from nanodiffusion.data.loader import DevicePrefetchIterator
 from nanodiffusion.metrics import (
@@ -113,6 +116,7 @@ def _save_final_checkpoint_if_needed[M: DiffusionModel, C: LoaderCursor](
     save: Callable[[], None],
 ) -> None:
     if state.step > initial_step and state.last_saved_step != state.step:
+        flush_pending_save()
         save()
 
 
@@ -207,7 +211,7 @@ def run_training_loop[M: DiffusionModel, B, JB, C: LoaderCursor](
 
     def _save() -> None:
         ckpt_dir = run_dir / f"step_{state.step}"
-        save_checkpoint(
+        save_checkpoint_async(
             ckpt_dir,
             model=state.model,
             ema_model=state.ema_model,
@@ -215,11 +219,11 @@ def run_training_loop[M: DiffusionModel, B, JB, C: LoaderCursor](
             key=state.key,
             step=state.step,
             cursor=state.cursor,
+            config=config,
             update_latest=True,
         )
-        write_config(ckpt_dir, config)
         state.last_saved_step = state.step
-        logger.info("checkpoint_saved", path=str(ckpt_dir), step=state.step)
+        logger.info("checkpoint_queued", path=str(ckpt_dir), step=state.step)
 
     t_window_start = time.monotonic()
     with (
@@ -301,5 +305,7 @@ def run_training_loop[M: DiffusionModel, B, JB, C: LoaderCursor](
             if stop_request.requested:
                 break
 
+    flush_pending_save()
     _save_final_checkpoint_if_needed(state, initial_step=initial_step, save=_save)
+    flush_pending_save()
     _log_graceful_stop(stop_request, step=state.step, run_dir=run_dir)

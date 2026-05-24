@@ -15,6 +15,7 @@ a pydantic schema change can only drift through that path.
 
 import shutil
 from collections.abc import Callable
+from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 from typing import Literal, cast
 
@@ -43,6 +44,19 @@ from nanodiffusion.types import PRNGKeyArray
 logger = structlog.get_logger(__name__)
 
 type ModelSnapshot = Literal["model", "ema"]
+
+
+class _AsyncSaveState:
+    """Mutable singleton for the async-save executor and in-flight future.
+
+    Class attributes (not module-level ``global`` rebinding) so writers
+    just assign and the lint stays clean. One worker, queue depth one:
+    a slow gcsfuse upload backpressures the next call to
+    :func:`save_checkpoint_async`, never spawns a second snapshot.
+    """
+
+    executor: ThreadPoolExecutor | None = None
+    inflight: Future[None] | None = None
 
 
 class CheckpointMeta(BaseModel):
@@ -88,6 +102,13 @@ def save_checkpoint[M: DiffusionModel](
 ) -> None:
     """Write ``(model, ema, opt_state, rng, meta)`` atomically to ``path``.
 
+    Synchronous: the training thread blocks until all four equinox
+    leaves are serialised and the ``.tmp`` dir renames into place. Use
+    :func:`save_checkpoint_async` from the training loop when the
+    serialise + upload cost matters (gcsfuse cross-region uploads can
+    run into minutes); the sync path is kept for tests and inference
+    dumps where a deterministic write is the simpler contract.
+
     Multi-host safe: only the rank-0 process writes; all hosts then
     barrier on :func:`multihost_utils.sync_global_devices` so no reader
     races ahead of the on-disk artifact. Safe to call unconditionally
@@ -106,21 +127,19 @@ def save_checkpoint[M: DiffusionModel](
     (unprivileged Windows) log and skip rather than failing the save.
     """
     if jax.process_index() == 0:
-        _write_checkpoint(
+        _write_snapshot(
             path,
-            model=model,
-            ema_model=ema_model,
-            opt_state=opt_state,
-            key=key,
+            snapshot=(model, ema_model, opt_state, key),
             step=step,
             cursor=cursor,
+            config_yaml=None,
             update_latest=update_latest,
         )
     if jax.process_count() > 1:
         multihost_utils.sync_global_devices(f"save_checkpoint:{path.name}")
 
 
-def _write_checkpoint[M: DiffusionModel](
+def save_checkpoint_async[M: DiffusionModel](
     path: Path,
     *,
     model: M,
@@ -129,8 +148,83 @@ def _write_checkpoint[M: DiffusionModel](
     key: PRNGKeyArray,
     step: int,
     cursor: LoaderCursor | None,
+    config: BaseModel | None = None,
+    update_latest: bool = False,
+) -> None:
+    """Snapshot ``(model, ema, opt_state, rng)`` and write it on a worker thread.
+
+    The :func:`jax.device_get` snapshot decouples the artifact from
+    device-resident arrays before returning, so the caller can mutate
+    params on the next training step while the host-side write is still
+    in flight. The executor is a single worker — bounded queue depth of
+    one — so a slow upload backpressures the next save rather than
+    spawning unbounded snapshots.
+
+    Pass ``config`` to bundle ``config.yaml`` into the same atomic
+    rename; the YAML is rendered on the calling thread (cheap) so the
+    worker thread doesn't touch the live config object. Multi-host
+    semantics match :func:`save_checkpoint`: rank-0 writes, all hosts
+    barrier — here on a ``snap:<name>`` token so the barrier reflects
+    the moment the snapshot is host-resident, not when the write lands.
+    """
+    if _AsyncSaveState.inflight is not None:
+        _AsyncSaveState.inflight.result()
+        _AsyncSaveState.inflight = None
+
+    is_rank_zero = jax.process_index() == 0
+    snapshot: tuple[M, M, optax.OptState, PRNGKeyArray] | None = None
+    config_yaml: str | None = None
+    if is_rank_zero:
+        snapshot = jax.device_get((model, ema_model, opt_state, key))
+        if config is not None:
+            config_yaml = yaml.dump(config.model_dump(mode="json"))
+
+    if jax.process_count() > 1:
+        multihost_utils.sync_global_devices(f"snap:{path.name}")
+
+    if not is_rank_zero or snapshot is None:
+        return
+
+    if _AsyncSaveState.executor is None:
+        _AsyncSaveState.executor = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="ckpt-save"
+        )
+    _AsyncSaveState.inflight = _AsyncSaveState.executor.submit(
+        _write_snapshot,
+        path,
+        snapshot=snapshot,
+        step=step,
+        cursor=cursor,
+        config_yaml=config_yaml,
+        update_latest=update_latest,
+    )
+
+
+def flush_pending_save() -> None:
+    """Block on any in-flight :func:`save_checkpoint_async` write.
+
+    Re-raises whatever exception the worker raised so caller sees a
+    failed save rather than silently losing the last checkpoint. Idle
+    when no save is in flight, including on non-rank-0 hosts where
+    submission is skipped.
+    """
+    if _AsyncSaveState.inflight is not None:
+        try:
+            _AsyncSaveState.inflight.result()
+        finally:
+            _AsyncSaveState.inflight = None
+
+
+def _write_snapshot[M: DiffusionModel](
+    path: Path,
+    *,
+    snapshot: tuple[M, M, optax.OptState, PRNGKeyArray],
+    step: int,
+    cursor: LoaderCursor | None,
+    config_yaml: str | None,
     update_latest: bool,
 ) -> None:
+    model, ema_model, opt_state, key = snapshot
     if path.exists():
         msg = f"refusing to overwrite existing checkpoint at {path}"
         raise FileExistsError(msg)
@@ -146,6 +240,8 @@ def _write_checkpoint[M: DiffusionModel](
     eqx.tree_serialise_leaves(tmp_path / RNG_FILENAME, key)
     meta = CheckpointMeta(step=step, cursor=cursor)
     (tmp_path / META_FILENAME).write_text(meta.model_dump_json(indent=2))
+    if config_yaml is not None:
+        (tmp_path / CONFIG_SIDECAR_FILENAME).write_text(config_yaml)
 
     tmp_path.replace(path)
 
