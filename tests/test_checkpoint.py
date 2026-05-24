@@ -22,6 +22,7 @@ from nanodiffusion.checkpoint import (
     load_model,
     make_manager,
     save_checkpoint,
+    save_checkpoint_with_logging,
 )
 from nanodiffusion.data.cursors import PretrainCursor
 from nanodiffusion.model import Transformer
@@ -513,3 +514,40 @@ def test_checkpoint_meta_json_round_trip() -> None:
             "token_offset": 0,
         },
     }
+
+
+def test_save_with_logging_emits_submit_and_finalize_events(
+    tmp_path: Path,
+    small_config: ModelConfig,
+    key: jax.Array,
+) -> None:
+    """``save_checkpoint_with_logging`` emits submit + finalize structured events."""
+    model = Transformer(small_config, key=key)
+    _, opt_state = _make_opt(model)
+
+    mngr = make_manager(tmp_path)
+    with structlog.testing.capture_logs() as cap_logs:
+        save_checkpoint_with_logging(
+            mngr,
+            1,
+            model=model,
+            ema_model=model,
+            opt_state=opt_state,
+            key=jax.random.key(0),
+            cursor=None,
+        )
+        flush(mngr)
+        deadline = time.perf_counter() + 2.0
+        while time.perf_counter() < deadline and not any(
+            r.get("event") == "checkpoint_save_finalized" for r in cap_logs
+        ):
+            time.sleep(0.01)
+
+    submit = next(r for r in cap_logs if r.get("event") == "checkpoint_save_submitted")
+    final = next(r for r in cap_logs if r.get("event") == "checkpoint_save_finalized")
+    assert submit["step"] == 1
+    assert submit["bytes_est"] > 0
+    assert final["step"] == 1
+    assert final["bytes_est"] == submit["bytes_est"]
+    assert final["wall_s"] > 0
+    assert final["throughput_mb_s"] > 0

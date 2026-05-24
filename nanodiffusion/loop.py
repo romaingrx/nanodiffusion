@@ -4,22 +4,19 @@ import dataclasses
 import datetime
 import math
 import os
-import threading
 import time
 from collections.abc import Callable, Iterator
 from pathlib import Path
 
-import equinox as eqx
 import jax
 import optax
-import orbax.checkpoint as ocp
 import structlog
 
 from nanodiffusion.checkpoint import (
     flush,
     make_manager,
     resolve_checkpoint_uri,
-    save_checkpoint,
+    save_checkpoint_with_logging,
 )
 from nanodiffusion.data.cursors import LoaderCursor
 from nanodiffusion.data.loader import DevicePrefetchIterator
@@ -95,58 +92,6 @@ def _save_final_checkpoint_if_needed[M: DiffusionModel, C: LoaderCursor](
     """
     if state.step > initial_step and state.last_saved_step != state.step:
         save()
-
-
-def _save_with_logging[M: DiffusionModel, C: LoaderCursor](
-    state: LoopState[M, C],
-    *,
-    mngr: ocp.CheckpointManager,
-    ckpt_uri: str,
-) -> None:
-    arrays = eqx.filter(
-        (state.model, state.ema_model, state.opt_state, state.key),
-        eqx.is_array,
-    )
-    bytes_est = sum(int(a.size) * a.dtype.itemsize for a in jax.tree.leaves(arrays))
-    save_step = state.step
-    t0 = time.perf_counter()
-    logger.info(
-        "checkpoint_save_submitted",
-        step=save_step,
-        bytes_est=bytes_est,
-        uri=ckpt_uri,
-    )
-    save_checkpoint(
-        mngr,
-        save_step,
-        model=state.model,
-        ema_model=state.ema_model,
-        opt_state=state.opt_state,
-        key=state.key,
-        cursor=state.cursor,
-    )
-    state.last_saved_step = save_step
-
-    def _await_and_log() -> None:
-        try:
-            mngr.wait_until_finished()
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("checkpoint_save_failed", step=save_step, error=str(exc))
-            return
-        wall_s = time.perf_counter() - t0
-        logger.info(
-            "checkpoint_save_finalized",
-            step=save_step,
-            wall_s=wall_s,
-            bytes_est=bytes_est,
-            throughput_mb_s=bytes_est / max(wall_s, 1e-9) / 1024**2,
-        )
-
-    threading.Thread(
-        target=_await_and_log,
-        daemon=True,
-        name=f"ckpt-await-{save_step}",
-    ).start()
 
 
 def _log_graceful_stop(stop_request: StopRequest, *, step: int, run_dir: Path) -> None:
@@ -225,7 +170,16 @@ def run_training_loop[M: DiffusionModel, B, JB, C: LoaderCursor](
     logger.info("checkpoint_manager_ready", uri=ckpt_uri)
 
     def _save() -> None:
-        _save_with_logging(state, mngr=mngr, ckpt_uri=ckpt_uri)
+        save_checkpoint_with_logging(
+            mngr,
+            state.step,
+            model=state.model,
+            ema_model=state.ema_model,
+            opt_state=state.opt_state,
+            key=state.key,
+            cursor=state.cursor,
+        )
+        state.last_saved_step = state.step
 
     t_window_start = time.monotonic()
     with (

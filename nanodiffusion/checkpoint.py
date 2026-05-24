@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import threading
+import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, cast
 
@@ -106,6 +108,61 @@ def save_checkpoint[M: DiffusionModel](
             meta=ocp.args.JsonSave(meta),
         ),
     )
+
+
+def save_checkpoint_with_logging[M: DiffusionModel](
+    mngr: ocp.CheckpointManager,
+    step: int,
+    *,
+    model: M,
+    ema_model: M,
+    opt_state: optax.OptState,
+    key: PRNGKeyArray,
+    cursor: LoaderCursor | None,
+) -> None:
+    """``save_checkpoint`` + structured submit/finalize events for measurement.
+
+    Spawns a daemon thread that waits on the upload and emits
+    ``checkpoint_save_finalized`` once durable, with ``wall_s`` and
+    ``throughput_mb_s``. Daemon dies with the process; under queue-depth-1
+    saves at realistic intervals (>> upload time) the prior daemon has
+    always finished by the time the next save submits.
+    """
+    arrays = eqx.filter((model, ema_model, opt_state, key), eqx.is_array)
+    bytes_est = sum(int(a.size) * a.dtype.itemsize for a in jax.tree.leaves(arrays))
+    uri = str(mngr.directory)
+    t0 = time.perf_counter()
+    logger.info("checkpoint_save_submitted", step=step, bytes_est=bytes_est, uri=uri)
+    save_checkpoint(
+        mngr,
+        step,
+        model=model,
+        ema_model=ema_model,
+        opt_state=opt_state,
+        key=key,
+        cursor=cursor,
+    )
+
+    def _await_and_log() -> None:
+        try:
+            mngr.wait_until_finished()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("checkpoint_save_failed", step=step, error=str(exc))
+            return
+        wall_s = time.perf_counter() - t0
+        logger.info(
+            "checkpoint_save_finalized",
+            step=step,
+            wall_s=wall_s,
+            bytes_est=bytes_est,
+            throughput_mb_s=bytes_est / max(wall_s, 1e-9) / 1024**2,
+        )
+
+    threading.Thread(
+        target=_await_and_log,
+        daemon=True,
+        name=f"ckpt-await-{step}",
+    ).start()
 
 
 def load_checkpoint[M: DiffusionModel](
