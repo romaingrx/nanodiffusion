@@ -42,7 +42,14 @@ train:
   ema_decay: 0.9999
   grad_clip: 1.0
   log_every: 50
-  save_every: 1000
+  # save_every=10000: with the async background save (PR #24), training only
+  # blocks if the previous save hasn't finished by the next save trigger
+  # (queue depth 1). Equinox serialisation currently writes through gcsfuse
+  # at ~3 MB/s (a 6.8 GB ckpt takes ~30 min), so save_every must be > the
+  # save duration in training time. At ~252 ms/step, 10000 steps ≈ 42 min,
+  # comfortably > 30 min. Preempt loss capped at 10000 steps ≈ 42 min.
+  # Drop back to 1000 once the Orbax + TensorStore migration lands.
+  save_every: 10000
   run_dir: runs/pretrain
 
 sft:
