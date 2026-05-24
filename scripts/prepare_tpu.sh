@@ -52,15 +52,18 @@ export PATH="$HOME/.local/bin:$PATH"
 grep -q 'HOME/.local/bin' ~/.bashrc 2>/dev/null || \
     echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc
 
-# --- XLA flags ---
-# Async collective fusion overlaps all-reduce with compute.
+# --- Env file ---
+# tmux in launch.sh starts a non-interactive shell, so ~/.bashrc
+# (which short-circuits in non-interactive mode on Debian/Ubuntu) is
+# not a reliable place for PATH and LIBTPU_INIT_ARGS. Mirror them
+# into a dedicated env file that launch.sh sources explicitly.
+# XLA async collective fusion overlaps all-reduce with compute.
 # JAX_ENABLE_PGLE is NOT set (GPU/CUPTI only, conflicts with --profile-steps).
-
-if ! grep -q 'LIBTPU_INIT_ARGS' ~/.bashrc 2>/dev/null; then
-    cat >> ~/.bashrc <<'EOF'
+cat > "$HOME/.nanodiffusion-env" <<'EOF'
+export PATH="$HOME/.local/bin:$PATH"
 export LIBTPU_INIT_ARGS="--xla_tpu_enable_async_collective_fusion_fuse_all_gather=true --xla_tpu_overlap_compute_collective_tc=true --xla_enable_async_all_gather=true"
 EOF
-fi
+ok "Env file at $HOME/.nanodiffusion-env"
 
 # --- Repo ---
 
