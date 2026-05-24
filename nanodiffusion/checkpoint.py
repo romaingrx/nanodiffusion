@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import threading
 import time
-from pathlib import Path
 from typing import TYPE_CHECKING, Literal, cast
 
 import equinox as eqx
@@ -24,6 +23,7 @@ from nanodiffusion.model import DiffusionModel
 if TYPE_CHECKING:
     import os
     from collections.abc import Callable
+    from pathlib import Path
 
     import optax
 
@@ -64,8 +64,14 @@ def resolve_checkpoint_uri(local_run_dir: Path, *, bucket: str | None) -> str:
         # Orbax/TensorStore reject relative paths; resolve so silent
         # save failures don't slip through when GCS_BUCKET is unset.
         return str(local_run_dir.resolve())
-    rel = local_run_dir.resolve().relative_to(Path.cwd())
-    return f"gs://{bucket}/{rel.as_posix()}"
+    # The repo's runs/ tree is a gcsfuse symlink to the bucket root,
+    # so the bucket key for runs/<paradigm>/<id> is just <paradigm>/<id>.
+    # Resolving the symlink would land us outside cwd and break
+    # relative_to(); strip the prefix lexically instead.
+    parts = local_run_dir.parts
+    if parts and parts[0] == "runs":
+        parts = parts[1:]
+    return f"gs://{bucket}/{'/'.join(parts)}"
 
 
 def make_manager(
