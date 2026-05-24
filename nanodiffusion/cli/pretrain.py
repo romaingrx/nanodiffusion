@@ -25,9 +25,9 @@ import click
     type=click.Path(exists=True, file_okay=False, path_type=Path),
     default=None,
     help=(
-        "Checkpoint directory to resume from. Can be an explicit step "
-        "dir (runs/pretrain/<id>/step_1000) or the 'latest' symlink "
-        "(runs/pretrain/<id>/latest)."
+        "Run directory to resume from (e.g. runs/pretrain/<id>). The "
+        "latest finalised step is selected automatically by the Orbax "
+        "checkpoint manager — no step subdir is needed."
     ),
 )
 @click.option(

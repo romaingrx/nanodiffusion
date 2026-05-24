@@ -8,7 +8,7 @@ import numpy as np
 import pytest
 
 from nanodiffusion.chat import Conversation
-from nanodiffusion.checkpoint import save_checkpoint
+from nanodiffusion.checkpoint import flush, make_manager, save_checkpoint
 from nanodiffusion.config import (
     Config,
     DataConfig,
@@ -16,7 +16,7 @@ from nanodiffusion.config import (
     SFTConfig,
     SFTDatasetConfig,
 )
-from nanodiffusion.constants import CONFIG_SIDECAR_FILENAME, LATEST_LINK_NAME
+from nanodiffusion.constants import CONFIG_SIDECAR_FILENAME
 from nanodiffusion.data.chat_datasets import CHAT_DATASETS, register_chat
 from nanodiffusion.data.chat_source import ChatSource, InMemoryChatSource
 from nanodiffusion.data.datasets import DownloadOptions
@@ -270,23 +270,25 @@ def test_sft_finetune_end_to_end_smoke(
     )
     opt_state = optimizer.init(eqx.filter(model, eqx.is_inexact_array))
 
-    ckpt_dir = tmp_path / "pretrain_latest"
-    save_checkpoint(
-        ckpt_dir,
-        model=model,
-        ema_model=model,
-        opt_state=opt_state,
-        key=jax.random.PRNGKey(0),
-        step=0,
-        cursor=None,
-    )
-    # Drop a config.yaml alongside so _resolve_model_config reads it.
+    pretrain_dir = tmp_path / "pretrain_latest"
+    pretrain_dir.mkdir()
     import yaml  # noqa: PLC0415
 
     ckpt_config = Config(model=sft_model_config)
-    (ckpt_dir / CONFIG_SIDECAR_FILENAME).write_text(
+    (pretrain_dir / CONFIG_SIDECAR_FILENAME).write_text(
         yaml.dump(ckpt_config.model_dump(mode="json"))
     )
+    mngr = make_manager(pretrain_dir)
+    save_checkpoint(
+        mngr,
+        0,
+        model=model,
+        ema_model=model,
+        opt_state=opt_state,
+        key=jax.random.key(0),
+        cursor=None,
+    )
+    flush(mngr)
 
     sft_config = Config(
         model=sft_model_config,
@@ -303,11 +305,9 @@ def test_sft_finetune_end_to_end_smoke(
         ),
     )
 
-    run_dir = sft_finetune(sft_config, pretrain_checkpoint=ckpt_dir)
+    run_dir = sft_finetune(sft_config, pretrain_checkpoint=pretrain_dir)
     assert run_dir.exists()
     assert (run_dir / CONFIG_SIDECAR_FILENAME).exists()
-    assert (run_dir / LATEST_LINK_NAME).exists()
-    # max_steps=3 with save_every=2 → step_2/ exists, step_3/ final save
     step_dirs = sorted(d.name for d in run_dir.iterdir() if d.name.startswith("step_"))
     assert step_dirs, f"no step_ dirs in {run_dir}"
 
@@ -358,18 +358,21 @@ def test_sft_finetune_resumes_from_saved_sft_checkpoint(
     pretrain_opt_state = pretrain_optimizer.init(
         eqx.filter(model, eqx.is_inexact_array)
     )
-    save_checkpoint(
-        pretrain_dir,
-        model=model,
-        ema_model=model,
-        opt_state=pretrain_opt_state,
-        key=jax.random.PRNGKey(0),
-        step=0,
-        cursor=None,
-    )
+    pretrain_dir.mkdir()
     (pretrain_dir / CONFIG_SIDECAR_FILENAME).write_text(
         yaml.dump(Config(model=sft_model_config).model_dump(mode="json"))
     )
+    pretrain_mngr = make_manager(pretrain_dir)
+    save_checkpoint(
+        pretrain_mngr,
+        0,
+        model=model,
+        ema_model=model,
+        opt_state=pretrain_opt_state,
+        key=jax.random.key(0),
+        cursor=None,
+    )
+    flush(pretrain_mngr)
 
     # First run stops cleanly at step 2 (max_steps == save_every), so
     # the periodic save and the end-of-training save collapse into a
@@ -394,10 +397,12 @@ def test_sft_finetune_resumes_from_saved_sft_checkpoint(
     assert mid_ckpt.exists(), sorted(p.name for p in first_run.iterdir())
 
     # Second run resumes and trains to step 6 → expect fresh step_4 + step_6.
+    # ``--resume-from`` now takes the run dir (not a step dir); Orbax
+    # selects the latest finalised step from there.
     resumed_config = first_config.model_copy(
         update={"sft": first_config.sft.model_copy(update={"max_steps": 6})}
     )
-    second_run = sft_finetune(resumed_config, resume_from=mid_ckpt)
+    second_run = sft_finetune(resumed_config, resume_from=first_run)
     # Resume reuses the same run dir per resolve_run_dir semantics.
     assert second_run == first_run
 

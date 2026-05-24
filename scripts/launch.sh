@@ -31,14 +31,14 @@ REPO_DIR="${REPO_DIR:-$HOME/nanodiffusion}"
 # Bootstrap: repo sync, deps, GCS mount, env file. Idempotent.
 bash "$SCRIPT_DIR/prepare_tpu.sh" "$RESUME"
 
-# On --resume, point at the newest step_* dir. gcsfuse can't traverse
-# symlinks across a reboot so we sort numerically by step number.
+# On --resume, point at the newest run dir. Orbax's CheckpointManager
+# picks the latest finalised step itself, so no step-N discovery here.
 RESUME_FLAG=""
 if [ "$RESUME" = "--resume" ]; then
-    LATEST=$(find "$REPO_DIR/runs/pretrain" -maxdepth 2 -name "step_*" -type d 2>/dev/null \
-        | sort -t_ -k2 -n | tail -1)
-    if [ -n "$LATEST" ]; then
-        RESUME_FLAG="--resume-from $LATEST"
+    LATEST_RUN=$(find "$REPO_DIR/runs/pretrain" -mindepth 1 -maxdepth 1 -type d 2>/dev/null \
+        | sort | tail -1)
+    if [ -n "$LATEST_RUN" ]; then
+        RESUME_FLAG="--resume-from $LATEST_RUN"
     fi
 fi
 

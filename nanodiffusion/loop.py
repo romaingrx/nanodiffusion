@@ -12,18 +12,21 @@ fans out to whatever sinks the caller configured.
 import dataclasses
 import datetime
 import math
+import threading
 import time
 from collections.abc import Callable, Iterator
 from pathlib import Path
 
+import equinox as eqx
 import jax
 import optax
 import structlog
-from pydantic import BaseModel
 
 from nanodiffusion.checkpoint import (
-    flush_pending_save,
-    save_checkpoint_async,
+    flush,
+    make_manager,
+    resolve_checkpoint_uri,
+    save_checkpoint,
 )
 from nanodiffusion.data.cursors import LoaderCursor
 from nanodiffusion.data.loader import DevicePrefetchIterator
@@ -49,14 +52,14 @@ def make_run_id() -> str:
 
 
 def resolve_run_dir(run_dir_root: Path, *, resume_from: Path | None) -> Path:
-    """Fresh timestamped run dir, or reuse ``resume_from.parent`` on resume.
+    """Fresh timestamped run dir, or reuse ``resume_from`` on resume.
 
-    The returned directory exists on disk; callers drop their own
-    ``config.yaml`` and ``logger.info`` on top so pretrain and SFT keep
-    their event-name conventions separate.
+    With the Orbax migration ``--resume-from`` points at the run dir
+    itself (the manager finds the latest step internally), so the
+    returned path is just the resolved input on resume.
     """
     if resume_from is not None:
-        run_dir = resume_from.parent.resolve()
+        run_dir = resume_from.resolve()
     else:
         run_dir = run_dir_root / make_run_id()
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -114,10 +117,67 @@ def _save_final_checkpoint_if_needed[M: DiffusionModel, C: LoaderCursor](
     *,
     initial_step: int,
     save: Callable[[], None],
+    flush_pending: Callable[[], None],
 ) -> None:
     if state.step > initial_step and state.last_saved_step != state.step:
-        flush_pending_save()
+        flush_pending()
         save()
+
+
+def _save_with_logging[M: DiffusionModel, C: LoaderCursor](
+    state: LoopState[M, C],
+    *,
+    mngr: object,
+    ckpt_uri: str,
+) -> None:
+    """Submit a save, log submit/finalize events, time the upload."""
+    state_tree = {
+        "model": state.model,
+        "ema": state.ema_model,
+        "opt": state.opt_state,
+        "key": state.key,
+    }
+    arrays, _static = eqx.partition(state_tree, eqx.is_array)
+    bytes_est = sum(int(a.size) * a.dtype.itemsize for a in jax.tree.leaves(arrays))
+    save_step = state.step
+    t0 = time.perf_counter()
+    logger.info(
+        "checkpoint_save_submitted",
+        step=save_step,
+        bytes_est=bytes_est,
+        uri=ckpt_uri,
+    )
+    save_checkpoint(
+        mngr,  # type: ignore[arg-type]
+        save_step,
+        model=state.model,
+        ema_model=state.ema_model,
+        opt_state=state.opt_state,
+        key=state.key,
+        cursor=state.cursor,
+    )
+    state.last_saved_step = save_step
+
+    def _await_and_log() -> None:
+        try:
+            mngr.wait_until_finished()  # type: ignore[attr-defined]
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("checkpoint_save_failed", step=save_step, error=str(exc))
+            return
+        wall_s = time.perf_counter() - t0
+        logger.info(
+            "checkpoint_save_finalized",
+            step=save_step,
+            wall_s=wall_s,
+            bytes_est=bytes_est,
+            throughput_mb_s=bytes_est / max(wall_s, 1e-9) / 1024**2,
+        )
+
+    threading.Thread(
+        target=_await_and_log,
+        daemon=True,
+        name=f"ckpt-await-{save_step}",
+    ).start()
 
 
 def _log_graceful_stop(stop_request: StopRequest, *, step: int, run_dir: Path) -> None:
@@ -180,7 +240,6 @@ def _collect_host_metrics(
 def run_training_loop[M: DiffusionModel, B, JB, C: LoaderCursor](
     state: LoopState[M, C],
     *,
-    config: BaseModel,
     run_dir: Path,
     train_step: TrainStepFn[M, JB],
     lr_schedule: optax.Schedule,
@@ -209,21 +268,12 @@ def run_training_loop[M: DiffusionModel, B, JB, C: LoaderCursor](
     last_log_step = state.step
     supervised_tokens_in_window = 0
 
+    ckpt_uri = resolve_checkpoint_uri(run_dir)
+    mngr = make_manager(ckpt_uri)
+    logger.info("checkpoint_manager_ready", uri=ckpt_uri)
+
     def _save() -> None:
-        ckpt_dir = run_dir / f"step_{state.step}"
-        save_checkpoint_async(
-            ckpt_dir,
-            model=state.model,
-            ema_model=state.ema_model,
-            opt_state=state.opt_state,
-            key=state.key,
-            step=state.step,
-            cursor=state.cursor,
-            config=config,
-            update_latest=True,
-        )
-        state.last_saved_step = state.step
-        logger.info("checkpoint_queued", path=str(ckpt_dir), step=state.step)
+        _save_with_logging(state, mngr=mngr, ckpt_uri=ckpt_uri)
 
     t_window_start = time.monotonic()
     with (
@@ -305,7 +355,12 @@ def run_training_loop[M: DiffusionModel, B, JB, C: LoaderCursor](
             if stop_request.requested:
                 break
 
-    flush_pending_save()
-    _save_final_checkpoint_if_needed(state, initial_step=initial_step, save=_save)
-    flush_pending_save()
+    flush(mngr)
+    _save_final_checkpoint_if_needed(
+        state,
+        initial_step=initial_step,
+        save=_save,
+        flush_pending=lambda: flush(mngr),
+    )
+    flush(mngr)
     _log_graceful_stop(stop_request, step=state.step, run_dir=run_dir)

@@ -1,62 +1,49 @@
-"""On-disk checkpoints for a training run.
+"""On-disk checkpoints via Orbax + TensorStore.
 
-A checkpoint directory holds four equinox-serialised binary files
-(``model.eqx`` / ``ema.eqx`` / ``opt_state.eqx`` / ``rng.eqx``) plus a
-``meta.json`` sidecar for the step / data-loader cursor and a
-``config.yaml`` written by :func:`write_config`. The RNG key lives in
-its own binary artifact so resume continues the same stochastic chain
-(masking / timestep sampling) rather than rewinding to the seed.
+A checkpoint manager owns a directory of step subdirectories
+(``step_N/``) each holding a ``state/`` item (model + ema + opt_state +
+key, serialised through TensorStore's OCDBT format) and a ``meta/``
+item (step counter + data-loader cursor, serialised as JSON). The
+``config.yaml`` sidecar is written once at run-dir level by
+:func:`write_config`, not per-step.
 
-Binary save/load is generic over the concrete diffusion-model class:
-pass a ``Transformer`` skeleton in, get a ``Transformer`` back, no
-casts at the call site. Only the sidecar helpers touch ``Config``, so
-a pydantic schema change can only drift through that path.
+The serialisation switch from ``eqx.tree_serialise_leaves`` was driven
+by the gcsfuse mount: Orbax + TensorStore talk the GCS JSON API
+directly via chunked OCDBT uploads (100+ MB/s), while the eqx path
+goes through gcsfuse and caps at ~3 MB/s because the many small leaf
+writes can't be batched.
 """
 
-import shutil
-from collections.abc import Callable
-from concurrent.futures import Future, ThreadPoolExecutor
-from pathlib import Path
-from typing import Literal, cast
+from __future__ import annotations
+
+import os
+from typing import TYPE_CHECKING, Literal, cast
 
 import equinox as eqx
 import jax
-import optax
+import jax.numpy as jnp
+import orbax.checkpoint as ocp
 import structlog
 import yaml
-from jax.experimental import multihost_utils
+from etils import epath
 from pydantic import BaseModel, ConfigDict, Field
 
 from nanodiffusion.config import Config, ModelConfig
-from nanodiffusion.constants import (
-    CONFIG_SIDECAR_FILENAME,
-    EMA_FILENAME,
-    LATEST_LINK_NAME,
-    META_FILENAME,
-    MODEL_FILENAME,
-    OPT_STATE_FILENAME,
-    RNG_FILENAME,
-)
+from nanodiffusion.constants import CONFIG_SIDECAR_FILENAME
 from nanodiffusion.data.cursors import LoaderCursor
 from nanodiffusion.model import DiffusionModel
-from nanodiffusion.types import PRNGKeyArray
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
+    from pathlib import Path
+
+    import optax
+
+    from nanodiffusion.types import PRNGKeyArray
 
 logger = structlog.get_logger(__name__)
 
 type ModelSnapshot = Literal["model", "ema"]
-
-
-class _AsyncSaveState:
-    """Mutable singleton for the async-save executor and in-flight future.
-
-    Class attributes (not module-level ``global`` rebinding) so writers
-    just assign and the lint stays clean. One worker, queue depth one:
-    a slow gcsfuse upload backpressures the next call to
-    :func:`save_checkpoint_async`, never spawns a second snapshot.
-    """
-
-    executor: ThreadPoolExecutor | None = None
-    inflight: Future[None] | None = None
 
 
 class CheckpointMeta(BaseModel):
@@ -89,252 +76,211 @@ class CheckpointMeta(BaseModel):
         return self.cursor
 
 
-def save_checkpoint[M: DiffusionModel](
-    path: Path,
-    *,
-    model: M,
-    ema_model: M,
-    opt_state: optax.OptState,
-    key: PRNGKeyArray,
-    step: int,
-    cursor: LoaderCursor | None,
-    update_latest: bool = False,
-) -> None:
-    """Write ``(model, ema, opt_state, rng, meta)`` atomically to ``path``.
+def resolve_checkpoint_uri(local_run_dir: Path, *, env_var: str = "GCS_BUCKET") -> str:
+    """Return the URI Orbax should target for a local run dir.
 
-    Synchronous: the training thread blocks until all four equinox
-    leaves are serialised and the ``.tmp`` dir renames into place. Use
-    :func:`save_checkpoint_async` from the training loop when the
-    serialise + upload cost matters (gcsfuse cross-region uploads can
-    run into minutes); the sync path is kept for tests and inference
-    dumps where a deterministic write is the simpler contract.
-
-    Multi-host safe: only the rank-0 process writes; all hosts then
-    barrier on :func:`multihost_utils.sync_global_devices` so no reader
-    races ahead of the on-disk artifact. Safe to call unconditionally
-    from every host — the gate lives inside rather than at call sites.
-
-    Leaves land in a sibling ``<path>.tmp`` dir first, then a single
-    :func:`os.replace` renames into place (atomic on POSIX; on
-    gcsfuse-backed paths the rename maps to a GCS copy+delete which is
-    not strictly atomic, so partial ``.tmp`` dirs are possible after a
-    hard preemption and get cleaned up on the next save). Raises
-    :class:`FileExistsError` if ``path`` already exists — we refuse to
-    silently overwrite a prior checkpoint.
-
-    When ``update_latest=True``, point ``path.parent/latest`` at
-    ``path.name`` via a temp-link swap; platforms that reject symlinks
-    (unprivileged Windows) log and skip rather than failing the save.
+    When ``$GCS_BUCKET`` is set, maps the ``runs/...`` suffix of
+    ``local_run_dir`` onto ``gs://<bucket>/<rel>`` so TensorStore goes
+    directly to GCS instead of through gcsfuse. Without the env var
+    (local dev, tests), the local path is returned as-is so
+    ``epath.Path`` falls back to the regular filesystem.
     """
-    if jax.process_index() == 0:
-        _write_snapshot(
-            path,
-            snapshot=(model, ema_model, opt_state, key),
-            step=step,
-            cursor=cursor,
-            config_yaml=None,
-            update_latest=update_latest,
-        )
-    if jax.process_count() > 1:
-        multihost_utils.sync_global_devices(f"save_checkpoint:{path.name}")
+    bucket = os.environ.get(env_var)
+    if bucket is None:
+        return str(local_run_dir)
+    parts = local_run_dir.absolute().parts
+    try:
+        idx = parts.index("runs")
+    except ValueError:
+        return str(local_run_dir)
+    rel = "/".join(parts[idx:])
+    return f"gs://{bucket}/{rel}"
 
 
-def save_checkpoint_async[M: DiffusionModel](
-    path: Path,
-    *,
-    model: M,
-    ema_model: M,
-    opt_state: optax.OptState,
-    key: PRNGKeyArray,
-    step: int,
-    cursor: LoaderCursor | None,
-    config: BaseModel | None = None,
-    update_latest: bool = False,
-) -> None:
-    """Snapshot ``(model, ema, opt_state, rng)`` and write it on a worker thread.
+def make_manager(
+    uri: str | os.PathLike[str], *, max_to_keep: int = 5
+) -> ocp.CheckpointManager:
+    """Create an Orbax CheckpointManager for ``uri``.
 
-    The :func:`jax.device_get` snapshot decouples the artifact from
-    device-resident arrays before returning, so the caller can mutate
-    params on the next training step while the host-side write is still
-    in flight. The executor is a single worker — bounded queue depth of
-    one — so a slow upload backpressures the next save rather than
-    spawning unbounded snapshots.
-
-    Pass ``config`` to bundle ``config.yaml`` into the same atomic
-    rename; the YAML is rendered on the calling thread (cheap) so the
-    worker thread doesn't touch the live config object. Multi-host
-    semantics match :func:`save_checkpoint`: rank-0 writes, all hosts
-    barrier — here on a ``snap:<name>`` token so the barrier reflects
-    the moment the snapshot is host-resident, not when the write lands.
+    Accepts ``gs://...`` URLs or local paths transparently via
+    ``epath.Path``. ``max_to_keep`` triggers GC of older steps after
+    each successful save.
     """
-    if _AsyncSaveState.inflight is not None:
-        _AsyncSaveState.inflight.result()
-        _AsyncSaveState.inflight = None
-
-    is_rank_zero = jax.process_index() == 0
-    snapshot: tuple[M, M, optax.OptState, PRNGKeyArray] | None = None
-    config_yaml: str | None = None
-    if is_rank_zero:
-        snapshot = jax.device_get((model, ema_model, opt_state, key))
-        if config is not None:
-            config_yaml = yaml.dump(config.model_dump(mode="json"))
-
-    if jax.process_count() > 1:
-        multihost_utils.sync_global_devices(f"snap:{path.name}")
-
-    if not is_rank_zero or snapshot is None:
-        return
-
-    if _AsyncSaveState.executor is None:
-        _AsyncSaveState.executor = ThreadPoolExecutor(
-            max_workers=1, thread_name_prefix="ckpt-save"
-        )
-    _AsyncSaveState.inflight = _AsyncSaveState.executor.submit(
-        _write_snapshot,
-        path,
-        snapshot=snapshot,
-        step=step,
-        cursor=cursor,
-        config_yaml=config_yaml,
-        update_latest=update_latest,
+    return ocp.CheckpointManager(
+        epath.Path(uri),
+        options=ocp.CheckpointManagerOptions(
+            max_to_keep=max_to_keep,
+            step_prefix="step",
+            enable_async_checkpointing=True,
+        ),
+        item_names=("state", "meta"),
     )
 
 
-def flush_pending_save() -> None:
-    """Block on any in-flight :func:`save_checkpoint_async` write.
-
-    Re-raises whatever exception the worker raised so caller sees a
-    failed save rather than silently losing the last checkpoint. Idle
-    when no save is in flight, including on non-rank-0 hosts where
-    submission is skipped.
-    """
-    if _AsyncSaveState.inflight is not None:
-        try:
-            _AsyncSaveState.inflight.result()
-        finally:
-            _AsyncSaveState.inflight = None
-
-
-def _write_snapshot[M: DiffusionModel](
-    path: Path,
-    *,
-    snapshot: tuple[M, M, optax.OptState, PRNGKeyArray],
+def save_checkpoint[M: DiffusionModel](
+    mngr: ocp.CheckpointManager,
     step: int,
+    *,
+    model: M,
+    ema_model: M,
+    opt_state: optax.OptState,
+    key: PRNGKeyArray,
     cursor: LoaderCursor | None,
-    config_yaml: str | None,
-    update_latest: bool,
 ) -> None:
-    model, ema_model, opt_state, key = snapshot
-    if path.exists():
-        msg = f"refusing to overwrite existing checkpoint at {path}"
-        raise FileExistsError(msg)
+    """Queue an asynchronous save of ``(model, ema, opt_state, key, meta)``.
 
-    tmp_path = path.with_name(path.name + ".tmp")
-    if tmp_path.exists():
-        shutil.rmtree(tmp_path)
-    tmp_path.mkdir(parents=True)
+    Returns ~immediately. Orbax fans out TensorStore writes on a
+    background thread. A subsequent ``save_checkpoint`` call on the
+    same manager blocks on the previous save's finalisation (queue
+    depth one) — this provides natural backpressure when ``save_every``
+    is short relative to upload time.
 
-    eqx.tree_serialise_leaves(tmp_path / MODEL_FILENAME, model)
-    eqx.tree_serialise_leaves(tmp_path / EMA_FILENAME, ema_model)
-    eqx.tree_serialise_leaves(tmp_path / OPT_STATE_FILENAME, opt_state)
-    eqx.tree_serialise_leaves(tmp_path / RNG_FILENAME, key)
-    meta = CheckpointMeta(step=step, cursor=cursor)
-    (tmp_path / META_FILENAME).write_text(meta.model_dump_json(indent=2))
-    if config_yaml is not None:
-        (tmp_path / CONFIG_SIDECAR_FILENAME).write_text(config_yaml)
-
-    tmp_path.replace(path)
-
-    if update_latest:
-        _update_latest_symlink(path.parent, path.name)
-
-
-def _update_latest_symlink(run_dir: Path, target_name: str) -> None:
-    """Atomically point ``run_dir/latest`` at ``target_name``.
-
-    Uses a relative target so the run directory is portable, and
-    renames a temp link over the existing one so readers never
-    observe a missing ``latest``. ``OSError`` is logged and swallowed
-    for filesystems that reject symlinks.
+    Multi-host: must be called on every host. Orbax does its own
+    coordination internally; there is no rank-0 gate at the Python
+    level. The state tree is materialised to host memory via
+    ``jax.device_get`` before submission so the next training step's
+    ``donate="all"`` can reuse the device buffers while Orbax is still
+    uploading.
     """
-    tmp_link = run_dir / (LATEST_LINK_NAME + ".tmp")
-    final_link = run_dir / LATEST_LINK_NAME
-    try:
-        if tmp_link.is_symlink() or tmp_link.exists():
-            tmp_link.unlink()
-        tmp_link.symlink_to(target_name)
-        tmp_link.replace(final_link)
-    except OSError as exc:
-        logger.warning(
-            "latest_symlink_skipped",
-            run_dir=str(run_dir),
-            target=target_name,
-            error=str(exc),
-        )
+    state: dict[str, object] = {
+        "model": model,
+        "ema": ema_model,
+        "opt": opt_state,
+        "key": key,
+    }
+    arrays, _static = eqx.partition(state, eqx.is_array)
+    arrays = jax.device_get(arrays)
+    meta = CheckpointMeta(step=step, cursor=cursor).model_dump(mode="json")
+    mngr.save(
+        step,
+        args=ocp.args.Composite(
+            state=ocp.args.StandardSave(arrays),
+            meta=ocp.args.JsonSave(meta),
+        ),
+    )
 
 
 def load_checkpoint[M: DiffusionModel](
-    path: Path,
+    mngr_or_uri: ocp.CheckpointManager | str | os.PathLike[str],
     *,
     model_skeleton: M,
     opt_state_builder: Callable[[M], optax.OptState],
+    step: int | None = None,
 ) -> tuple[M, M, optax.OptState, PRNGKeyArray, CheckpointMeta]:
     """Inverse of :func:`save_checkpoint`.
 
-    ``model_skeleton`` may be either a real :class:`DiffusionModel` or
-    an abstract shape tree from :func:`eqx.filter_eval_shape`; only
-    leaf shape + dtype are read. ``opt_state_builder`` is called with
-    the freshly loaded model to shape the opt-state tree — typically
-    ``lambda m: optimizer.init(eqx.filter(m, eqx.is_inexact_array))``.
-    Threading a builder instead of a pre-built skeleton lets callers
-    skip the wasteful real-weights init on resume and keeps the
-    two-phase load hidden from every driver.
+    Accepts either an open ``CheckpointManager`` (when the caller is
+    keeping one around for ongoing saves — typical in the training
+    loop) or a URI/path (one-shot loads from tests / inference paths).
 
-    ``path`` may be a ``latest`` symlink; the filesystem resolves it
-    transparently. The return type is bound to the skeleton's concrete
-    type so callers keep model-specific attributes without downcasts.
+    ``step`` defaults to ``mngr.latest_step()``. Raises
+    :class:`FileNotFoundError` if no finalised step exists.
     """
-    model = cast(
-        "M", eqx.tree_deserialise_leaves(path / MODEL_FILENAME, model_skeleton)
+    mngr = (
+        mngr_or_uri
+        if isinstance(mngr_or_uri, ocp.CheckpointManager)
+        else make_manager(mngr_or_uri, max_to_keep=1)
     )
-    ema_model = cast(
-        "M", eqx.tree_deserialise_leaves(path / EMA_FILENAME, model_skeleton)
+    resolved_step = step if step is not None else mngr.latest_step()
+    if resolved_step is None:
+        msg = f"no finalised checkpoint to restore in {mngr.directory}"
+        raise FileNotFoundError(msg)
+
+    skel_state = _build_skel_state(model_skeleton, opt_state_builder)
+    arr_skel, static = eqx.partition(skel_state, eqx.is_array)
+
+    restored = mngr.restore(
+        resolved_step,
+        args=ocp.args.Composite(
+            state=ocp.args.StandardRestore(arr_skel),
+            meta=ocp.args.JsonRestore(),
+        ),
     )
-    opt_state_skeleton = opt_state_builder(model)
-    opt_state = cast(
-        "optax.OptState",
-        eqx.tree_deserialise_leaves(path / OPT_STATE_FILENAME, opt_state_skeleton),
+    state = eqx.combine(restored["state"], static)
+    meta = CheckpointMeta.model_validate(restored["meta"])
+    _assert_step_counters_match(state["opt"], meta.step)
+    return (
+        cast("M", state["model"]),
+        cast("M", state["ema"]),
+        cast("optax.OptState", state["opt"]),
+        cast("PRNGKeyArray", state["key"]),
+        meta,
     )
-    key_skeleton = jax.random.PRNGKey(0)
-    key = cast(
-        "PRNGKeyArray",
-        eqx.tree_deserialise_leaves(path / RNG_FILENAME, key_skeleton),
+
+
+def load_meta(
+    uri: str | os.PathLike[str], *, step: int | None = None
+) -> CheckpointMeta:
+    """Read just the ``meta`` item from a checkpoint.
+
+    Standalone — used by inference paths that don't need the heavy
+    model+opt_state restore. Returns the validated Pydantic model
+    (step counter + data-loader cursor).
+    """
+    mngr = make_manager(uri, max_to_keep=1)
+    resolved_step = step if step is not None else mngr.latest_step()
+    if resolved_step is None:
+        msg = f"no finalised checkpoint to read in {uri}"
+        raise FileNotFoundError(msg)
+    restored = mngr.restore(
+        resolved_step,
+        args=ocp.args.Composite(meta=ocp.args.JsonRestore()),
     )
-    meta = CheckpointMeta.model_validate_json((path / META_FILENAME).read_text())
-    return model, ema_model, opt_state, key, meta
+    return CheckpointMeta.model_validate(restored["meta"])
 
 
 def load_model[M: DiffusionModel](
-    path: Path,
+    uri: str | os.PathLike[str],
     *,
     model_skeleton: M,
     which: ModelSnapshot = "ema",
+    step: int | None = None,
 ) -> M:
-    """Read just the model weights from a training checkpoint.
+    """Read just the model (or EMA) weights from a checkpoint.
 
-    For inference and sampling paths that don't need optimizer state
-    or metadata. ``which="ema"`` (more stable, sampling default) or
-    ``"model"`` (raw trained weights).
+    Standalone — no manager required from the caller. Opens a manager,
+    restores only the requested subtree (Orbax restores the subset of
+    leaves provided in the target), and returns. ``which="ema"`` is
+    the default for sampling/inference because EMA weights are the
+    smoothed inference target; ``which="model"`` returns the raw
+    trained weights (used to seed SFT from a pretrain checkpoint).
     """
-    filename = EMA_FILENAME if which == "ema" else MODEL_FILENAME
-    return cast("M", eqx.tree_deserialise_leaves(path / filename, model_skeleton))
+    mngr = make_manager(uri, max_to_keep=1)
+    resolved_step = step if step is not None else mngr.latest_step()
+    if resolved_step is None:
+        msg = f"no finalised checkpoint to load in {uri}"
+        raise FileNotFoundError(msg)
+
+    real_skeleton = _materialize_skeleton(model_skeleton)
+    arr_skel, static = eqx.partition(real_skeleton, eqx.is_array)
+    target: dict[str, object] = {which: arr_skel}
+    # ``partial_restore=True`` tells Orbax that ``target`` intentionally
+    # covers only a subtree of the saved state — without it, restore
+    # fails with a "structures do not match" error.
+    restored = mngr.restore(
+        resolved_step,
+        args=ocp.args.Composite(
+            state=ocp.args.PyTreeRestore(target, partial_restore=True),
+        ),
+    )
+    return cast("M", eqx.combine(restored["state"][which], static))
+
+
+def flush(mngr: ocp.CheckpointManager) -> None:
+    """Block until all queued saves on ``mngr`` have finalised on disk.
+
+    Idempotent when nothing is in flight. Always call before exiting
+    the training loop so async writes aren't abandoned on shutdown.
+    """
+    mngr.wait_until_finished()
 
 
 def write_config(run_dir: Path, config: BaseModel) -> None:
     """Dump a resolved pydantic config to ``run_dir/config.yaml``.
 
-    Uses ``model_dump(mode="json")`` so ``Path`` and other non-yaml
-    types round-trip cleanly through :func:`yaml.safe_load`.
+    The sidecar lives at the run-dir root (not under ``step_*/``),
+    so it survives both the gcsfuse local view and the Orbax gs://
+    checkpoint tree.
     """
     (run_dir / CONFIG_SIDECAR_FILENAME).write_text(
         yaml.dump(config.model_dump(mode="json"))
@@ -342,21 +288,21 @@ def write_config(run_dir: Path, config: BaseModel) -> None:
 
 
 def resolve_model_config_from_checkpoint(
-    checkpoint: Path,
+    run_dir: Path,
     *,
     fallback: ModelConfig,
     log_event: str,
 ) -> ModelConfig:
-    """Pick up a checkpoint's ``config.yaml`` model section when present.
+    """Pick up the run's ``config.yaml`` model section when present.
 
-    The sidecar is authoritative for model shape since the on-disk
-    weights were produced under it. If the user-supplied ``fallback``
-    disagrees we warn under ``log_event`` and keep going; a genuinely
-    mismatched shape would fail at deserialisation one line later.
-    Missing sidecar falls back silently so hand-constructed test
-    checkpoints keep working.
+    ``config.yaml`` lives at the run-dir root. The sidecar is
+    authoritative for model shape since the on-disk weights were
+    produced under it. If the user-supplied ``fallback`` disagrees we
+    warn under ``log_event`` and keep going; a genuinely mismatched
+    shape would fail at restore time one call later. Missing sidecar
+    falls back silently so hand-constructed test runs keep working.
     """
-    sidecar = checkpoint / CONFIG_SIDECAR_FILENAME
+    sidecar = run_dir / CONFIG_SIDECAR_FILENAME
     if not sidecar.exists():
         return fallback
     from_disk = Config.from_yaml(sidecar)
@@ -367,3 +313,86 @@ def resolve_model_config_from_checkpoint(
             ignored=fallback.model_dump(),
         )
     return from_disk.model
+
+
+def _materialize_skeleton[T](skeleton: T) -> T:
+    """Replace ``ShapeDtypeStruct`` leaves with zero-filled real arrays.
+
+    Optax's ``optimizer.init`` walks the model with ``eqx.filter(m,
+    eqx.is_inexact_array)`` — a filter that returns False for
+    ``ShapeDtypeStruct``, so an abstract skeleton produces an empty
+    opt_state. Materialising to host-side zeros keeps the abstract
+    path's "no graph trace, no init draws" promise while letting
+    ``opt_state_builder`` see a real tree.
+    """
+    return jax.tree.map(
+        lambda x: (
+            jnp.zeros(x.shape, x.dtype) if isinstance(x, jax.ShapeDtypeStruct) else x
+        ),
+        skeleton,
+    )
+
+
+def _build_skel_state[M: DiffusionModel](
+    model_skeleton: M,
+    opt_state_builder: Callable[[M], optax.OptState],
+) -> dict[str, object]:
+    """Construct a skeleton state tree mirroring what ``save_checkpoint`` wrote.
+
+    Materialises the (possibly abstract) ``model_skeleton`` to real
+    host-side zeros so ``opt_state_builder`` can run through
+    :func:`optax.GradientTransformation.init` — which uses
+    ``eqx.is_inexact_array`` internally and would otherwise see Nones
+    at every array position under an abstract skeleton.
+    """
+    real_skeleton = _materialize_skeleton(model_skeleton)
+    return {
+        "model": real_skeleton,
+        "ema": real_skeleton,
+        "opt": opt_state_builder(real_skeleton),
+        "key": jax.random.key(0),
+    }
+
+
+def _assert_step_counters_match(opt_state: object, meta_step: int) -> None:
+    """Log a warning if optax step counter and ``meta.step`` disagree.
+
+    The optimizer's internal ``count`` is incremented on every
+    ``optimizer.update`` call; it should equal ``meta.step`` at save
+    time. Drift signals a bug in step tracking (e.g. a save happening
+    on a step where the optimizer was skipped via
+    :func:`nanodiffusion.optimizer.apply_or_skip`). We warn rather
+    than fail so a single non-finite-gradient skip doesn't abort the
+    resume — the operator can investigate the log.
+    """
+
+    def _is_count_holder(x: object) -> bool:
+        # ``tuple.count`` is a method; we want a non-callable ``count``
+        # attribute (the jnp scalar in optax's ScaleByAdamState etc.).
+        count = getattr(x, "count", None)
+        return count is not None and not callable(count)
+
+    counts: list[int] = []
+    for leaf in jax.tree.leaves(opt_state, is_leaf=_is_count_holder):
+        if not _is_count_holder(leaf):
+            continue
+        try:
+            counts.append(int(leaf.count))
+        except (TypeError, ValueError):
+            continue
+    if not counts:
+        return
+    if not all(c == counts[0] for c in counts):
+        logger.warning(
+            "checkpoint_step_counter_disagreement",
+            counts=counts,
+            meta_step=meta_step,
+        )
+        return
+    actual = counts[0]
+    if actual != meta_step:
+        logger.warning(
+            "checkpoint_step_counter_mismatch",
+            opt_state_count=actual,
+            meta_step=meta_step,
+        )
