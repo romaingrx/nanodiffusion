@@ -42,7 +42,13 @@ train:
   ema_decay: 0.9999
   grad_clip: 1.0
   log_every: 50
-  save_every: 1000
+  # save_every=5000 (~21 min training between saves) is a compromise for
+  # cross-region gcsfuse: bucket in europe-west6, TPU in europe-west4, so
+  # the 4.8 GB checkpoint takes ~7 min to upload. At save_every=1000
+  # (~4 min training), saves block training and dominate wall-clock; at
+  # 5000 the save-to-train ratio drops to ~1:3 and a preemption loses at
+  # most 5000 steps (~21 min).
+  save_every: 5000
   run_dir: runs/pretrain
 
 sft:
