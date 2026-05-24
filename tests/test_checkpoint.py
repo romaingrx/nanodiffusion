@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import threading
+import time
 from typing import TYPE_CHECKING, assert_type
 
 import equinox as eqx
@@ -9,11 +11,14 @@ import numpy as np
 import optax
 import pytest
 
+from nanodiffusion import checkpoint as ckpt_mod
 from nanodiffusion.checkpoint import (
     CheckpointMeta,
+    flush_pending_save,
     load_checkpoint,
     load_model,
     save_checkpoint,
+    save_checkpoint_async,
 )
 from nanodiffusion.constants import (
     EMA_FILENAME,
@@ -433,6 +438,193 @@ def test_checkpoint_meta_rejects_legacy_pretrain_cursor() -> None:
 
     with pytest.raises(ValueError, match="doc_idx"):
         CheckpointMeta.model_validate(legacy)
+
+
+@pytest.fixture(autouse=True)
+def _drain_inflight_save() -> None:
+    """Ensure no async save leaks between tests in this module.
+
+    ``save_checkpoint_async`` stashes the worker future in module state;
+    a test that returns without flushing would let the next test observe
+    the leftover future on its first call. The fixture drains after the
+    test rather than before so failed tests don't mask the leak.
+    """
+    yield
+    flush_pending_save()
+
+
+def test_save_checkpoint_async_returns_before_write_completes(
+    tmp_path: Path,
+    small_config: ModelConfig,
+    key: jax.Array,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Async submit returns once the snapshot is host-resident, not after I/O."""
+    model = Transformer(small_config, key=key)
+    _, opt_state = _make_opt(model)
+
+    started = threading.Event()
+    gate = threading.Event()
+    original = ckpt_mod._write_snapshot  # noqa: SLF001
+
+    def gated_write(*args: object, **kwargs: object) -> None:
+        started.set()
+        assert gate.wait(timeout=5.0), "gate never released"
+        original(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(ckpt_mod, "_write_snapshot", gated_write)
+
+    ckpt = tmp_path / "step_1"
+    save_checkpoint_async(
+        ckpt,
+        model=model,
+        ema_model=model,
+        opt_state=opt_state,
+        key=jax.random.PRNGKey(0),
+        step=1,
+        cursor=None,
+    )
+
+    assert started.wait(timeout=2.0), "worker thread never started"
+    assert not ckpt.exists(), "file landed before the gate released"
+
+    gate.set()
+    flush_pending_save()
+    assert ckpt.exists()
+
+
+def test_flush_pending_save_blocks_until_write_completes(
+    tmp_path: Path,
+    small_config: ModelConfig,
+    key: jax.Array,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``flush_pending_save`` must not return until the on-disk artifact lands."""
+    model = Transformer(small_config, key=key)
+    _, opt_state = _make_opt(model)
+
+    gate = threading.Event()
+    original = ckpt_mod._write_snapshot  # noqa: SLF001
+
+    def gated_write(*args: object, **kwargs: object) -> None:
+        assert gate.wait(timeout=5.0)
+        original(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(ckpt_mod, "_write_snapshot", gated_write)
+
+    ckpt = tmp_path / "step_1"
+    save_checkpoint_async(
+        ckpt,
+        model=model,
+        ema_model=model,
+        opt_state=opt_state,
+        key=jax.random.PRNGKey(0),
+        step=1,
+        cursor=None,
+    )
+    assert not ckpt.exists()
+
+    release_delay = 0.15
+    t0 = time.monotonic()
+    threading.Timer(release_delay, gate.set).start()
+    flush_pending_save()
+    elapsed = time.monotonic() - t0
+
+    assert elapsed >= release_delay - 0.05, (
+        f"flush returned in {elapsed:.3f}s, "
+        f"before gate released at {release_delay:.3f}s"
+    )
+    assert ckpt.exists()
+
+
+def test_back_to_back_async_saves_do_not_race(
+    tmp_path: Path,
+    small_config: ModelConfig,
+    key: jax.Array,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A second ``save_checkpoint_async`` must block on the first via ``_inflight``.
+
+    Without the inflight-drain guard the snapshot for save 2 would land
+    immediately while save 1 is still serialising — for a real model
+    that doubles the host-side memory footprint per pending save.
+    """
+    model = Transformer(small_config, key=key)
+    _, opt_state = _make_opt(model)
+
+    started_1 = threading.Event()
+    gate_1 = threading.Event()
+    started_2 = threading.Event()
+    original = ckpt_mod._write_snapshot  # noqa: SLF001
+
+    def gated_write(
+        path: Path,
+        *,
+        snapshot: object,
+        step: int,
+        cursor: object,
+        config_yaml: object,
+        update_latest: bool,
+    ) -> None:
+        if step == 1:
+            started_1.set()
+            assert gate_1.wait(timeout=5.0)
+        elif step == 2:
+            started_2.set()
+        original(  # type: ignore[arg-type]
+            path,
+            snapshot=snapshot,
+            step=step,
+            cursor=cursor,
+            config_yaml=config_yaml,
+            update_latest=update_latest,
+        )
+
+    monkeypatch.setattr(ckpt_mod, "_write_snapshot", gated_write)
+
+    save_checkpoint_async(
+        tmp_path / "step_1",
+        model=model,
+        ema_model=model,
+        opt_state=opt_state,
+        key=jax.random.PRNGKey(0),
+        step=1,
+        cursor=None,
+    )
+    assert started_1.wait(timeout=2.0)
+
+    second_returned = threading.Event()
+
+    def call_save_2() -> None:
+        save_checkpoint_async(
+            tmp_path / "step_2",
+            model=model,
+            ema_model=model,
+            opt_state=opt_state,
+            key=jax.random.PRNGKey(0),
+            step=2,
+            cursor=None,
+        )
+        second_returned.set()
+
+    thread = threading.Thread(target=call_save_2)
+    thread.start()
+    try:
+        time.sleep(0.1)
+        assert not second_returned.is_set(), (
+            "save_checkpoint_async(step=2) returned while save 1 was still gated"
+        )
+        assert not started_2.is_set()
+
+        gate_1.set()
+
+        assert second_returned.wait(timeout=2.0), "save 2 never returned"
+        flush_pending_save()
+    finally:
+        thread.join(timeout=2.0)
+
+    assert (tmp_path / "step_1").exists()
+    assert (tmp_path / "step_2").exists()
 
 
 def test_checkpoint_meta_json_round_trip() -> None:
