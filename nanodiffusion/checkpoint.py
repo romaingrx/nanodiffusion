@@ -61,7 +61,9 @@ def resolve_checkpoint_uri(local_run_dir: Path, *, bucket: str | None) -> str:
     bypasses the mount and writes ``step_*/`` directly through TensorStore.
     """
     if bucket is None:
-        return str(local_run_dir)
+        # Orbax/TensorStore reject relative paths; resolve so silent
+        # save failures don't slip through when GCS_BUCKET is unset.
+        return str(local_run_dir.resolve())
     rel = local_run_dir.resolve().relative_to(Path.cwd())
     return f"gs://{bucket}/{rel.as_posix()}"
 

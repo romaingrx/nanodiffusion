@@ -59,9 +59,10 @@ grep -q 'HOME/.local/bin' ~/.bashrc 2>/dev/null || \
 # into a dedicated env file that launch.sh sources explicitly.
 # XLA async collective fusion overlaps all-reduce with compute.
 # JAX_ENABLE_PGLE is NOT set (GPU/CUPTI only, conflicts with --profile-steps).
-cat > "$HOME/.nanodiffusion-env" <<'EOF'
-export PATH="$HOME/.local/bin:$PATH"
+cat > "$HOME/.nanodiffusion-env" <<EOF
+export PATH="\$HOME/.local/bin:\$PATH"
 export LIBTPU_INIT_ARGS="--xla_tpu_enable_async_collective_fusion_fuse_all_gather=true --xla_tpu_overlap_compute_collective_tc=true --xla_enable_async_all_gather=true"
+export GCS_BUCKET="${GCS_BUCKET}"
 EOF
 ok "Env file at $HOME/.nanodiffusion-env"
 
