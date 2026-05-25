@@ -13,6 +13,7 @@ from jax.sharding import Mesh
 
 from nanodiffusion.checkpoint import (
     load_checkpoint,
+    load_meta,
     load_model,
     resolve_model_config_from_checkpoint,
     write_config,
@@ -28,6 +29,7 @@ from nanodiffusion.loop import (
     StepStats,
     resolve_run_dir,
     run_training_loop,
+    write_lineage,
 )
 from nanodiffusion.model import DiffusionModel, Transformer, transformer_skeleton
 from nanodiffusion.optimizer import make_optimizer, scale_ema_decay
@@ -240,6 +242,14 @@ def sft_finetune(
     run_dir = resolve_run_dir(sft.run_dir, resume_from=resume_from)
     configure_jax_runtime(run_dir)
     write_config(run_dir, config)
+    if pretrain_checkpoint is not None:
+        base_meta = load_meta(pretrain_checkpoint)
+        write_lineage(
+            run_dir,
+            paradigm="sft",
+            base_uri=str(pretrain_checkpoint),
+            base_step=base_meta.step,
+        )
     logger.info(
         "sft_start",
         run_dir=str(run_dir),

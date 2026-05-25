@@ -2,8 +2,11 @@
 
 import dataclasses
 import datetime
+import json
 import math
 import os
+import shutil
+import subprocess
 import time
 from collections.abc import Callable, Iterator
 from pathlib import Path
@@ -47,6 +50,43 @@ def resolve_run_dir(run_dir_root: Path, *, resume_from: Path | None) -> Path:
         run_dir = run_dir_root / make_run_id()
     run_dir.mkdir(parents=True, exist_ok=True)
     return run_dir
+
+
+def write_lineage(
+    run_dir: Path,
+    *,
+    paradigm: str,
+    base_uri: str,
+    base_step: int,
+) -> None:
+    """Drop a ``lineage.json`` sidecar pointing at the parent checkpoint.
+
+    Makes downstream branching mechanical: any derived run (sft from
+    pretrain, rlhf from sft, eval from anything) can be walked back to
+    its origin by reading this file. Best-effort on git_sha — failures
+    leave the field null rather than aborting the run.
+    """
+    git_bin = shutil.which("git")
+    if git_bin is None:
+        git_sha = None
+    else:
+        try:
+            git_sha = subprocess.check_output(  # noqa: S603
+                [git_bin, "rev-parse", "--short", "HEAD"],
+                text=True,
+                stderr=subprocess.DEVNULL,
+            ).strip()
+        except subprocess.CalledProcessError:
+            git_sha = None
+
+    lineage = {
+        "paradigm": paradigm,
+        "base_uri": base_uri,
+        "base_step": base_step,
+        "git_sha": git_sha,
+        "started_at": datetime.datetime.now(tz=datetime.UTC).isoformat(),
+    }
+    (run_dir / "lineage.json").write_text(json.dumps(lineage, indent=2) + "\n")
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
