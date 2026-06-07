@@ -31,7 +31,7 @@ dependencies = [
     # Checkpointing: Orbax + TensorStore write the GCS JSON API directly
     # (via OCDBT chunked uploads), bypassing the gcsfuse mount that caps
     # eqx.tree_serialise_leaves at ~3 MB/s.
-    "orbax-checkpoint>=0.11,<0.12",
+    "orbax-checkpoint>=0.11,<0.13",
     "tensorstore>=0.1.65,<0.2",
     "etils[epath-gcs]",
 ]
