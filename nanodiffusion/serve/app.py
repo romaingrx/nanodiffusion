@@ -7,7 +7,8 @@ from pathlib import Path
 from typing import Annotated
 
 import structlog
-from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, Request
+from fastapi.responses import JSONResponse
 from sse_starlette.sse import EventSourceResponse
 
 from nanodiffusion.inference import (
@@ -17,6 +18,7 @@ from nanodiffusion.inference import (
     warmup,
 )
 from nanodiffusion.serve.generation import generate_blocking, generate_stream
+from nanodiffusion.serve.middleware import RequestContextMiddleware
 from nanodiffusion.serve.protocol import (
     ChatRequest,
     ChatResponse,
@@ -71,6 +73,20 @@ def create_app(
         yield
 
     app = FastAPI(lifespan=lifespan)
+    app.add_middleware(RequestContextMiddleware)
+
+    @app.exception_handler(ValueError)
+    async def on_value_error(  # pyright: ignore[reportUnusedFunction]
+        _request: Request, exc: ValueError
+    ) -> JSONResponse:
+        """Any :class:`ValueError` raised by generation/validation maps to 422.
+
+        The middleware already has ``path``/``method``/``request_id`` bound, so
+        this log line carries full request context automatically.
+        """
+        detail = str(exc)
+        log.warning("request.rejected", detail=detail)
+        return JSONResponse(status_code=422, content={"detail": detail})
 
     def _runtime(request: Request) -> Runtime:
         rt: Runtime = request.app.state.runtime
@@ -92,10 +108,7 @@ def create_app(
     async def chat(  # pyright: ignore[reportUnusedFunction]
         req: ChatRequest, rt: Annotated[Runtime, Depends(_runtime)]
     ) -> ChatResponse:
-        try:
-            return await asyncio.to_thread(generate_blocking, rt, req)
-        except ValueError as exc:
-            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return await asyncio.to_thread(generate_blocking, rt, req)
 
     @app.post("/api/chat/stream")
     async def chat_stream(  # pyright: ignore[reportUnusedFunction]
@@ -103,10 +116,7 @@ def create_app(
         request: Request,
         rt: Annotated[Runtime, Depends(_runtime)],
     ) -> EventSourceResponse:
-        try:
-            frames = generate_stream(rt, req)
-        except ValueError as exc:
-            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        frames = generate_stream(rt, req)
         return EventSourceResponse(_sse_events(frames, request))
 
     return app

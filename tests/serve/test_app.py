@@ -2,6 +2,7 @@
 
 import json
 
+import structlog
 from fastapi.testclient import TestClient
 
 
@@ -69,3 +70,30 @@ def test_stream_yields_expected_frames(client: TestClient) -> None:
 def test_stream_rejects_invalid_request(client: TestClient) -> None:
     res = client.post("/api/chat/stream", json=_payload(max_length=10_000))
     assert res.status_code == 422
+
+
+def test_422_response_carries_detail(client: TestClient) -> None:
+    res = client.post("/api/chat", json=_payload(max_length=10_000))
+    assert res.status_code == 422
+    assert "detail" in res.json()
+    assert "max_length" in res.json()["detail"]
+
+
+def test_successful_request_emits_access_log(client: TestClient) -> None:
+    with structlog.testing.capture_logs() as entries:
+        client.get("/api/health")
+    access = [e for e in entries if e.get("event") == "request.complete"]
+    assert len(access) == 1
+    assert access[0]["status"] == 200
+    assert access[0]["log_level"] == "info"
+    assert isinstance(access[0]["duration_ms"], float)
+
+
+def test_rejected_request_logs_reason_and_warning_access(client: TestClient) -> None:
+    with structlog.testing.capture_logs() as entries:
+        client.post("/api/chat", json=_payload(max_length=10_000))
+    reject = next(e for e in entries if e.get("event") == "request.rejected")
+    access = next(e for e in entries if e.get("event") == "request.complete")
+    assert "max_length" in reject["detail"]
+    assert access["status"] == 422
+    assert access["log_level"] == "warning"
