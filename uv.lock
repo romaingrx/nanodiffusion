@@ -1425,7 +1425,7 @@ requires-dist = [
     { name = "pyyaml", specifier = ">=6.0.0" },
     { name = "requests", specifier = ">=2.32.0" },
     { name = "ruff", marker = "extra == 'dev'" },
-    { name = "setuptools", marker = "extra == 'profile'", specifier = "<78" },
+    { name = "setuptools", marker = "extra == 'profile'", specifier = "<83" },
     { name = "structlog", specifier = ">=24.0.0" },
     { name = "tensorboard", marker = "extra == 'profile'", specifier = ">=2.18.0" },
     { name = "tensorboard-plugin-profile", marker = "extra == 'profile'", specifier = ">=2.18.0" },
